@@ -2722,11 +2722,7 @@ class GPUModelRunner(
         if not mm_kwargs:
             return []
 
-        should_time = bool(
-            self.observability_config
-            and self.observability_config.enable_mm_processor_stats
-            and scheduler_output.scheduled_encoder_inputs
-        )
+        should_time = bool(scheduler_output.scheduled_encoder_inputs)
 
         # Batch mm inputs as much as we can: if a request in the batch has
         # multiple modalities or a different modality than the previous one,
