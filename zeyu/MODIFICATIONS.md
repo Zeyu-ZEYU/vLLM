@@ -1,20 +1,19 @@
-# vLLM Source Modifications for Per-Request Latency Measurement
+# vLLM Source Modifications for Per-Request Latency and Per-Iteration Profiling
 
-This document describes all modifications made to vLLM source files to support per-request vision encoder latency tracking.
+This document describes all modifications made to vLLM source files.
 
 ## Overview
 
-vLLM already tracks **prefill time**, **decode time**, and **TPOT** (Time Per Output Token) per request via `RequestStateStats` (accessible through `RequestOutput.metrics` when `disable_log_stats=False`).
+Two categories of modifications:
 
-vLLM also has a built-in **encoder timing infrastructure** (`timed_encoder_operation()`, `encoder_timing_registry`, `get_encoder_timing_stats()`) in the V1 model runner, but it is gated behind `observability_config.enable_mm_processor_stats`. The only modification needed is to remove this gate so encoder timing is always recorded.
+1. **Vision encoder timing always-on** — Remove the observability config gate so the existing encoder timing infrastructure runs by default.
+2. **Per-iteration logging** — Add a lightweight JSONL logger that records which requests are in each iteration and their phase (vision encoder / prefill / decode), for correlation with nsys/ncu GPU profiling data.
 
-## Modified File
+## Modified Files
 
-### `vllm/v1/worker/gpu_model_runner.py`
+### 1. `vllm/v1/worker/gpu_model_runner.py`
 
-**Purpose**: Make vision encoder timing always-on instead of requiring an observability config flag.
-
-**Change**: In `_execute_mm_encoder()` method (around line 2725), removed the observability config gate:
+**Change A — Encoder timing always-on**: In `_execute_mm_encoder()` (around line 2725), removed the observability config gate:
 
 ```python
 # BEFORE:
@@ -28,44 +27,46 @@ should_time = bool(
 should_time = bool(scheduler_output.scheduled_encoder_inputs)
 ```
 
-**Rationale**: The existing `timed_encoder_operation()` context manager already uses `torch.accelerator.synchronize()` barriers and `time.perf_counter()` for accurate GPU timing. It records per-request encoder forward pass time in `self.encoder_timing_registry`. The only thing preventing it from running was the `enable_mm_processor_stats` flag check. By removing this gate, the timing is always recorded when there are multimodal encoder inputs to process.
+**Change B — NVTX marker for vision encoder**: Added `record_function_or_nullcontext("gpu_model_runner: vision_encoder")` around the encoder execution loop (lines 2792-2878). This creates a distinct NVTX range in nsys so vision encoder kernels can be separated from other preprocessing. Zero overhead when `VLLM_NVTX_SCOPES_FOR_PROFILING` is not set.
 
-**Retrieval path**: The accumulated timing is retrieved via `collective_rpc("get_encoder_timing_stats")`, which works in both single-process and multi-process engine modes:
+### 2. `vllm/v1/engine/core.py`
 
-```python
-encoder_stats = llm.llm_engine.collective_rpc("get_encoder_timing_stats")
-# Returns: list[dict[internal_req_id, {"encoder_forward_secs": float, "num_encoder_calls": int}]]
+**Change — Hook iteration logger**: Added `_log_iteration_data()` context manager in `EngineCore.step()` alongside existing `log_error_detail` and `log_iteration_details`. Also calls `shutdown_iteration_logger()` in `shutdown()`.
+
+### 3. `vllm/envs.py`
+
+**Change — Register env vars**:
+- `VLLM_LOG_ITERATIONS` (bool, default False): Enable per-iteration JSONL logging.
+- `VLLM_ITERATION_LOG_DIR` (str, default "."): Output directory for iteration/request JSONL files.
+
+## New Files
+
+### `vllm/v1/engine/iteration_logger.py`
+
+`IterationLogger` class that:
+- Writes `iterations.jsonl` with per-iteration metadata (request IDs, phase classification, token counts, elapsed time)
+- Accumulates request-to-iteration mapping and writes `requests.jsonl` on shutdown
+- Uses same prefill/decode classification logic as `compute_iteration_details()` from `vllm/v1/utils.py`
+
+## Profiling Pipeline
+
 ```
+1. Run with VLLM_LOG_ITERATIONS=1 + nsys
+   -> iterations.jsonl, requests.jsonl (request/phase data)
+   -> nsys_report.nsys-rep (GPU kernel timeline)
+   -> Export to CSV: nsys_kernels.csv, nsys_nvtx.csv
 
-## How the Measurement Pipeline Works
+2. (Optional) Run with ncu for SM metrics
+   -> ncu_metrics.csv (per-kernel SM throughput, warp occupancy)
 
-```
-LLM.generate()
-  |-- EngineCore schedules requests
-  |     |-- scheduler_output.scheduled_encoder_inputs = {req_id: [input_ids]}
-  |
-  |-- GPUWorker.execute_model(scheduler_output)
-  |     |-- GPUModelRunner._execute_mm_encoder(scheduler_output)
-  |           |-- should_time = bool(scheduled_encoder_inputs)  <-- MODIFIED
-  |           |-- for each modality group:
-  |           |     |-- with timed_encoder_operation(...):
-  |           |           |-- torch.accelerator.synchronize()
-  |           |           |-- time.perf_counter() -> t_start
-  |           |           |-- model.embed_multimodal(**kwargs)
-  |           |           |-- torch.accelerator.synchronize()
-  |           |           |-- time.perf_counter() -> t_end
-  |           |           |-- encoder_timing_registry[req_id] += elapsed
-  |           |-- Cache encoder outputs in encoder_cache
-  |
-  |-- After inference completes:
-        |-- Script calls: llm.llm_engine.collective_rpc("get_encoder_timing_stats")
-        |     |-- Returns encoder timing dict from each worker
-        |-- Script reads: output.metrics (RequestStateStats) for prefill/decode
-        |-- Script combines all metrics and writes JSON output
+3. Post-process: python zeyu/analyze_profile.py <output_dir>
+   -> consolidated_iterations.jsonl (iterations + GPU util + SM metrics)
+   -> consolidated_requests.jsonl (requests + per-phase GPU/SM averages)
 ```
 
 ## Impact Assessment
 
-- **Performance impact**: The `torch.accelerator.synchronize()` calls add a small amount of latency (typically < 1 ms) per vision encoder batch. This overhead is negligible for profiling purposes.
-- **Backward compatibility**: This change is fully backward-compatible. The timing was already implemented; this change only removes the gate that prevented it from running by default.
-- **No new dependencies**: No new imports, classes, or fields were added. The change reuses 100% of the existing infrastructure.
+- **Iteration logger overhead**: One JSON line per iteration (~200 bytes). Negligible.
+- **NVTX marker overhead**: Zero when `VLLM_NVTX_SCOPES_FOR_PROFILING` is not set (returns `nullcontext`).
+- **Encoder timing overhead**: ~1 ms per vision encoder batch from `torch.accelerator.synchronize()`.
+- **Backward compatibility**: All changes are gated behind env vars or no-op when not enabled.

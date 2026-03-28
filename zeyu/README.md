@@ -137,9 +137,55 @@ zeyu/
 +-- outputs/                       # Timestamped JSON output files
 |   +-- .gitkeep
 +-- run_qwen35_vision_offline.py   # Main inference script
++-- profile_run.sh                 # Profiling wrapper (nsys + ncu)
++-- analyze_profile.py             # Post-processing for profiling data
 +-- MODIFICATIONS.md               # Documents vLLM source changes
 +-- README.md                      # This file
 ```
+
+## GPU Profiling (Per-Iteration Metrics)
+
+### Quick Start
+
+```bash
+# nsys profiling (GPU utilization per iteration)
+bash zeyu/profile_run.sh --nsys-only --model /path/to/Qwen3.5-9B
+
+# Iteration logging only (no GPU profiling, fast)
+bash zeyu/profile_run.sh --skip-profile --model /path/to/Qwen3.5-9B
+
+# Full profiling (nsys + ncu for SM metrics, slow)
+bash zeyu/profile_run.sh --model /path/to/Qwen3.5-9B
+```
+
+### What Gets Recorded
+
+**Run 1 (nsys)** produces:
+- `iterations.jsonl` — Per-iteration: request IDs, phase (encoder/prefill/decode), token counts, elapsed time
+- `requests.jsonl` — Per-request: which iterations were encoder/prefill/decode
+- `nsys_kernels.csv` — CUDA kernel timeline (nanosecond precision)
+- `nsys_nvtx.csv` — NVTX ranges for iteration boundaries and vision encoder
+
+**Run 2 (ncu, optional)** adds:
+- `ncu_metrics.csv` — SM throughput %, warp occupancy % per kernel
+
+### Post-Processing
+
+```bash
+python zeyu/analyze_profile.py zeyu/outputs/profile_<timestamp>/
+```
+
+Produces:
+- `consolidated_iterations.jsonl` — Iterations sorted by timestamp with GPU utilization %, SM metrics, and per-request phase info
+- `consolidated_requests.jsonl` — Requests sorted by start time with per-phase GPU/SM averages
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `VLLM_LOG_ITERATIONS` | `0` | Set to `1` to enable iteration JSONL logging |
+| `VLLM_ITERATION_LOG_DIR` | `.` | Directory for iteration/request JSONL files |
+| `VLLM_NVTX_SCOPES_FOR_PROFILING` | `0` | Set to `1` to enable NVTX markers (needed for nsys) |
 
 ## Notes
 

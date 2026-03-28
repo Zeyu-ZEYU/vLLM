@@ -21,6 +21,10 @@ import zmq
 
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
+from vllm.v1.engine.iteration_logger import (
+    get_iteration_logger,
+    shutdown_iteration_logger,
+)
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
@@ -377,6 +381,16 @@ class EngineCore:
         )
         self._iteration_index += 1
 
+    @contextmanager
+    def _log_iteration_data(self, scheduler_output: SchedulerOutput):
+        """Log per-iteration metadata to JSONL when VLLM_LOG_ITERATIONS=1."""
+        iter_logger = get_iteration_logger()
+        if iter_logger is None:
+            yield
+            return
+        with iter_logger.log_iteration(scheduler_output):
+            yield
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -394,6 +408,7 @@ class EngineCore:
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
+            self._log_iteration_data(scheduler_output),
         ):
             model_output = future.result()
             if model_output is None:
@@ -547,6 +562,7 @@ class EngineCore:
             self.abort_requests(request_ids)
 
     def shutdown(self):
+        shutdown_iteration_logger()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()

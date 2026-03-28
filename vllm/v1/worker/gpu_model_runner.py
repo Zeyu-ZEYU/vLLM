@@ -2792,6 +2792,11 @@ class GPUModelRunner(
         encoder_outputs: list[torch.Tensor] = []
         # Track the current index in mm_kwargs/mm_lora_refs to map groups to request IDs
         current_item_idx = 0
+        # NVTX marker to distinguish vision encoder from other preprocessing.
+        _ve_scope = record_function_or_nullcontext(
+            "gpu_model_runner: vision_encoder"
+        )
+        _ve_scope.__enter__()
         for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
             mm_kwargs,
             device=self.device,
@@ -2870,6 +2875,8 @@ class GPUModelRunner(
             encoder_outputs.extend(batch_outputs)
 
             current_item_idx += num_items
+
+        _ve_scope.__exit__(None, None, None)
 
         # Cache the encoder outputs by mm_hash
         for mm_hash, output in zip(mm_hashes, encoder_outputs):
