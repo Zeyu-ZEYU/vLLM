@@ -1,0 +1,6 @@
+{"images": ["zeyu/inputs/imgs/cherry_blossom.jpg"], "text": "What is the content of this image?", "delay": 0}
+{"images": ["zeyu/inputs/imgs/cherry_blossom.jpg"], "text": "Describe this image in detail.", "delay": 100}
+{"images": ["zeyu/inputs/imgs/stop_sign.jpg"], "text": "What sign is shown in this image and what does it mean?", "delay": 200}
+{"images": ["zeyu/inputs/imgs/stop_sign.jpg"], "text": "List all objects you can see in this image.", "delay": 0}
+{"text": "What is the capital of France?", "delay": 0}
+{"images": ["zeyu/inputs/imgs/cherry_blossom.jpg", "zeyu/inputs/imgs/stop_sign.jpg"], "text": "Compare these two images.", "delay": 0}

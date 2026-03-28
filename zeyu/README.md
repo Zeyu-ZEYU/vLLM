@@ -39,55 +39,77 @@ For each request, the following metrics are recorded:
 
 ## Usage
 
-### Basic Run
+### Basic Run (built-in examples)
 
 ```bash
 # From the vLLM repository root:
 python zeyu/run_qwen35_vision_offline.py --model /path/to/Qwen3.5-9B
 ```
 
-No special environment variables needed. The script works with vLLM's default multiprocessing mode.
+No special environment variables needed. Without `--input`, the script uses built-in example images and questions.
 
-### Custom Configuration
-
-```bash
-python zeyu/run_qwen35_vision_offline.py \
-    --model Qwen/Qwen3.5-9B \
-    --max-model-len 4096 \
-    --max-num-seqs 5 \
-    --max-tokens 128 \
-    --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.9 \
-    --temperature 0.0 \
-    --dtype auto
-```
-
-### Using a Different Model Size
+### Using a JSONL Input File
 
 ```bash
-# Qwen3.5-27B (requires more GPU memory)
 python zeyu/run_qwen35_vision_offline.py \
-    --model Qwen/Qwen3.5-27B \
-    --tensor-parallel-size 2
-
-# Qwen3-VL-8B (older but also supported)
-python zeyu/run_qwen35_vision_offline.py \
-    --model Qwen/Qwen3-VL-8B-Instruct
-
-# Qwen2.5-VL-7B
-python zeyu/run_qwen35_vision_offline.py \
-    --model Qwen/Qwen2.5-VL-7B-Instruct
+    --model /path/to/Qwen3.5-9B \
+    --input zeyu/inputs/reqs/sample.jsonl
 ```
 
-### Custom Input Images
+The JSONL file contains one JSON object per line. Each line specifies a request:
 
-Place `.jpg` or `.png` files in `zeyu/data/`. The script automatically picks them up and includes them as additional requests alongside the built-in test images.
+```json
+{"images": ["zeyu/inputs/imgs/cherry_blossom.jpg"], "text": "What is in this image?", "delay": 0}
+{"images": ["zeyu/inputs/imgs/a.jpg", "zeyu/inputs/imgs/b.jpg"], "text": "Compare these two images."}
+{"text": "What is the capital of France?"}
+{"images": [], "text": "Hello world"}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `text` | Yes | The user question / prompt text |
+| `images` | No | Single path string or list of path strings. Omitting, `null`, or `[]` means text-only. |
+| `delay` | No | Milliseconds to wait before submitting this request (default: 0) |
+
+All paths are relative to the current working directory (where you run `python`).
+
+### Per-Request Delays
+
+Each request in the JSONL file can have a `delay` field (in milliseconds). When any request has `delay > 0`, the script submits requests one by one with the specified wait time, simulating staggered arrival.
+
+Override all per-request delays with `--delay`:
+
+```bash
+# All requests delayed by 500ms regardless of JSONL values
+python zeyu/run_qwen35_vision_offline.py \
+    --model /path/to/Qwen3.5-9B \
+    --input zeyu/inputs/reqs/sample.jsonl \
+    --delay 500
+
+# Force zero delay (batch all at once) even if JSONL has delays
+python zeyu/run_qwen35_vision_offline.py \
+    --model /path/to/Qwen3.5-9B \
+    --input zeyu/inputs/reqs/sample.jsonl \
+    --delay 0
+```
+
+### Multi-Image Requests
+
+Requests can include multiple images. The prompt template automatically adds one `<|image_pad|>` placeholder per image:
+
+```json
+{"images": ["img1.jpg", "img2.jpg", "img3.jpg"], "text": "Describe the differences between these images."}
+```
+
+The script sets `limit_mm_per_prompt` to the maximum number of images in any single request.
 
 ## CLI Arguments
 
 | Argument | Default | Description |
 |---|---|---|
 | `--model` | `Qwen/Qwen3.5-9B` | HuggingFace model identifier or local path |
+| `--input` | (none) | Path to JSONL file with requests. Uses built-in examples if not provided. |
+| `--delay` | (none) | Global delay override in ms. Overrides all per-request delay values. |
 | `--max-model-len` | `4096` | Maximum context length |
 | `--max-num-seqs` | `5` | Maximum batch size |
 | `--max-tokens` | `128` | Max generated tokens per request |
@@ -100,58 +122,23 @@ Place `.jpg` or `.png` files in `zeyu/data/`. The script automatically picks the
 
 Results are written to `zeyu/outputs/latency_<YYYYMMDD_HHMMSS>.json`.
 
-### Example Output Structure
-
-```json
-{
-  "model": "Qwen/Qwen3.5-9B",
-  "timestamp": "2026-03-28T06:30:00+00:00",
-  "config": {
-    "max_model_len": 4096,
-    "max_num_seqs": 5,
-    "max_tokens": 128,
-    "tensor_parallel_size": 1,
-    "temperature": 0.0,
-    "dtype": "auto"
-  },
-  "summary": {
-    "num_requests": 4,
-    "total_decode_tokens": 512,
-    "avg_vision_encoder_time_ms": 15.2,
-    "avg_prefill_time_ms": 48.7,
-    "avg_decode_time_ms": 340.5,
-    "avg_tpot_ms": 2.68
-  },
-  "requests": [
-    {
-      "request_id": "0",
-      "image_source": "cherry_blossom (built-in)",
-      "question": "What is the content of this image?",
-      "generated_text": "...",
-      "num_prompt_tokens": 256,
-      "num_generation_tokens": 128,
-      "vision_encoder_time_ms": 15.2,
-      "prefill_time_ms": 48.7,
-      "decode_time_ms": 340.5,
-      "tpot_ms": 2.68
-    }
-  ]
-}
-```
-
 A summary table is also printed to stdout after each run.
 
 ## Directory Structure
 
 ```
 zeyu/
-+-- data/                           # Put custom input images here
++-- inputs/
+|   +-- imgs/                      # Input images for JSONL requests
+|   |   +-- cherry_blossom.jpg     # Sample image (from vLLM assets)
+|   |   +-- stop_sign.jpg          # Sample image (from vLLM assets)
+|   +-- reqs/
+|       +-- sample.jsonl           # Sample JSONL input file
++-- outputs/                       # Timestamped JSON output files
 |   +-- .gitkeep
-+-- outputs/                        # Timestamped JSON output files
-|   +-- .gitkeep
-+-- run_qwen35_vision_offline.py    # Main inference script
-+-- MODIFICATIONS.md                # Documents vLLM source changes
-+-- README.md                       # This file
++-- run_qwen35_vision_offline.py   # Main inference script
++-- MODIFICATIONS.md               # Documents vLLM source changes
++-- README.md                      # This file
 ```
 
 ## Notes
@@ -160,3 +147,4 @@ zeyu/
 - Prefill and decode times come from vLLM's `RequestStateStats`, which uses monotonic timestamps from the engine core.
 - Vision encoder timing is retrieved via `collective_rpc("get_encoder_timing_stats")`, which works in both single-process and default multi-process engine modes.
 - Only the first request to use a given image triggers the vision encoder; subsequent requests with the same image hit the encoder cache and show VE = 0.
+- When delays are used, requests are submitted via `LLM.enqueue()` + `time.sleep()` + `LLM.wait_for_completion()`. When no delays are needed, the more efficient batch `LLM.generate()` is used.

@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,41 +38,136 @@ from vllm.multimodal.image import convert_image_mode  # noqa: E402
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
-DATA_DIR = SCRIPT_DIR / "data"
 OUTPUT_DIR = SCRIPT_DIR / "outputs"
 
 # Default model -- can be overridden with --model
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 
-# Qwen3.5 / Qwen3-VL / Qwen2.5-VL share the same prompt template.
-PROMPT_TEMPLATE = (
-    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-    "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
-    "{question}<|im_end|>\n"
-    "<|im_start|>assistant\n"
-)
+
+# ---------------------------------------------------------------------------
+# Prompt building
+# ---------------------------------------------------------------------------
+def build_prompt(question: str, num_images: int) -> str:
+    """Build a Qwen3.5 chat-template prompt.
+
+    Args:
+        question: The user question text.
+        num_images: Number of images attached (0 = text-only).
+    """
+    vision_block = (
+        "<|vision_start|><|image_pad|><|vision_end|>" * num_images
+    )
+    return (
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        f"<|im_start|>user\n{vision_block}{question}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Example inputs
+# Load requests from JSONL file
+# ---------------------------------------------------------------------------
+def load_requests_from_file(
+    path: str, delay_override: int | None
+) -> list[dict]:
+    """Load requests from a JSONL file.
+
+    Each line is a JSON object with:
+      - ``text`` (required): the user question.
+      - ``images`` (optional): a single path string or a list of path strings.
+        An empty list ``[]`` is treated the same as omitting the field.
+      - ``delay`` (optional, default 0): milliseconds to wait before
+        submitting this request.
+
+    All paths are relative to the current working directory.
+    """
+    filepath = Path(path)
+    if not filepath.exists():
+        raise FileNotFoundError(f"Input file not found: {filepath}")
+
+    examples: list[dict] = []
+    with open(filepath) as f:
+        for line_num, raw_line in enumerate(f, start=1):
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                obj = json.loads(raw_line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid JSON on line {line_num} of {filepath}: {exc}"
+                ) from exc
+
+            # --- text (required) ---
+            text = obj.get("text")
+            if not text:
+                raise ValueError(
+                    f"Missing 'text' field on line {line_num} of {filepath}"
+                )
+
+            # --- images (optional) ---
+            raw_images = obj.get("images")
+            image_paths: list[str] = []
+            if isinstance(raw_images, str):
+                image_paths = [raw_images]
+            elif isinstance(raw_images, list):
+                image_paths = [p for p in raw_images if p]  # filter empties
+
+            pil_images: list[Image.Image] = []
+            for img_path in image_paths:
+                p = Path(img_path)
+                if not p.exists():
+                    raise FileNotFoundError(
+                        f"Image not found: {p} "
+                        f"(line {line_num} of {filepath})"
+                    )
+                pil_images.append(convert_image_mode(Image.open(p), "RGB"))
+
+            # --- delay ---
+            delay = (
+                delay_override
+                if delay_override is not None
+                else obj.get("delay", 0)
+            )
+
+            # --- Build prompt and multi_modal_data ---
+            num_imgs = len(pil_images)
+            prompt = build_prompt(text, num_imgs)
+
+            mm_data: dict = {}
+            if num_imgs == 1:
+                mm_data["image"] = pil_images[0]
+            elif num_imgs > 1:
+                mm_data["image"] = pil_images
+
+            image_source = (
+                ", ".join(image_paths) if image_paths else "(text-only)"
+            )
+
+            examples.append(
+                {
+                    "image_source": image_source,
+                    "question": text,
+                    "delay": delay,
+                    "prompt": prompt,
+                    "multi_modal_data": mm_data,
+                    "num_images": num_imgs,
+                }
+            )
+
+    return examples
+
+
+# ---------------------------------------------------------------------------
+# Built-in example inputs (used when --input is not provided)
 # ---------------------------------------------------------------------------
 def build_example_inputs() -> list[dict]:
-    """Return a list of example request dicts, each with an image and prompt."""
+    """Return a list of example request dicts using vLLM built-in assets."""
 
-    # Built-in vLLM test images.
     cherry = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
     stop = convert_image_mode(ImageAsset("stop_sign").pil_image, "RGB")
 
-    # Also load local images from zeyu/data/ if any jpg/png files exist.
-    local_images: list[tuple[str, Image.Image]] = []
-    if DATA_DIR.exists():
-        for ext in ("*.jpg", "*.jpeg", "*.png"):
-            for p in sorted(DATA_DIR.glob(ext)):
-                local_images.append(
-                    (p.name, convert_image_mode(Image.open(p), "RGB"))
-                )
-
-    examples = [
+    raw = [
         {
             "image_source": "cherry_blossom (built-in)",
             "image": cherry,
@@ -94,16 +190,18 @@ def build_example_inputs() -> list[dict]:
         },
     ]
 
-    # Append local images with a generic question.
-    for fname, img in local_images:
+    examples: list[dict] = []
+    for r in raw:
         examples.append(
             {
-                "image_source": fname,
-                "image": img,
-                "question": "Describe this image in detail.",
+                "image_source": r["image_source"],
+                "question": r["question"],
+                "delay": 0,
+                "prompt": build_prompt(r["question"], num_images=1),
+                "multi_modal_data": {"image": r["image"]},
+                "num_images": 1,
             }
         )
-
     return examples
 
 
@@ -124,7 +222,6 @@ def get_vision_encoder_times(llm: LLM) -> dict[str, float]:
     timing by ``RequestOutput.request_id``.
     """
     try:
-        # collective_rpc returns a list (one dict per worker).
         worker_stats_list = llm.llm_engine.collective_rpc(
             "get_encoder_timing_stats"
         )
@@ -132,16 +229,13 @@ def get_vision_encoder_times(llm: LLM) -> dict[str, float]:
         print(f"[WARN] Could not retrieve encoder timing stats: {exc}")
         return {}
 
-    # Merge results from all workers, mapping internal -> external IDs.
     result: dict[str, float] = {}
     for worker_stats in worker_stats_list:
         if not worker_stats:
             continue
         for internal_id, stats_dict in worker_stats.items():
-            # Internal ID format: "{external_id}-{8_hex_chars}"
             external_id = internal_id.rsplit("-", 1)[0]
             elapsed = stats_dict.get("encoder_forward_secs", 0.0)
-            # Accumulate in case multiple workers processed the same request.
             result[external_id] = result.get(external_id, 0.0) + elapsed
 
     return result
@@ -178,7 +272,6 @@ def extract_request_metrics(output, vision_times: dict[str, float]) -> dict:
             len(output.outputs[0].token_ids) if output.outputs else 0
         )
 
-    # Vision encoder time (keyed by external request ID).
     ve_time = vision_times.get(output.request_id, 0.0)
     result["vision_encoder_time_s"] = round(ve_time, 6)
     result["vision_encoder_time_ms"] = round(ve_time * 1000, 3)
@@ -198,6 +291,20 @@ def main():
         type=str,
         default=DEFAULT_MODEL,
         help=f"HuggingFace model ID or local path (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--input",
+        type=str,
+        default=None,
+        help="Path to a JSONL file with requests. If not provided, "
+        "built-in example inputs are used.",
+    )
+    parser.add_argument(
+        "--delay",
+        type=int,
+        default=None,
+        help="Global delay override in ms. Overrides per-request delay "
+        "values from the JSONL file.",
     )
     parser.add_argument(
         "--max-model-len",
@@ -247,18 +354,23 @@ def main():
     # Ensure output directory exists.
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Build example inputs.
-    examples = build_example_inputs()
-    print(f"Prepared {len(examples)} example requests.")
+    # Build examples -- either from file or built-in.
+    if args.input:
+        examples = load_requests_from_file(args.input, args.delay)
+    else:
+        examples = build_example_inputs()
+        # Apply --delay override to built-in examples too.
+        if args.delay is not None:
+            for ex in examples:
+                ex["delay"] = args.delay
 
-    # Build prompts.
-    prompts = [PROMPT_TEMPLATE.format(question=ex["question"]) for ex in examples]
+    print(f"Prepared {len(examples)} requests.")
 
-    # Build vLLM inputs with multimodal data.
-    inputs = [
-        {"prompt": prompt, "multi_modal_data": {"image": ex["image"]}}
-        for prompt, ex in zip(prompts, examples)
-    ]
+    # Determine max images per request for limit_mm_per_prompt.
+    max_images = max(
+        (ex.get("num_images", 0) for ex in examples), default=1
+    )
+    max_images = max(max_images, 1)  # at least 1
 
     # Initialize LLM with stats enabled.
     print(f"Loading model: {args.model} ...")
@@ -269,12 +381,12 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         dtype=args.dtype,
-        limit_mm_per_prompt={"image": 1},
+        limit_mm_per_prompt={"image": max_images},
         mm_processor_kwargs={
             "min_pixels": 28 * 28,
             "max_pixels": 1280 * 28 * 28,
         },
-        disable_log_stats=False,  # Enable stats for latency tracking
+        disable_log_stats=False,
         seed=42,
     )
 
@@ -283,9 +395,30 @@ def main():
         max_tokens=args.max_tokens,
     )
 
+    # Build vLLM input dicts.
+    vllm_inputs: list[dict] = []
+    for ex in examples:
+        inp: dict = {"prompt": ex["prompt"]}
+        if ex["multi_modal_data"]:
+            inp["multi_modal_data"] = ex["multi_modal_data"]
+        vllm_inputs.append(inp)
+
+    # Check if any request has a non-zero delay.
+    has_delays = any(ex.get("delay", 0) > 0 for ex in examples)
+
     # Run inference.
     print("Running inference ...")
-    outputs = llm.generate(inputs, sampling_params=sampling_params)
+    if has_delays:
+        # Submit requests one by one with delays using enqueue/wait.
+        for ex, inp in zip(examples, vllm_inputs):
+            delay_ms = ex.get("delay", 0)
+            if delay_ms > 0:
+                time.sleep(delay_ms / 1000.0)
+            llm.enqueue(inp, sampling_params=sampling_params)
+        outputs = llm.wait_for_completion()
+    else:
+        # No delays -- use batch generate (more efficient).
+        outputs = llm.generate(vllm_inputs, sampling_params=sampling_params)
 
     # Retrieve vision encoder timings via collective_rpc.
     vision_times = get_vision_encoder_times(llm)
