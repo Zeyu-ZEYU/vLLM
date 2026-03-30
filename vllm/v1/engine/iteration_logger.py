@@ -108,6 +108,11 @@ class IterationLogger:
         yield  # model execution happens here
 
         elapsed_ms = (time.monotonic() - ts_mono) * 1000.0
+        elapsed_s = elapsed_ms / 1000.0
+        num_reqs = len(
+            scheduler_output.num_scheduled_tokens
+        )
+        rps = round(num_reqs / elapsed_s, 3) if elapsed_s > 0 else 0.0
 
         # --- Write iteration record ---
         record = {
@@ -115,6 +120,9 @@ class IterationLogger:
             "ts_mono": round(ts_mono, 6),
             "ts_wall": round(ts_wall, 6),
             "elapsed_ms": round(elapsed_ms, 3),
+            "step_latency_ms": round(elapsed_ms, 3),
+            "num_reqs": num_reqs,
+            "step_rps": rps,
             "has_encoder": len(encoder_req_ids) > 0,
             "encoder_req_ids": encoder_req_ids,
             "prefill_req_ids": prefill_req_ids,

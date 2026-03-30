@@ -91,8 +91,8 @@ def parse_nsys_nvtx(path: Path) -> list[dict]:
     return ranges
 
 
-def parse_nsys_nvtx_vision_encoder(path: Path) -> list[dict]:
-    """Parse nsys NVTX CSV for vision_encoder sub-ranges."""
+def parse_nsys_nvtx_by_name(path: Path, keyword: str) -> list[dict]:
+    """Parse nsys NVTX CSV for sub-ranges whose name contains *keyword*."""
     if not path.exists():
         return []
 
@@ -101,7 +101,7 @@ def parse_nsys_nvtx_vision_encoder(path: Path) -> list[dict]:
         reader = csv.DictReader(f)
         for row in reader:
             name = row.get("Name", row.get("Range", ""))
-            if "vision_encoder" not in name:
+            if keyword not in name:
                 continue
             try:
                 start_ns = int(row.get("Start (ns)", 0))
@@ -401,14 +401,20 @@ def main():
 
     nvtx_ranges = parse_nsys_nvtx(nsys_nvtx_csv) if nsys_nvtx_csv else []
     ve_ranges = (
-        parse_nsys_nvtx_vision_encoder(nsys_nvtx_csv)
+        parse_nsys_nvtx_by_name(nsys_nvtx_csv, "vision_encoder")
+        if nsys_nvtx_csv
+        else []
+    )
+    fwd_ranges = (
+        parse_nsys_nvtx_by_name(nsys_nvtx_csv, "gpu_model_runner: forward")
         if nsys_nvtx_csv
         else []
     )
     kernels = parse_nsys_kernels(nsys_kernel_csv) if nsys_kernel_csv else []
     print(
         f"Parsed nsys: {len(nvtx_ranges)} iteration NVTX ranges, "
-        f"{len(ve_ranges)} vision_encoder ranges, {len(kernels)} kernels."
+        f"{len(ve_ranges)} vision_encoder ranges, "
+        f"{len(fwd_ranges)} text_forward ranges, {len(kernels)} kernels."
     )
 
     # --- Parse ncu data ---
@@ -439,7 +445,6 @@ def main():
                     ve_rng["start_ns"] >= rng["start_ns"]
                     and ve_rng["end_ns"] <= rng["end_ns"]
                 ):
-                    # Find kernels within the VE sub-range.
                     ve_kernels = [
                         k
                         for k in iter_kernels
@@ -454,6 +459,29 @@ def main():
                         "gpu_util_pct"
                     ]
             record["vision_encoder_kernel_time_ns"] = ve_kernel_time_ns
+
+            # Check if this iteration overlaps a text forward NVTX range.
+            for fwd_rng in fwd_ranges:
+                if (
+                    fwd_rng["start_ns"] >= rng["start_ns"]
+                    and fwd_rng["end_ns"] <= rng["end_ns"]
+                ):
+                    fwd_kernels = [
+                        k
+                        for k in iter_kernels
+                        if k["start_ns"] >= fwd_rng["start_ns"]
+                        and k["start_ns"] < fwd_rng["end_ns"]
+                    ]
+                    fwd_gpu = compute_gpu_util(
+                        fwd_kernels, fwd_rng["duration_ns"]
+                    )
+                    record["text_forward_gpu_util_pct"] = fwd_gpu[
+                        "gpu_util_pct"
+                    ]
+                    record["text_forward_kernel_time_ns"] = fwd_gpu[
+                        "total_kernel_time_ns"
+                    ]
+                    break  # one forward per iteration
 
             # Enrich with ncu SM metrics.
             if ncu_by_name and iter_kernels:
