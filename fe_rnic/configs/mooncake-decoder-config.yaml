@@ -1,0 +1,28 @@
+# ============================================================================
+# Mooncake LMCache config — Decoder 节点
+# 占位符由 disagg_vllm_launcher.sh 启动时 sed 替换，生成到 /tmp/
+#   {MASTER_IP}     — mooncake master IPv4 地址 (eth0 管理网卡)
+#   {LOCAL_RDMA_IP} — 当前节点 IPv6 RDMA 地址 (bond 接口, 如 fd03:4514:80:6240::1)
+#   {IB_DEVICES}    — IB HCA 设备列表 (如 mlx5_bond_0,...,mlx5_bond_3)
+#
+# 网络平面:
+#   IPv4 (eth0/mlx5_0)         → remote_url / metadata_server / master_server_address
+#   IPv6 (bond0~3/mlx5_bond_*) → local_hostname / device_name / protocol (RDMA)
+# ============================================================================
+
+chunk_size: 256
+remote_url: "mooncakestore://{MASTER_IP}:50052/"
+remote_serde: "naive"
+local_cpu: False
+max_local_cpu_size: 100
+
+extra_config:
+  local_hostname: "{LOCAL_RDMA_IP}"
+  metadata_server: "http://{MASTER_IP}:8080/metadata"
+  protocol: "rdma"
+  device_name: "{IB_DEVICES}"                      # mlx5_bond_0,...,mlx5_bond_3
+  master_server_address: "{MASTER_IP}:50052"
+  global_segment_size: 64424509440                 # 60 GB
+  local_buffer_size:    4294967296                  # 4 GB per GPU
+  transfer_timeout: 10
+  save_chunk_meta: False
