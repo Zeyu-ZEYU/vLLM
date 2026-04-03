@@ -510,6 +510,7 @@ class EngineCore:
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
+            self._log_iteration_data(scheduler_output),
         ):
             model_output = future.result()
             if model_output is None:
