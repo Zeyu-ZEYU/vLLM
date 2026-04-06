@@ -32,6 +32,7 @@ class IterationLogger:
 
         self._iter_file = open(self._log_dir / "iterations.jsonl", "w")
         self._iteration_index = 0
+        self._prev_ts_mono: float | None = None
 
         # request_id -> {"encoder_iters": [], "prefill_iters": [],
         #                 "decode_iters": [], "first_iter": N}
@@ -107,20 +108,32 @@ class IterationLogger:
 
         yield  # model execution happens here
 
-        elapsed_ms = (time.monotonic() - ts_mono) * 1000.0
-        elapsed_s = elapsed_ms / 1000.0
+        # In async scheduling mode, the GPU work is submitted before
+        # this context manager, so yield-based timing would only measure
+        # the future.result() wait (microseconds, not real execution).
+        # Instead, compute step latency from inter-iteration intervals.
+        if self._prev_ts_mono is not None:
+            step_latency_ms = (ts_mono - self._prev_ts_mono) * 1000.0
+        else:
+            step_latency_ms = 0.0  # first iteration, no prior reference
+        self._prev_ts_mono = ts_mono
+
+        step_latency_s = step_latency_ms / 1000.0
         num_reqs = len(
             scheduler_output.num_scheduled_tokens
         )
-        rps = round(num_reqs / elapsed_s, 3) if elapsed_s > 0 else 0.0
+        rps = (
+            round(num_reqs / step_latency_s, 3)
+            if step_latency_s > 0
+            else 0.0
+        )
 
         # --- Write iteration record ---
         record = {
             "iter": idx,
             "ts_mono": round(ts_mono, 6),
             "ts_wall": round(ts_wall, 6),
-            "elapsed_ms": round(elapsed_ms, 3),
-            "step_latency_ms": round(elapsed_ms, 3),
+            "step_latency_ms": round(step_latency_ms, 3),
             "num_reqs": num_reqs,
             "step_rps": rps,
             "has_encoder": len(encoder_req_ids) > 0,

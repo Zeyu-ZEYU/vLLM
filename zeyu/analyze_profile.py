@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -51,44 +50,75 @@ def load_requests(path: Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Parse nsys NVTX CSV — identify iteration NVTX ranges
 # ---------------------------------------------------------------------------
-ANNOTATE_PATTERN = re.compile(
-    r"execute_context_(\d+)\((\d+)\)_generation_(\d+)\((\d+)\)"
-)
+def parse_nsys_nvtx_iterations(path: Path) -> list[dict]:
+    """Parse nsys NVTX CSV and build per-iteration time windows.
 
-
-def parse_nsys_nvtx(path: Path) -> list[dict]:
-    """Parse nsys NVTX GPU projection trace CSV.
-
-    Returns a list of dicts with start_ns, duration_ns, name for each
-    NVTX range that matches the annotate_profile pattern.
+    vLLM emits NVTX ranges like ``gpu_model_runner: preprocess``,
+    ``gpu_model_runner: forward``, ``gpu_model_runner: sample`` for each
+    iteration.  We use the ``preprocess`` ranges as iteration start
+    markers and extend each iteration window to the end of the
+    corresponding ``sample`` range.  If preprocess ranges are absent, we
+    fall back to ``forward`` ranges alone.
     """
     if not path.exists():
         return []
 
-    ranges = []
+    # Collect all relevant NVTX ranges.
+    preprocess_ranges: list[dict] = []
+    forward_ranges: list[dict] = []
+    sample_ranges: list[dict] = []
+
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             name = row.get("Name", row.get("Range", ""))
-            if not ANNOTATE_PATTERN.search(name):
-                continue
             try:
                 start_ns = int(row.get("Start (ns)", 0))
                 duration_ns = int(row.get("Duration (ns)", 0))
             except (ValueError, TypeError):
                 continue
-            ranges.append(
+            entry = {
+                "start_ns": start_ns,
+                "end_ns": start_ns + duration_ns,
+                "duration_ns": duration_ns,
+                "name": name,
+            }
+            if "gpu_model_runner: preprocess" in name:
+                preprocess_ranges.append(entry)
+            elif "gpu_model_runner: forward" in name:
+                forward_ranges.append(entry)
+            elif "gpu_model_runner: sample" in name:
+                sample_ranges.append(entry)
+
+    # Sort all by start time.
+    preprocess_ranges.sort(key=lambda r: r["start_ns"])
+    forward_ranges.sort(key=lambda r: r["start_ns"])
+    sample_ranges.sort(key=lambda r: r["start_ns"])
+
+    # Build iteration windows.
+    # Prefer preprocess as start, sample as end (covers the full step).
+    # Fall back to forward ranges if preprocess is missing.
+    if preprocess_ranges:
+        iterations = []
+        for i, pp in enumerate(preprocess_ranges):
+            # Find the sample range that ends this iteration.
+            end_ns = pp["end_ns"]
+            for sr in sample_ranges:
+                if sr["start_ns"] >= pp["start_ns"]:
+                    end_ns = sr["end_ns"]
+                    break
+            iterations.append(
                 {
-                    "start_ns": start_ns,
-                    "end_ns": start_ns + duration_ns,
-                    "duration_ns": duration_ns,
-                    "name": name,
+                    "start_ns": pp["start_ns"],
+                    "end_ns": end_ns,
+                    "duration_ns": end_ns - pp["start_ns"],
+                    "name": pp["name"],
                 }
             )
+        return iterations
 
-    # Sort by start time.
-    ranges.sort(key=lambda r: r["start_ns"])
-    return ranges
+    # Fallback: use forward ranges as iteration boundaries.
+    return forward_ranges
 
 
 def parse_nsys_nvtx_by_name(path: Path, keyword: str) -> list[dict]:
@@ -399,7 +429,11 @@ def main():
             nsys_nvtx_csv = p
             break
 
-    nvtx_ranges = parse_nsys_nvtx(nsys_nvtx_csv) if nsys_nvtx_csv else []
+    nvtx_ranges = (
+        parse_nsys_nvtx_iterations(nsys_nvtx_csv)
+        if nsys_nvtx_csv
+        else []
+    )
     ve_ranges = (
         parse_nsys_nvtx_by_name(nsys_nvtx_csv, "vision_encoder")
         if nsys_nvtx_csv
