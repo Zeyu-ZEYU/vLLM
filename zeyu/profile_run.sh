@@ -98,6 +98,13 @@ if $RUN_NSYS; then
         --output "$OUT_DIR/nsys_nvtx" \
         "$OUT_DIR/nsys_report.nsys-rep" 2>/dev/null || true
 
+    # NVTX push/pop trace (CPU-side boundaries, same clock as kernels).
+    nsys stats \
+        -r nvtx_pushpop_trace \
+        --format csv \
+        --output "$OUT_DIR/nsys_nvtx_pushpop" \
+        "$OUT_DIR/nsys_report.nsys-rep" 2>/dev/null || true
+
     echo "nsys CSV export done."
 
 # --- No nsys, just iteration logging ---

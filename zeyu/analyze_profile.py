@@ -74,12 +74,25 @@ def parse_nsys_nvtx_iterations(path: Path) -> list[dict]:
             name = row.get("Name", row.get("Range", ""))
             try:
                 start_ns = int(row.get("Start (ns)", 0))
-                duration_ns = int(row.get("Duration (ns)", 0))
+                # nvtx_pushpop_trace may have "End (ns)" instead of
+                # "Duration (ns)"; handle both.
+                end_raw = row.get("End (ns)")
+                dur_raw = row.get("Duration (ns)")
+                if end_raw is not None:
+                    end_ns = int(end_raw)
+                    duration_ns = end_ns - start_ns
+                elif dur_raw is not None:
+                    duration_ns = int(dur_raw)
+                    end_ns = start_ns + duration_ns
+                else:
+                    continue
             except (ValueError, TypeError):
+                continue
+            if start_ns == 0 and duration_ns == 0:
                 continue
             entry = {
                 "start_ns": start_ns,
-                "end_ns": start_ns + duration_ns,
+                "end_ns": end_ns,
                 "duration_ns": duration_ns,
                 "name": name,
             }
@@ -135,13 +148,24 @@ def parse_nsys_nvtx_by_name(path: Path, keyword: str) -> list[dict]:
                 continue
             try:
                 start_ns = int(row.get("Start (ns)", 0))
-                duration_ns = int(row.get("Duration (ns)", 0))
+                end_raw = row.get("End (ns)")
+                dur_raw = row.get("Duration (ns)")
+                if end_raw is not None:
+                    end_ns = int(end_raw)
+                    duration_ns = end_ns - start_ns
+                elif dur_raw is not None:
+                    duration_ns = int(dur_raw)
+                    end_ns = start_ns + duration_ns
+                else:
+                    continue
             except (ValueError, TypeError):
+                continue
+            if start_ns == 0 and duration_ns == 0:
                 continue
             ranges.append(
                 {
                     "start_ns": start_ns,
-                    "end_ns": start_ns + duration_ns,
+                    "end_ns": end_ns,
                     "duration_ns": duration_ns,
                 }
             )
@@ -420,7 +444,13 @@ def main():
             nsys_kernel_csv = p
             break
 
+    # Prefer nvtx_pushpop_trace (CPU-side NVTX boundaries, same clock as
+    # cuda_gpu_trace kernels) over nvtx_gpu_proj_trace (GPU-projected times
+    # which use a different clock origin and cause correlation failures).
+    nsys_nvtx_csv = None
     for candidate in [
+        "nsys_nvtx_pushpop_nvtx_pushpop_trace.csv",
+        "nsys_nvtx_pushpop.csv",
         "nsys_nvtx_nvtx_gpu_proj_trace.csv",
         "nsys_nvtx.csv",
     ]:
@@ -450,6 +480,17 @@ def main():
         f"{len(ve_ranges)} vision_encoder ranges, "
         f"{len(fwd_ranges)} text_forward ranges, {len(kernels)} kernels."
     )
+
+    # Debug: show timestamp domains to diagnose correlation issues.
+    if nvtx_ranges and kernels:
+        print(
+            f"  NVTX time range: "
+            f"{nvtx_ranges[0]['start_ns']} .. {nvtx_ranges[-1]['end_ns']}"
+        )
+        print(
+            f"  Kernel time range: "
+            f"{kernels[0]['start_ns']} .. {kernels[-1]['end_ns']}"
+        )
 
     # --- Parse ncu data ---
     ncu_csv = profile_dir / "ncu_metrics.csv"

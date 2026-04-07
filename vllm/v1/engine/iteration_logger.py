@@ -63,6 +63,39 @@ class IterationLogger:
                 }
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    def _mem_snapshot_before(self) -> tuple[float | None, float | None]:
+        """Synchronize GPU, then capture memory baseline and reset peak."""
+        try:
+            import torch
+
+            device = torch.device("cuda:0")
+            # Synchronize so that any pending GPU memory ops from the
+            # previous iteration are reflected before we read/reset stats.
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            allocated = torch.cuda.memory_allocated(device)
+            return round(allocated / (1024**2), 2), None
+        except Exception:
+            return None, None
+
+    def _mem_snapshot_after(self) -> tuple[float | None, float | None]:
+        """Synchronize GPU, then capture memory and read peak."""
+        try:
+            import torch
+
+            device = torch.device("cuda:0")
+            # Synchronize so that all GPU memory allocations/frees from
+            # this iteration are finalized before we read stats.
+            torch.cuda.synchronize(device)
+            allocated = torch.cuda.memory_allocated(device)
+            peak = torch.cuda.max_memory_allocated(device)
+            return (
+                round(allocated / (1024**2), 2),
+                round(peak / (1024**2), 2),
+            )
+        except Exception:
+            return None, None
+
     @contextmanager
     def log_iteration(self, scheduler_output: SchedulerOutput):
         """Context manager that records one iteration's metadata.
@@ -106,7 +139,12 @@ class IterationLogger:
         ts_mono = time.monotonic()
         ts_wall = time.time()
 
+        # Measure GPU memory before/after model execution.
+        mem_before, mem_peak = self._mem_snapshot_before()
+
         yield  # model execution happens here
+
+        mem_after, mem_peak_after = self._mem_snapshot_after()
 
         # In async scheduling mode, the GPU work is submitted before
         # this context manager, so yield-based timing would only measure
@@ -146,6 +184,13 @@ class IterationLogger:
             "num_decode_tokens": num_decode_tokens,
             "total_tokens": (
                 scheduler_output.total_num_scheduled_tokens
+            ),
+            "gpu_mem_allocated_MiB": mem_before,
+            "gpu_mem_peak_MiB": mem_peak_after,
+            "gpu_mem_delta_MiB": (
+                round(mem_peak_after - mem_before, 2)
+                if mem_before is not None and mem_peak_after is not None
+                else None
             ),
         }
         self._iter_file.write(
