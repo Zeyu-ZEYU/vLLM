@@ -262,10 +262,14 @@ def compute_gpu_util(
             cur_start, cur_end = start, end
     merged_time += cur_end - cur_start
 
+    gpu_util_pct = round(merged_time / wall_time_ns * 100, 2)
+    gap_ns = wall_time_ns - merged_time
     return {
-        "gpu_util_pct": round(merged_time / wall_time_ns * 100, 2),
+        "gpu_util_pct": gpu_util_pct,
         "total_kernel_time_ns": merged_time,
         "num_kernels": len(kernels),
+        "kernel_launch_gap_ns": gap_ns,
+        "kernel_launch_gap_pct": round(100 - gpu_util_pct, 2),
     }
 
 
@@ -533,6 +537,12 @@ def main():
                     record["vision_encoder_gpu_util_pct"] = ve_gpu[
                         "gpu_util_pct"
                     ]
+                    record["vision_encoder_kernel_launch_gap_ns"] = ve_gpu[
+                        "kernel_launch_gap_ns"
+                    ]
+                    record["vision_encoder_kernel_launch_gap_pct"] = ve_gpu[
+                        "kernel_launch_gap_pct"
+                    ]
             record["vision_encoder_kernel_time_ns"] = ve_kernel_time_ns
 
             # Check if this iteration overlaps a text forward NVTX range.
@@ -555,6 +565,12 @@ def main():
                     ]
                     record["text_forward_kernel_time_ns"] = fwd_gpu[
                         "total_kernel_time_ns"
+                    ]
+                    record["text_forward_kernel_launch_gap_ns"] = fwd_gpu[
+                        "kernel_launch_gap_ns"
+                    ]
+                    record["text_forward_kernel_launch_gap_pct"] = fwd_gpu[
+                        "kernel_launch_gap_pct"
                     ]
                     break  # one forward per iteration
 
