@@ -431,63 +431,57 @@ def enrich_with_ncu(
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Process a single directory of iteration + nsys + ncu data
 # ---------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(
-        description="Merge iteration logs + nsys + ncu into consolidated files"
-    )
-    parser.add_argument(
-        "profile_dir",
-        type=str,
-        help="Path to the profile output directory",
-    )
-    args = parser.parse_args()
+def process_single_dir(
+    profile_dir: Path,
+    *,
+    label: str = "",
+) -> tuple[list[dict], list[dict]]:
+    """Process one set of iteration logs + nsys/ncu CSVs.
 
-    profile_dir = Path(args.profile_dir)
-    if not profile_dir.exists():
-        print(f"Error: directory not found: {profile_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    # --- Load data ---
+    Returns (consolidated_iters, consolidated_reqs).
+    """
     iter_path = profile_dir / "iterations.jsonl"
     req_path = profile_dir / "requests.jsonl"
 
     if not iter_path.exists():
-        print(f"Error: {iter_path} not found", file=sys.stderr)
-        sys.exit(1)
+        print(f"  {label}No iterations.jsonl in {profile_dir}")
+        return [], []
 
     iterations = load_iterations(iter_path)
     requests = load_requests(req_path) if req_path.exists() else []
-    print(f"Loaded {len(iterations)} iterations, {len(requests)} requests.")
+    print(
+        f"  {label}Loaded {len(iterations)} iterations, "
+        f"{len(requests)} requests."
+    )
 
-    # --- Parse nsys data ---
-    # Try common nsys output naming conventions.
+    # --- Parse nsys data (look in profile_dir and parent) ---
     nsys_kernel_csv = None
     nsys_nvtx_csv = None
-    for candidate in [
-        "nsys_kernels_cuda_gpu_trace.csv",
-        "nsys_kernels.csv",
-    ]:
-        p = profile_dir / candidate
-        if p.exists():
-            nsys_kernel_csv = p
-            break
+    search_dirs = [profile_dir, profile_dir.parent]
 
-    # Prefer nvtx_pushpop_trace (CPU-side NVTX boundaries, same clock as
-    # cuda_gpu_trace kernels) over nvtx_gpu_proj_trace (GPU-projected times
-    # which use a different clock origin and cause correlation failures).
-    nsys_nvtx_csv = None
-    for candidate in [
-        "nsys_nvtx_pushpop_nvtx_pushpop_trace.csv",
-        "nsys_nvtx_pushpop.csv",
-        "nsys_nvtx_nvtx_gpu_proj_trace.csv",
-        "nsys_nvtx.csv",
-    ]:
-        p = profile_dir / candidate
-        if p.exists():
-            nsys_nvtx_csv = p
-            break
+    for d in search_dirs:
+        if nsys_kernel_csv is None:
+            for c in [
+                "nsys_kernels_cuda_gpu_trace.csv",
+                "nsys_kernels.csv",
+            ]:
+                p = d / c
+                if p.exists():
+                    nsys_kernel_csv = p
+                    break
+        if nsys_nvtx_csv is None:
+            for c in [
+                "nsys_nvtx_pushpop_nvtx_pushpop_trace.csv",
+                "nsys_nvtx_pushpop.csv",
+                "nsys_nvtx_nvtx_gpu_proj_trace.csv",
+                "nsys_nvtx.csv",
+            ]:
+                p = d / c
+                if p.exists():
+                    nsys_nvtx_csv = p
+                    break
 
     nvtx_ranges = (
         parse_nsys_nvtx_iterations(nsys_nvtx_csv)
@@ -504,39 +498,42 @@ def main():
         if nsys_nvtx_csv
         else []
     )
-    kernels = parse_nsys_kernels(nsys_kernel_csv) if nsys_kernel_csv else []
+    kernels = (
+        parse_nsys_kernels(nsys_kernel_csv) if nsys_kernel_csv else []
+    )
     print(
-        f"Parsed nsys: {len(nvtx_ranges)} iteration NVTX ranges, "
-        f"{len(ve_ranges)} vision_encoder ranges, "
-        f"{len(fwd_ranges)} text_forward ranges, {len(kernels)} kernels."
+        f"  {label}Parsed nsys: {len(nvtx_ranges)} iter NVTX, "
+        f"{len(ve_ranges)} VE, {len(fwd_ranges)} fwd, "
+        f"{len(kernels)} kernels."
     )
 
-    # Debug: show timestamp domains to diagnose correlation issues.
     if nvtx_ranges and kernels:
         print(
-            f"  NVTX time range: "
-            f"{nvtx_ranges[0]['start_ns']} .. {nvtx_ranges[-1]['end_ns']}"
+            f"  {label}NVTX time: "
+            f"{nvtx_ranges[0]['start_ns']}..{nvtx_ranges[-1]['end_ns']}"
         )
         print(
-            f"  Kernel time range: "
-            f"{kernels[0]['start_ns']} .. {kernels[-1]['end_ns']}"
+            f"  {label}Kernel time: "
+            f"{kernels[0]['start_ns']}..{kernels[-1]['end_ns']}"
         )
 
-    # --- Parse ncu data ---
-    ncu_csv = profile_dir / "ncu_metrics.csv"
-    ncu_by_name = parse_ncu_csv(ncu_csv)
-    if ncu_by_name:
-        print(f"Parsed ncu: {len(ncu_by_name)} unique kernel names.")
+    ncu_csv_path = None
+    for d in search_dirs:
+        p = d / "ncu_metrics.csv"
+        if p.exists():
+            ncu_csv_path = p
+            break
+    ncu_by_name = parse_ncu_csv(ncu_csv_path) if ncu_csv_path else {}
 
-    # --- Correlate kernels to iteration NVTX ranges ---
+    # --- Correlate ---
     kernels_per_iter = correlate_kernels_to_ranges(kernels, nvtx_ranges)
 
-    # --- Build consolidated iterations ---
     consolidated_iters = []
     for i, it in enumerate(iterations):
-        record = dict(it)  # copy all iteration fields
+        record = dict(it)
+        if label:
+            record["gpu_role"] = label.strip(" []")
 
-        # Match with NVTX range (by sequential order).
         if i < len(nvtx_ranges):
             rng = nvtx_ranges[i]
             iter_kernels = kernels_per_iter[i]
@@ -548,7 +545,6 @@ def main():
             )
             record.update(gpu_metrics)
 
-            # Check if this iteration overlaps a vision_encoder NVTX range.
             ve_kernel_time_ns = 0
             for ve_rng in ve_ranges:
                 if (
@@ -578,7 +574,6 @@ def main():
                     ) if rng["duration_ns"] > 0 else 0.0
             record["vision_encoder_kernel_time_ns"] = ve_kernel_time_ns
 
-            # Check if this iteration overlaps a text forward NVTX range.
             for fwd_rng in fwd_ranges:
                 if (
                     fwd_rng["start_ns"] >= rng["start_ns"]
@@ -609,12 +604,10 @@ def main():
                     ) if rng["duration_ns"] > 0 else 0.0
                     break  # one forward per iteration
 
-            # Enrich with ncu SM metrics.
             if ncu_by_name and iter_kernels:
                 sm_metrics = enrich_with_ncu(iter_kernels, ncu_by_name)
                 record.update(sm_metrics)
 
-        # Build per-request phase list for this iteration.
         per_req_phases = []
         for req_id in it.get("prefill_req_ids", []):
             ext_id = req_id.rsplit("-", 1)[0]
@@ -627,7 +620,6 @@ def main():
         consolidated_iters.append(record)
 
     # --- Build consolidated requests ---
-    # Map iteration GPU metrics back to requests by phase.
     iter_gpu_util_map = {}
     iter_sm_map = {}
     for ci in consolidated_iters:
@@ -641,11 +633,11 @@ def main():
     consolidated_reqs = []
     for req in requests:
         record = dict(req)
+        if label:
+            record["gpu_role"] = label.strip(" []")
 
-        # Average GPU util per phase.
         for phase in ("encoder", "prefill", "decode"):
-            iters_key = f"{phase}_iters"
-            phase_iters = req.get(iters_key, [])
+            phase_iters = req.get(f"{phase}_iters", [])
             utils = [
                 iter_gpu_util_map[i]
                 for i in phase_iters
@@ -655,8 +647,6 @@ def main():
             record[f"{phase}_avg_gpu_util_pct"] = (
                 round(sum(utils) / len(utils), 2) if utils else None
             )
-
-            # SM metrics.
             sm_vals = [
                 iter_sm_map[i]
                 for i in phase_iters
@@ -675,10 +665,140 @@ def main():
 
         consolidated_reqs.append(record)
 
-    # Sort requests by first_iter.
-    consolidated_reqs.sort(
-        key=lambda r: r.get("first_iter") or 0
+    consolidated_reqs.sort(key=lambda r: r.get("first_iter") or 0)
+    return consolidated_iters, consolidated_reqs
+
+
+def print_summary(consolidated_iters: list[dict], label: str = ""):
+    """Print GPU utilization summary for a set of iterations."""
+    if not consolidated_iters:
+        return
+    gpu_utils = [
+        ci["gpu_util_pct"]
+        for ci in consolidated_iters
+        if "gpu_util_pct" in ci
+    ]
+    if gpu_utils:
+        print(
+            f"\n{label}GPU utilization across "
+            f"{len(gpu_utils)} iterations:"
+        )
+        print(f"  avg: {sum(gpu_utils) / len(gpu_utils):.1f}%")
+        print(f"  min: {min(gpu_utils):.1f}%")
+        print(f"  max: {max(gpu_utils):.1f}%")
+
+    encoder_iters = [
+        ci for ci in consolidated_iters if ci.get("has_encoder")
+    ]
+    prefill_only = [
+        ci
+        for ci in consolidated_iters
+        if ci.get("num_prefill_reqs", 0) > 0
+        and ci.get("num_decode_reqs", 0) == 0
+        and not ci.get("has_encoder")
+    ]
+    decode_only = [
+        ci
+        for ci in consolidated_iters
+        if ci.get("num_decode_reqs", 0) > 0
+        and ci.get("num_prefill_reqs", 0) == 0
+    ]
+    mixed = [
+        ci
+        for ci in consolidated_iters
+        if ci.get("num_prefill_reqs", 0) > 0
+        and ci.get("num_decode_reqs", 0) > 0
+    ]
+    print(f"\n{label}Iteration breakdown:")
+    print(f"  encoder:     {len(encoder_iters)}")
+    print(f"  prefill-only: {len(prefill_only)}")
+    print(f"  decode-only:  {len(decode_only)}")
+    print(f"  mixed (chunked prefill): {len(mixed)}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description="Merge iteration logs + nsys + ncu into consolidated files"
     )
+    parser.add_argument(
+        "profile_dir",
+        type=str,
+        help="Path to the profile output directory",
+    )
+    args = parser.parse_args()
+
+    profile_dir = Path(args.profile_dir)
+    if not profile_dir.exists():
+        print(f"Error: directory not found: {profile_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    # Detect disaggregated mode: prefill/ and decode/ subdirectories.
+    prefill_dir = profile_dir / "prefill"
+    decode_dir = profile_dir / "decode"
+    is_disagg = prefill_dir.exists() and decode_dir.exists()
+
+    if is_disagg:
+        print("Detected disaggregated mode (prefill/ + decode/ subdirs).")
+        print("\n--- Prefill GPU ---")
+        p_iters, p_reqs = process_single_dir(
+            prefill_dir, label="[prefill] "
+        )
+        print("\n--- Decode GPU ---")
+        d_iters, d_reqs = process_single_dir(
+            decode_dir, label="[decode] "
+        )
+
+        # Merge: interleave by wall-clock timestamp, tag with gpu_role.
+        all_iters = p_iters + d_iters
+        all_iters.sort(key=lambda r: r.get("ts_wall", 0))
+
+        # Merge requests: combine prefill-side and decode-side info per
+        # external request ID.
+        req_by_ext: dict[str, dict] = {}
+        for req in p_reqs + d_reqs:
+            ext_id = req.get("external_id", "")
+            if ext_id not in req_by_ext:
+                req_by_ext[ext_id] = dict(req)
+            else:
+                existing = req_by_ext[ext_id]
+                # Merge iteration lists and GPU metrics from both sides.
+                for key in (
+                    "encoder_iters",
+                    "prefill_iters",
+                    "decode_iters",
+                ):
+                    existing.setdefault(key, []).extend(
+                        req.get(key, [])
+                    )
+                # Prefer non-None values for GPU metrics.
+                for key, val in req.items():
+                    if key not in existing or existing[key] is None:
+                        existing[key] = val
+
+        all_reqs = list(req_by_ext.values())
+        all_reqs.sort(key=lambda r: r.get("first_iter") or 0)
+
+        consolidated_iters = all_iters
+        consolidated_reqs = all_reqs
+
+        print_summary(p_iters, label="[Prefill GPU] ")
+        print_summary(d_iters, label="[Decode GPU] ")
+    else:
+        # Single-GPU mode: iterations.jsonl at top level.
+        iter_path = profile_dir / "iterations.jsonl"
+        if not iter_path.exists():
+            print(
+                f"Error: {iter_path} not found", file=sys.stderr
+            )
+            sys.exit(1)
+
+        consolidated_iters, consolidated_reqs = process_single_dir(
+            profile_dir
+        )
+        print_summary(consolidated_iters)
 
     # --- Write outputs ---
     out_iters = profile_dir / "consolidated_iterations.jsonl"
@@ -694,48 +814,6 @@ def main():
     print(f"\nConsolidated output written to:")
     print(f"  {out_iters}")
     print(f"  {out_reqs}")
-
-    # --- Print summary ---
-    if consolidated_iters:
-        gpu_utils = [
-            ci["gpu_util_pct"]
-            for ci in consolidated_iters
-            if "gpu_util_pct" in ci
-        ]
-        if gpu_utils:
-            print(f"\nGPU utilization across {len(gpu_utils)} iterations:")
-            print(f"  avg: {sum(gpu_utils) / len(gpu_utils):.1f}%")
-            print(f"  min: {min(gpu_utils):.1f}%")
-            print(f"  max: {max(gpu_utils):.1f}%")
-
-        encoder_iters = [
-            ci for ci in consolidated_iters if ci.get("has_encoder")
-        ]
-        prefill_only = [
-            ci
-            for ci in consolidated_iters
-            if ci.get("num_prefill_reqs", 0) > 0
-            and ci.get("num_decode_reqs", 0) == 0
-            and not ci.get("has_encoder")
-        ]
-        decode_only = [
-            ci
-            for ci in consolidated_iters
-            if ci.get("num_decode_reqs", 0) > 0
-            and ci.get("num_prefill_reqs", 0) == 0
-        ]
-        mixed = [
-            ci
-            for ci in consolidated_iters
-            if ci.get("num_prefill_reqs", 0) > 0
-            and ci.get("num_decode_reqs", 0) > 0
-        ]
-
-        print(f"\nIteration breakdown:")
-        print(f"  encoder:     {len(encoder_iters)}")
-        print(f"  prefill-only: {len(prefill_only)}")
-        print(f"  decode-only:  {len(decode_only)}")
-        print(f"  mixed (chunked prefill): {len(mixed)}")
 
 
 if __name__ == "__main__":

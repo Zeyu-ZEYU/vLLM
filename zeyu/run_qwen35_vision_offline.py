@@ -10,6 +10,10 @@ Measures:
   - Decode latency            (last_token_ts - first_token_ts)
   - Decode token count and average Time-Per-Output-Token (TPOT)
 
+Supports single-GPU and PD disaggregated mode (--disagg):
+  GPU 0: vision encoder + text prefill
+  GPU 1: text decode
+
 Results are written to zeyu/outputs/latency_<timestamp>.json.
 """
 
@@ -17,9 +21,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
+from multiprocessing import Event, Process
 from pathlib import Path
 
 from PIL import Image
@@ -349,6 +355,13 @@ def main():
         default="auto",
         help="Model dtype, e.g. auto, bfloat16, float16 (default: auto)",
     )
+    parser.add_argument(
+        "--disagg",
+        action="store_true",
+        default=False,
+        help="Enable PD disaggregation: vision encoder + prefill on GPU 0, "
+        "decode on GPU 1. Requires 2 GPUs.",
+    )
     args = parser.parse_args()
 
     # Ensure output directory exists.
@@ -366,13 +379,23 @@ def main():
 
     print(f"Prepared {len(examples)} requests.")
 
-    # Determine max images per request for limit_mm_per_prompt.
+    if args.disagg:
+        run_disaggregated(args, examples)
+        return
+
+    run_single_gpu(args, examples)
+
+
+# ---------------------------------------------------------------------------
+# Single-GPU inference
+# ---------------------------------------------------------------------------
+def run_single_gpu(args, examples: list[dict]):
+    """Run all requests on a single GPU (default mode)."""
     max_images = max(
         (ex.get("num_images", 0) for ex in examples), default=1
     )
-    max_images = max(max_images, 1)  # at least 1
+    max_images = max(max_images, 1)
 
-    # Initialize LLM with stats enabled.
     print(f"Loading model: {args.model} ...")
     llm = LLM(
         model=args.model,
@@ -395,21 +418,11 @@ def main():
         max_tokens=args.max_tokens,
     )
 
-    # Build vLLM input dicts.
-    vllm_inputs: list[dict] = []
-    for ex in examples:
-        inp: dict = {"prompt": ex["prompt"]}
-        if ex["multi_modal_data"]:
-            inp["multi_modal_data"] = ex["multi_modal_data"]
-        vllm_inputs.append(inp)
-
-    # Check if any request has a non-zero delay.
+    vllm_inputs = _build_vllm_inputs(examples)
     has_delays = any(ex.get("delay", 0) > 0 for ex in examples)
 
-    # Run inference.
     print("Running inference ...")
     if has_delays:
-        # Submit requests one by one with delays using enqueue/wait.
         for ex, inp in zip(examples, vllm_inputs):
             delay_ms = ex.get("delay", 0)
             if delay_ms > 0:
@@ -417,23 +430,241 @@ def main():
             llm.enqueue(inp, sampling_params=sampling_params)
         outputs = llm.wait_for_completion()
     else:
-        # No delays -- use batch generate (more efficient).
         outputs = llm.generate(vllm_inputs, sampling_params=sampling_params)
 
-    # Retrieve vision encoder timings via collective_rpc.
     vision_times = get_vision_encoder_times(llm)
     print(
         f"Retrieved vision encoder timings for {len(vision_times)} request(s)."
     )
 
-    # Collect results.
+    _report_results(args, examples, outputs, vision_times)
+
+
+# ---------------------------------------------------------------------------
+# Disaggregated PD mode
+# ---------------------------------------------------------------------------
+def _build_vllm_inputs(examples: list[dict]) -> list[dict]:
+    """Convert example dicts to vLLM input dicts."""
+    vllm_inputs: list[dict] = []
+    for ex in examples:
+        inp: dict = {"prompt": ex["prompt"]}
+        if ex["multi_modal_data"]:
+            inp["multi_modal_data"] = ex["multi_modal_data"]
+        vllm_inputs.append(inp)
+    return vllm_inputs
+
+
+def _common_llm_kwargs(args, examples: list[dict]) -> dict:
+    """Return LLM constructor kwargs shared by single-GPU and disagg modes."""
+    max_images = max(
+        (ex.get("num_images", 0) for ex in examples), default=1
+    )
+    max_images = max(max_images, 1)
+    return dict(
+        model=args.model,
+        max_model_len=args.max_model_len,
+        max_num_seqs=args.max_num_seqs,
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        dtype=args.dtype,
+        limit_mm_per_prompt={"image": max_images},
+        mm_processor_kwargs={
+            "min_pixels": 28 * 28,
+            "max_pixels": 1280 * 28 * 28,
+        },
+        disable_log_stats=False,
+        seed=42,
+    )
+
+
+def _run_prefill(args, examples: list[dict], prefill_done):
+    """Prefill process: vision encoder + prefill on GPU 0."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+    # Write iteration logs to a prefill-specific subdirectory so the
+    # decode process does not overwrite them.
+    iter_log_dir = os.environ.get("VLLM_ITERATION_LOG_DIR", ".")
+    prefill_log_dir = os.path.join(iter_log_dir, "prefill")
+    os.environ["VLLM_ITERATION_LOG_DIR"] = prefill_log_dir
+
+    from vllm.config import KVTransferConfig
+
+    llm_kwargs = _common_llm_kwargs(args, examples)
+    llm_kwargs["enforce_eager"] = True
+    llm_kwargs["kv_transfer_config"] = KVTransferConfig(
+        kv_connector="P2pNcclConnector",
+        kv_role="kv_producer",
+        kv_rank=0,
+        kv_parallel_size=2,
+    )
+
+    print("[Prefill/GPU0] Loading model ...")
+    llm = LLM(**llm_kwargs)
+
+    vllm_inputs = _build_vllm_inputs(examples)
+    # Prefill generates only 1 token — KV cache is transferred to decode.
+    prefill_params = SamplingParams(
+        temperature=args.temperature,
+        max_tokens=1,
+    )
+
+    print("[Prefill/GPU0] Running prefill ...")
+    outputs = llm.generate(vllm_inputs, sampling_params=prefill_params)
+
+    # Save prompts + first token for decode process.
+    new_prompts = []
+    for output in outputs:
+        first_tok = output.outputs[0].text if output.outputs else ""
+        new_prompts.append(output.prompt + first_tok)
+
+    tmp_file = OUTPUT_DIR / "_disagg_prompts.json"
+    with open(tmp_file, "w") as f:
+        json.dump(new_prompts, f)
+
+    # Collect prefill-side metrics.
+    vision_times = get_vision_encoder_times(llm)
+    prefill_metrics = []
+    for i, output in enumerate(outputs):
+        m = extract_request_metrics(output, vision_times)
+        prefill_metrics.append(m)
+
+    metrics_file = OUTPUT_DIR / "_disagg_prefill_metrics.json"
+    with open(metrics_file, "w") as f:
+        json.dump(prefill_metrics, f)
+
+    print("[Prefill/GPU0] Done. Signaling decode ...")
+    prefill_done.set()
+
+    # Stay alive until decode finishes (NCCL needs both endpoints).
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+
+
+def _run_decode(args, examples: list[dict], prefill_done):
+    """Decode process: text decode on GPU 1."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
+    # Write iteration logs to a decode-specific subdirectory.
+    iter_log_dir = os.environ.get("VLLM_ITERATION_LOG_DIR", ".")
+    decode_log_dir = os.path.join(iter_log_dir, "decode")
+    os.environ["VLLM_ITERATION_LOG_DIR"] = decode_log_dir
+
+    from vllm.config import KVTransferConfig
+
+    llm_kwargs = _common_llm_kwargs(args, examples)
+    llm_kwargs["enforce_eager"] = True
+    llm_kwargs["kv_transfer_config"] = KVTransferConfig(
+        kv_connector="P2pNcclConnector",
+        kv_role="kv_consumer",
+        kv_rank=1,
+        kv_parallel_size=2,
+    )
+
+    print("[Decode/GPU1] Loading model ...")
+    llm = LLM(**llm_kwargs)
+
+    print("[Decode/GPU1] Waiting for prefill to finish ...")
+    prefill_done.wait()
+
+    tmp_file = OUTPUT_DIR / "_disagg_prompts.json"
+    with open(tmp_file) as f:
+        prompts = json.load(f)
+
+    # Build text-only inputs (no images — vision encoding already done).
+    decode_inputs = [{"prompt": p} for p in prompts]
+
+    decode_params = SamplingParams(
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+    )
+
+    print("[Decode/GPU1] Running decode ...")
+    outputs = llm.generate(decode_inputs, sampling_params=decode_params)
+
+    vision_times = get_vision_encoder_times(llm)
+
+    # Merge prefill metrics.
+    metrics_file = OUTPUT_DIR / "_disagg_prefill_metrics.json"
+    prefill_metrics = []
+    if metrics_file.exists():
+        with open(metrics_file) as f:
+            prefill_metrics = json.load(f)
+
+    _report_results(
+        args,
+        examples,
+        outputs,
+        vision_times,
+        prefill_metrics=prefill_metrics,
+        mode="disagg",
+    )
+
+    # Clean up temp files.
+    tmp_file.unlink(missing_ok=True)
+    metrics_file.unlink(missing_ok=True)
+
+
+def run_disaggregated(args, examples: list[dict]):
+    """Launch prefill and decode processes on separate GPUs."""
+    print("=" * 60)
+    print("PD Disaggregated Mode: GPU 0 = prefill, GPU 1 = decode")
+    print("=" * 60)
+
+    prefill_done = Event()
+    prefill_proc = Process(
+        target=_run_prefill, args=(args, examples, prefill_done)
+    )
+    decode_proc = Process(
+        target=_run_decode, args=(args, examples, prefill_done)
+    )
+
+    prefill_proc.start()
+    decode_proc.start()
+
+    decode_proc.join()
+    # Decode finished — terminate prefill (it's waiting in a sleep loop).
+    prefill_proc.terminate()
+    prefill_proc.join(timeout=5)
+    print("\nDisaggregated inference complete.")
+
+
+# ---------------------------------------------------------------------------
+# Shared reporting
+# ---------------------------------------------------------------------------
+def _report_results(
+    args,
+    examples: list[dict],
+    outputs,
+    vision_times: dict[str, float],
+    *,
+    prefill_metrics: list[dict] | None = None,
+    mode: str = "single",
+):
+    """Collect metrics, write JSON, and print summary table."""
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     request_results = []
 
     for i, output in enumerate(outputs):
         metrics = extract_request_metrics(output, vision_times)
-        generated_text = output.outputs[0].text if output.outputs else ""
 
+        # In disagg mode, merge prefill-side VE + prefill timing.
+        if prefill_metrics and i < len(prefill_metrics):
+            pm = prefill_metrics[i]
+            if pm.get("vision_encoder_time_ms", 0) > 0:
+                metrics["vision_encoder_time_ms"] = pm[
+                    "vision_encoder_time_ms"
+                ]
+                metrics["vision_encoder_time_s"] = pm[
+                    "vision_encoder_time_s"
+                ]
+            if pm.get("prefill_time_ms", 0) > 0:
+                metrics["prefill_time_ms"] = pm["prefill_time_ms"]
+                metrics["prefill_time_s"] = pm["prefill_time_s"]
+
+        generated_text = output.outputs[0].text if output.outputs else ""
         request_results.append(
             {
                 "request_id": output.request_id,
@@ -444,18 +675,20 @@ def main():
             }
         )
 
-    # Compute summary statistics.
     n = len(request_results)
     summary = {}
     if n > 0:
-        # Only count actual encoder runs (exclude cache hits where VE = 0).
         ve_times_actual = [
             r["vision_encoder_time_ms"]
             for r in request_results
             if r["vision_encoder_time_ms"] > 0
         ]
-        prefill_times = [r.get("prefill_time_ms", 0.0) for r in request_results]
-        decode_times = [r.get("decode_time_ms", 0.0) for r in request_results]
+        prefill_times = [
+            r.get("prefill_time_ms", 0.0) for r in request_results
+        ]
+        decode_times = [
+            r.get("decode_time_ms", 0.0) for r in request_results
+        ]
         tpots = [r.get("tpot_ms", 0.0) for r in request_results]
         total_decode_tokens = sum(
             r.get("num_generation_tokens", 0) for r in request_results
@@ -463,6 +696,7 @@ def main():
 
         num_ve_runs = len(ve_times_actual)
         summary = {
+            "mode": mode,
             "num_requests": n,
             "num_encoder_runs": num_ve_runs,
             "total_decode_tokens": total_decode_tokens,
@@ -476,9 +710,9 @@ def main():
             "avg_tpot_ms": round(sum(tpots) / n, 3),
         }
 
-    # Build final output.
     final_output = {
         "model": args.model,
+        "mode": mode,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "config": {
             "max_model_len": args.max_model_len,
@@ -492,16 +726,16 @@ def main():
         "requests": request_results,
     }
 
-    # Write to file.
     output_file = OUTPUT_DIR / f"latency_{timestamp}.json"
     with open(output_file, "w") as f:
         json.dump(final_output, f, indent=2, ensure_ascii=False)
     print(f"\nResults written to: {output_file}")
 
     # Print summary table.
+    mode_label = "DISAGG (prefill GPU0 + decode GPU1)" if mode == "disagg" else "SINGLE GPU"
     print("\n" + "=" * 80)
     print(f"{'LATENCY MEASUREMENT SUMMARY':^80}")
-    print(f"Model: {args.model}")
+    print(f"Model: {args.model}  |  Mode: {mode_label}")
     print("=" * 80)
     header = (
         f"{'Req':>4} | {'Image Source':<30} | {'VE(ms)':>8} | "

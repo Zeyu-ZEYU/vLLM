@@ -103,6 +103,23 @@ Requests can include multiple images. The prompt template automatically adds one
 
 The script sets `limit_mm_per_prompt` to the maximum number of images in any single request.
 
+### PD Disaggregated Mode (2 GPUs)
+
+Run vision encoder + prefill on GPU 0 and decode on GPU 1:
+
+```bash
+python zeyu/run_qwen35_vision_offline.py \
+    --model /path/to/Qwen3.5-9B \
+    --disagg
+```
+
+This launches two processes using vLLM's `P2pNcclConnector` for KV cache transfer between GPUs. Vision encoding and prefill happen on GPU 0, then KV caches are transferred to GPU 1 for decode. Requires 2 GPUs visible to the process.
+
+With profiling:
+```bash
+bash zeyu/profile_run.sh --nsys-only --model /path/to/Qwen3.5-9B --disagg
+```
+
 ## CLI Arguments
 
 | Argument | Default | Description |
@@ -110,6 +127,7 @@ The script sets `limit_mm_per_prompt` to the maximum number of images in any sin
 | `--model` | `Qwen/Qwen3.5-9B` | HuggingFace model identifier or local path |
 | `--input` | (none) | Path to JSONL file with requests. Uses built-in examples if not provided. |
 | `--delay` | (none) | Global delay override in ms. Overrides all per-request delay values. |
+| `--disagg` | off | Enable PD disaggregation (prefill+encoder on GPU 0, decode on GPU 1) |
 | `--max-model-len` | `4096` | Maximum context length |
 | `--max-num-seqs` | `5` | Maximum batch size |
 | `--max-tokens` | `128` | Max generated tokens per request |

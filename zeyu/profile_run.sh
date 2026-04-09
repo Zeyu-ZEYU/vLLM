@@ -77,6 +77,7 @@ if $RUN_NSYS; then
     nsys profile \
         --trace=cuda,nvtx \
         --cuda-graph-trace=node \
+        --trace-fork-before-exec=true \
         --output="$OUT_DIR/nsys_report" \
         --force-overwrite=true \
         python "$PYTHON_SCRIPT" "${SCRIPT_ARGS[@]}"
