@@ -571,12 +571,11 @@ def main():
                     record["vision_encoder_gpu_util_pct"] = ve_gpu[
                         "gpu_util_pct"
                     ]
-                    record["vision_encoder_kernel_launch_gap_ns"] = ve_gpu[
-                        "kernel_launch_gap_ns"
-                    ]
-                    record["vision_encoder_kernel_launch_gap_pct"] = ve_gpu[
-                        "kernel_launch_gap_pct"
-                    ]
+                    ve_gap_ns = ve_gpu["kernel_launch_gap_ns"]
+                    record["vision_encoder_kernel_launch_gap_ns"] = ve_gap_ns
+                    record["vision_encoder_kernel_launch_gap_pct"] = round(
+                        ve_gap_ns / rng["duration_ns"] * 100, 2
+                    ) if rng["duration_ns"] > 0 else 0.0
             record["vision_encoder_kernel_time_ns"] = ve_kernel_time_ns
 
             # Check if this iteration overlaps a text forward NVTX range.
@@ -603,12 +602,11 @@ def main():
                     record["text_forward_kernel_time_ns"] = fwd_gpu[
                         "total_kernel_time_ns"
                     ]
-                    record["text_forward_kernel_launch_gap_ns"] = fwd_gpu[
-                        "kernel_launch_gap_ns"
-                    ]
-                    record["text_forward_kernel_launch_gap_pct"] = fwd_gpu[
-                        "kernel_launch_gap_pct"
-                    ]
+                    fwd_gap_ns = fwd_gpu["kernel_launch_gap_ns"]
+                    record["text_forward_kernel_launch_gap_ns"] = fwd_gap_ns
+                    record["text_forward_kernel_launch_gap_pct"] = round(
+                        fwd_gap_ns / rng["duration_ns"] * 100, 2
+                    ) if rng["duration_ns"] > 0 else 0.0
                     break  # one forward per iteration
 
             # Enrich with ncu SM metrics.
