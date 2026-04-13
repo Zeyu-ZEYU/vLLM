@@ -233,18 +233,27 @@ def correlate_kernels_to_ranges(
 
 
 def compute_gpu_util(
-    kernels: list[dict], wall_time_ns: int
+    kernels: list[dict],
+    wall_time_ns: int,
+    window_start_ns: int | None = None,
+    window_end_ns: int | None = None,
 ) -> dict:
     """Compute GPU utilization from a set of kernels within a time window.
 
     Returns dict with gpu_util_pct, total_kernel_time_ns, num_kernels.
     Handles overlapping kernels by computing non-overlapping coverage.
+
+    If *window_start_ns* and *window_end_ns* are provided, kernel
+    intervals are clipped to that window so that kernels extending
+    beyond the measurement range do not inflate utilization above 100%.
     """
     if wall_time_ns <= 0 or not kernels:
         return {
             "gpu_util_pct": 0.0,
             "total_kernel_time_ns": 0,
             "num_kernels": 0,
+            "kernel_launch_gap_ns": 0,
+            "kernel_launch_gap_pct": 0.0,
         }
 
     # Sort intervals by start, merge overlaps to get true busy time.
@@ -252,6 +261,23 @@ def compute_gpu_util(
         [(k["start_ns"], k["end_ns"]) for k in kernels],
         key=lambda x: x[0],
     )
+
+    # Clip intervals to the measurement window.
+    if window_start_ns is not None and window_end_ns is not None:
+        intervals = [
+            (max(s, window_start_ns), min(e, window_end_ns))
+            for s, e in intervals
+        ]
+        intervals = [(s, e) for s, e in intervals if s < e]
+
+    if not intervals:
+        return {
+            "gpu_util_pct": 0.0,
+            "total_kernel_time_ns": 0,
+            "num_kernels": len(kernels),
+            "kernel_launch_gap_ns": wall_time_ns,
+            "kernel_launch_gap_pct": 100.0,
+        }
     merged_time = 0
     cur_start, cur_end = intervals[0]
     for start, end in intervals[1:]:
@@ -514,7 +540,12 @@ def main():
         if i < len(nvtx_ranges):
             rng = nvtx_ranges[i]
             iter_kernels = kernels_per_iter[i]
-            gpu_metrics = compute_gpu_util(iter_kernels, rng["duration_ns"])
+            gpu_metrics = compute_gpu_util(
+                iter_kernels,
+                rng["duration_ns"],
+                window_start_ns=rng["start_ns"],
+                window_end_ns=rng["end_ns"],
+            )
             record.update(gpu_metrics)
 
             # Check if this iteration overlaps a vision_encoder NVTX range.
@@ -531,7 +562,10 @@ def main():
                         and k["start_ns"] < ve_rng["end_ns"]
                     ]
                     ve_gpu = compute_gpu_util(
-                        ve_kernels, ve_rng["duration_ns"]
+                        ve_kernels,
+                        ve_rng["duration_ns"],
+                        window_start_ns=ve_rng["start_ns"],
+                        window_end_ns=ve_rng["end_ns"],
                     )
                     ve_kernel_time_ns = ve_gpu["total_kernel_time_ns"]
                     record["vision_encoder_gpu_util_pct"] = ve_gpu[
@@ -558,7 +592,10 @@ def main():
                         and k["start_ns"] < fwd_rng["end_ns"]
                     ]
                     fwd_gpu = compute_gpu_util(
-                        fwd_kernels, fwd_rng["duration_ns"]
+                        fwd_kernels,
+                        fwd_rng["duration_ns"],
+                        window_start_ns=fwd_rng["start_ns"],
+                        window_end_ns=fwd_rng["end_ns"],
                     )
                     record["text_forward_gpu_util_pct"] = fwd_gpu[
                         "gpu_util_pct"
