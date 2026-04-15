@@ -47,6 +47,8 @@ fe_rnic/
 ├── ray_start.sh                       # Ray 集群启动 (export env + ray start)
 ├── disagg_vllm_launcher.sh            # vLLM 启动入口 (prefill/decode/proxy)
 ├── disagg_proxy_server.py             # PD 分离代理 (来自 LMCache, 见下方说明)
+├── benchmark.py                       # Metrics 收集 (RPS, TTFT, TBT, JCT)
+├── gen_synthetic_data.py              # 合成数据生成 (10K~100K tokens)
 ├── clean.sh                           # 清理残留进程
 ├── configs/
 │   ├── mooncake-prefiller-config.yaml # Prefiller mooncake 配置模板
@@ -220,3 +222,22 @@ bash clean.sh --all    # 清理所有 4 个节点 (需从 node-0 执行)
    部分 KV chunk 可通过机头 RNIC (mlx5_0) 传输。分流策略由
    `LMCache/lmcache/v1/kv_routing.py` 的 `route_kv_chunk()` 函数控制，
    默认全走机尾。修改函数返回值可临时切换为全机头实验。
+
+## Benchmark
+
+**快速测试:**
+```bash
+python benchmark.py --url http://192.168.0.42:9090 --num-requests 5 --max-tokens 20
+```
+
+**合成数据测试 (Poisson 发送):**
+```bash
+# 生成数据
+python gen_synthetic_data.py --input-lens 1024,2048 --num-per-len 5 -o /tmp/data.jsonl
+
+# 运行 benchmark
+python benchmark.py --url http://192.168.0.42:9090 --dataset /tmp/data.jsonl --qps 1.0 \
+  --output-dir /home/zeyu/exp_results/fe_rnic --tag test1
+```
+
+**收集的 Metrics:** RPS, TTFT (ms), TBT (ms), JCT (ms), avg output tokens

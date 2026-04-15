@@ -37,12 +37,24 @@ import numpy as np
 class RequestResult:
     req_id: int
     prompt_len: int
-    output_tokens: int
-    ttft: float          # seconds
+    output_tokens: int = 0
+    ttft: float = 0.0    # seconds
     itl: list[float] = field(default_factory=list)  # inter-token latencies
     jct: float = 0.0     # job completion time (seconds)
     success: bool = True
     error: str = ""
+
+
+def _pcts(data: list[float]) -> dict:
+    """Compute P25/P50/P75/P95 for a list of values."""
+    if not data:
+        return {"p25": 0, "p50": 0, "p75": 0, "p95": 0}
+    return {
+        "p25": float(np.percentile(data, 25)),
+        "p50": float(np.percentile(data, 50)),
+        "p75": float(np.percentile(data, 75)),
+        "p95": float(np.percentile(data, 95)),
+    }
 
 
 @dataclass
@@ -53,20 +65,22 @@ class BenchmarkResult:
     total_time: float            # seconds
     rps: float                   # requests per second
 
+    # ITL — Inter-Token Latency (ms)
+    itl_p25: float
+    itl_p50: float
+    itl_p75: float
+    itl_p95: float
+
+    # E2EL — End-to-End Latency (ms)
+    e2el_p25: float
+    e2el_p50: float
+    e2el_p75: float
+    e2el_p95: float
+
     # TTFT (ms)
     ttft_mean: float
     ttft_median: float
     ttft_p99: float
-
-    # TBT / ITL (ms)
-    tbt_mean: float
-    tbt_median: float
-    tbt_p99: float
-
-    # JCT (ms)
-    jct_mean: float
-    jct_median: float
-    jct_p99: float
 
     # Decode
     avg_output_tokens: float
@@ -164,13 +178,25 @@ async def run_benchmark(args) -> BenchmarkResult:
 
     # Build prompts
     prompts = []
-    if args.synthetic:
+    max_tokens_list = []
+    if args.dataset:
+        import jsonlines  # noqa: F811
+        with open(args.dataset, "r") as f:
+            for line in f:
+                req = json.loads(line.strip())
+                prompts.append(req["prompt"])
+                max_tokens_list.append(req.get("max_tokens", args.max_tokens))
+        args.num_requests = len(prompts)
+    elif args.synthetic:
         for _ in range(args.num_requests):
             prompts.append(generate_synthetic_prompt(args.input_len))
     elif args.prompt:
         prompts = [args.prompt] * args.num_requests
     else:
         prompts = ["Hello, my name is"] * args.num_requests
+
+    if not max_tokens_list:
+        max_tokens_list = [args.max_tokens] * len(prompts)
 
     # Poisson arrival if qps > 0
     arrival_times: list[float] = []
@@ -205,7 +231,7 @@ async def run_benchmark(args) -> BenchmarkResult:
             task = asyncio.create_task(
                 send_request(
                     session, args.url, prompts[i],
-                    args.max_tokens, args.model, i,
+                    max_tokens_list[i], args.model, i,
                 )
             )
             tasks.append(task)
@@ -225,17 +251,20 @@ async def run_benchmark(args) -> BenchmarkResult:
             num_requests=args.num_requests,
             num_completed=0, num_failed=len(failed),
             total_time=total_time, rps=0,
+            itl_p25=0, itl_p50=0, itl_p75=0, itl_p95=0,
+            e2el_p25=0, e2el_p50=0, e2el_p75=0, e2el_p95=0,
             ttft_mean=0, ttft_median=0, ttft_p99=0,
-            tbt_mean=0, tbt_median=0, tbt_p99=0,
-            jct_mean=0, jct_median=0, jct_p99=0,
             avg_output_tokens=0, avg_input_tokens=0,
         )
 
     ttfts = [r.ttft * 1000 for r in completed]  # ms
-    jcts = [r.jct * 1000 for r in completed]     # ms
+    e2els = [r.jct * 1000 for r in completed]    # ms (E2EL = JCT)
     all_itls = []
     for r in completed:
         all_itls.extend([x * 1000 for x in r.itl])  # ms
+
+    itl_pcts = _pcts(all_itls)
+    e2el_pcts = _pcts(e2els)
 
     result = BenchmarkResult(
         num_requests=args.num_requests,
@@ -244,17 +273,19 @@ async def run_benchmark(args) -> BenchmarkResult:
         total_time=total_time,
         rps=len(completed) / total_time if total_time > 0 else 0,
 
+        itl_p25=itl_pcts["p25"],
+        itl_p50=itl_pcts["p50"],
+        itl_p75=itl_pcts["p75"],
+        itl_p95=itl_pcts["p95"],
+
+        e2el_p25=e2el_pcts["p25"],
+        e2el_p50=e2el_pcts["p50"],
+        e2el_p75=e2el_pcts["p75"],
+        e2el_p95=e2el_pcts["p95"],
+
         ttft_mean=float(np.mean(ttfts)),
         ttft_median=float(np.median(ttfts)),
         ttft_p99=float(np.percentile(ttfts, 99)) if len(ttfts) > 1 else ttfts[0],
-
-        tbt_mean=float(np.mean(all_itls)) if all_itls else 0,
-        tbt_median=float(np.median(all_itls)) if all_itls else 0,
-        tbt_p99=float(np.percentile(all_itls, 99)) if len(all_itls) > 1 else (all_itls[0] if all_itls else 0),
-
-        jct_mean=float(np.mean(jcts)),
-        jct_median=float(np.median(jcts)),
-        jct_p99=float(np.percentile(jcts, 99)) if len(jcts) > 1 else jcts[0],
 
         avg_output_tokens=float(np.mean([r.output_tokens for r in completed])),
         avg_input_tokens=float(np.mean([r.prompt_len for r in completed])),
@@ -279,10 +310,10 @@ def print_results(result: BenchmarkResult):
     print()
     print(f"  TTFT (ms):    mean={result.ttft_mean:.1f}  "
           f"median={result.ttft_median:.1f}  p99={result.ttft_p99:.1f}")
-    print(f"  TBT  (ms):    mean={result.tbt_mean:.1f}  "
-          f"median={result.tbt_median:.1f}  p99={result.tbt_p99:.1f}")
-    print(f"  JCT  (ms):    mean={result.jct_mean:.1f}  "
-          f"median={result.jct_median:.1f}  p99={result.jct_p99:.1f}")
+    print(f"  ITL  (ms):    P25={result.itl_p25:.1f}  P50={result.itl_p50:.1f}  "
+          f"P75={result.itl_p75:.1f}  P95={result.itl_p95:.1f}")
+    print(f"  E2EL (ms):    P25={result.e2el_p25:.1f}  P50={result.e2el_p50:.1f}  "
+          f"P75={result.e2el_p75:.1f}  P95={result.e2el_p95:.1f}")
     print("=" * 60)
 
 
@@ -330,6 +361,8 @@ def main():
                         help="Approximate input length in tokens (with --synthetic)")
     parser.add_argument("--prompt", type=str, default=None,
                         help="Fixed prompt to use for all requests")
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="JSONL file from gen_synthetic_data.py")
 
     # Output
     parser.add_argument("--output-dir", type=str, default=None,
