@@ -45,11 +45,24 @@ cleanup_node() {
         killed=$((killed + $(echo "$orphan_pids" | wc -w)))
     fi
 
+    # 清理 VLLM::APIServer / DPCoordin / resource_tracker 僵尸进程
+    # (这些进程不被上面的 pgrep -f 匹配到，因为进程名不含上述 pattern)
+    local zombie_pids
+    zombie_pids=$(ps aux | grep -E "VLLM::|DPCoordin|resource_tracker" | grep -v grep | awk '{print $2}' || true)
+    if [[ -n "$zombie_pids" ]]; then
+        echo "  杀掉 [VLLM/DPCoordin/resource_tracker zombies]: $(echo $zombie_pids | wc -w) 个"
+        echo "$zombie_pids" | xargs kill -9 2>/dev/null || true
+        killed=$((killed + $(echo "$zombie_pids" | wc -w)))
+    fi
+
     # 清理 Ray
     if command -v ray &>/dev/null; then
         echo "  停止 Ray..."
         ray stop --force 2>/dev/null || true
     fi
+
+    # 清理临时文件
+    rm -f /tmp/engine_* 2>/dev/null || true
 
     # 清理共享内存 (NCCL / Mooncake 可能残留)
     local shm_files
@@ -85,7 +98,7 @@ if [[ "${1:-}" == "--all" ]]; then
     echo ""
     for node in lj1.zeyu.tw lj2.zeyu.tw lj3.zeyu.tw; do
         echo "[${node}]"
-        ssh -o ConnectTimeout=5 "zeyu@${node}" "$(declare -f cleanup_node); cleanup_node" 2>/dev/null || echo "  连接失败: $node"
+        ssh -o ConnectTimeout=5 "zeyu@${node}" "docker exec -u zeyu fe_rnic bash -c 'export PATH=/home/zeyu/miniforge3/envs/fe_rnic/bin:\$PATH && cd /home/zeyu/vllm/fe_rnic/fe_rnic && bash clean.sh'" 2>/dev/null || echo "  连接失败: $node"
         echo ""
     done
     echo "========== 全部清理完成 =========="

@@ -72,6 +72,21 @@ if [[ -n "$output" ]]; then
 fi
 export LMCACHE_USE_EXPERIMENTAL=True
 
+# Head NIC splitting: generate head config if enabled
+ENABLE_HEAD_NIC_SPLIT="${ENABLE_HEAD_NIC_SPLIT:-false}"
+if [[ "$ENABLE_HEAD_NIC_SPLIT" == "true" ]]; then
+    head_template="$SCRIPT_DIR/configs/mooncake-head-nic-config.yaml"
+    head_output="/tmp/mooncake-head-nic-config.yaml"
+    LOCAL_HEAD_IP="${LOCAL_HEAD_IP:-${LOCAL_IP}}"
+    if [[ -f "$head_template" ]]; then
+        sed -e "s|{MASTER_IP}|${MASTER_IP}|g" \
+            -e "s|{LOCAL_HEAD_IP}|${LOCAL_HEAD_IP}|g" \
+            "$head_template" > "$head_output"
+        export LMCACHE_HEAD_NIC_CONFIG_FILE="$head_output"
+        echo "[ray_start] Head NIC config: $head_output (device=mlx5_0)"
+    fi
+fi
+
 # vLLM multiprocessing
 export VLLM_ENABLE_V1_MULTIPROCESSING=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn

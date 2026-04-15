@@ -49,6 +49,9 @@ PROXY_PORT="${PROXY_PORT:-9090}"
 # KV overlap: layerwise KV transfer overlapping with prefill computation
 ENABLE_KV_OVERLAP="${ENABLE_KV_OVERLAP:-false}"
 
+# Head NIC splitting: route some KV chunks via management RNIC (mlx5_0)
+ENABLE_HEAD_NIC_SPLIT="${ENABLE_HEAD_NIC_SPLIT:-false}"
+
 export PYTHONHASHSEED="${VLLM_PYTHON_HASH_SEED:-123}"
 
 # ======================== 工具函数 ========================
@@ -120,6 +123,12 @@ prefill)
         KV_EXTRA="${KV_EXTRA},\"lmcache.use_layerwise\":true"
         echo "[prefill] KV overlap 已启用 (layerwise)"
     fi
+    if [[ "$ENABLE_HEAD_NIC_SPLIT" == "true" ]]; then
+        HEAD_CFG="${LMCACHE_HEAD_NIC_CONFIG_FILE:-/tmp/mooncake-head-nic-config.yaml}"
+        KV_EXTRA="${KV_EXTRA},\"lmcache.enable_head_nic_split\":true"
+        KV_EXTRA="${KV_EXTRA},\"lmcache.head_nic_config_file\":\"${HEAD_CFG}\""
+        echo "[prefill] Head NIC 分流已启用 (config=$HEAD_CFG)"
+    fi
     KV_EXTRA="${KV_EXTRA}}"
     KV_CONFIG="{\"kv_connector\":\"LMCacheConnectorV1\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":${KV_EXTRA}}"
 
@@ -168,6 +177,17 @@ decode)
     echo "[decode] IB 设备: $IB_DEVICES"
     echo "[decode] DP backend: Ray (单节点)"
 
+    # Build decode kv-transfer-config
+    DEC_KV_EXTRA='{"discard_partial_chunks":false,"lmcache_rpc_port":"consumer1"'
+    if [[ "$ENABLE_HEAD_NIC_SPLIT" == "true" ]]; then
+        HEAD_CFG="${LMCACHE_HEAD_NIC_CONFIG_FILE:-/tmp/mooncake-head-nic-config.yaml}"
+        DEC_KV_EXTRA="${DEC_KV_EXTRA},\"lmcache.enable_head_nic_split\":true"
+        DEC_KV_EXTRA="${DEC_KV_EXTRA},\"lmcache.head_nic_config_file\":\"${HEAD_CFG}\""
+        echo "[decode] Head NIC 分流已启用 (config=$HEAD_CFG)"
+    fi
+    DEC_KV_EXTRA="${DEC_KV_EXTRA}}"
+    DEC_KV_CONFIG="{\"kv_connector\":\"LMCacheConnectorV1\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":${DEC_KV_EXTRA}}"
+
     UCX_TLS=all \
     LMCACHE_CONFIG_FILE="$config_file" \
     LMCACHE_USE_EXPERIMENTAL=True \
@@ -190,8 +210,7 @@ decode)
         --max-num-batched-tokens 10000 \
         --max-num-seqs 256 \
         --gpu-memory-utilization 0.9 \
-        --kv-transfer-config \
-        '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_consumer","kv_connector_extra_config":{"discard_partial_chunks":false,"lmcache_rpc_port":"consumer1"}}'
+        --kv-transfer-config "$DEC_KV_CONFIG"
     ;;
 
 # ------------------------------------------------------------------

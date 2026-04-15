@@ -216,3 +216,7 @@ bash clean.sh --all    # 清理所有 4 个节点 (需从 node-0 执行)
 6. **KV Overlap**: 通过 `ENABLE_KV_OVERLAP=true` 启用 layerwise KV 传输。
    Prefill 每计算一层就 RDMA WRITE KV 到 decode 节点的 Mooncake segment，
    与后续层的 GPU 计算 pipeline 化。需同时在 proxy 传入 `DECODE_RDMA_IPS`。
+7. **Head NIC 分流**: 通过 `ENABLE_HEAD_NIC_SPLIT=true` 启用（需在 ray_start.sh 前设置）。
+   部分 KV chunk 可通过机头 RNIC (mlx5_0) 传输。分流策略由
+   `LMCache/lmcache/v1/kv_routing.py` 的 `route_kv_chunk()` 函数控制，
+   默认全走机尾。修改函数返回值可临时切换为全机头实验。

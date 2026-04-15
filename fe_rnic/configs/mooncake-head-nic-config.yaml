@@ -1,0 +1,25 @@
+# ============================================================================
+# Mooncake LMCache config — Head NIC (管理网 RNIC mlx5_0)
+# 用于 KV 机头分流: 部分 KV chunk 通过机头 RNIC 传输
+#
+# 占位符由 ray_start.sh 启动时 sed 替换
+#   {MASTER_IP}      — mooncake master IPv4
+#   {LOCAL_HEAD_IP}  — 当前节点机头 RNIC 的 IPv4 地址 (eth0)
+# ============================================================================
+
+chunk_size: 256
+remote_url: "mooncakestore://{MASTER_IP}:50052/"
+remote_serde: "naive"
+local_cpu: False
+max_local_cpu_size: 100
+
+extra_config:
+  local_hostname: "{LOCAL_HEAD_IP}"
+  metadata_server: "http://{MASTER_IP}:8080/metadata"
+  protocol: "rdma"
+  device_name: "mlx5_0"
+  master_server_address: "{MASTER_IP}:50052"
+  global_segment_size: 4294967296                    # 4 GB (head NIC 分流量较小)
+  local_buffer_size:    1073741824                    # 1 GB
+  transfer_timeout: 10
+  save_chunk_meta: False
