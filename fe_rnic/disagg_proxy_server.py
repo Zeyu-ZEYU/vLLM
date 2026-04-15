@@ -100,6 +100,9 @@ async def lifespan(app: FastAPI):
         len(dec_hosts) == 1 and len(dec_ports) == 1 and global_args.num_decoders > 1
     )
 
+    # Resolve per-decoder RDMA hostnames (for KV overlap)
+    dec_rdma_hosts = global_args.decoder_rdma_host or []
+
     for i, (host, port) in enumerate(decoder_pairs):
         decoder_base_url = f"http://{host}:{int(port)}"
         decode_client = httpx.AsyncClient(timeout=None, base_url=decoder_base_url)
@@ -112,12 +115,18 @@ async def lifespan(app: FastAPI):
             init_ports = list(global_args.decoder_init_port)
             alloc_ports = list(global_args.decoder_alloc_port)
 
+        # Map decoder index to its RDMA hostname (if available)
+        rdma_host = None
+        if dec_rdma_hosts:
+            rdma_host = dec_rdma_hosts[i % len(dec_rdma_hosts)]
+
         app.state.decode_clients.append(
             ClientInfo(
                 decode_client,
                 host,
                 init_ports,
                 alloc_ports,
+                rdma_host,
             )
         )
 
@@ -194,6 +203,12 @@ def parse_args():
     parser.add_argument("--decoder-port", type=csv_ints, default=[8200])
     parser.add_argument("--decoder-init-port", type=csv_ints, default=[8300])
     parser.add_argument("--decoder-alloc-port", type=csv_ints, default=[8400])
+    parser.add_argument(
+        "--decoder-rdma-host",
+        type=csv_strs,
+        default=None,
+        help="Decode nodes' Mooncake RDMA hostnames (IPv6) for KV overlap",
+    )
 
     parser.add_argument("--num-decoders", type=int, default=1)
     parser.add_argument("--proxy-host", type=str, default="localhost")
@@ -207,6 +222,7 @@ def parse_args():
 class ClientInfo:
     client: httpx.AsyncClient
     host: Optional[str] = None
+    rdma_host: Optional[str] = None  # Mooncake RDMA hostname for KV overlap
     init_port: Optional[list[int]] = None
     alloc_port: Optional[list[int]] = None
 
@@ -378,6 +394,8 @@ async def handle_completions(request: Request):
             "receiver_init_port": decode_client.init_port,
             "receiver_alloc_port": decode_client.alloc_port,
         }
+        if decode_client.rdma_host:
+            disagg_spec["receiver_rdma_host"] = decode_client.rdma_host
         num_tp_rank = len(decode_client.init_port or [])
 
         req_data["kv_transfer_params"] = {
@@ -484,6 +502,8 @@ async def handle_chat_completions(request: Request):
             "receiver_init_port": decode_client.init_port,
             "receiver_alloc_port": decode_client.alloc_port,
         }
+        if decode_client.rdma_host:
+            disagg_spec["receiver_rdma_host"] = decode_client.rdma_host
 
         num_tp_rank = len(decode_client.init_port or [])
 

@@ -46,6 +46,9 @@ DECODE_TP="${DECODE_TP:-1}"
 
 PROXY_PORT="${PROXY_PORT:-9090}"
 
+# KV overlap: layerwise KV transfer overlapping with prefill computation
+ENABLE_KV_OVERLAP="${ENABLE_KV_OVERLAP:-false}"
+
 export PYTHONHASHSEED="${VLLM_PYTHON_HASH_SEED:-123}"
 
 # ======================== 工具函数 ========================
@@ -111,6 +114,15 @@ prefill)
     echo "[prefill] IB 设备: $IB_DEVICES"
     echo "[prefill] DP backend: Ray"
 
+    # Build kv-transfer-config JSON
+    KV_EXTRA='{"discard_partial_chunks":false,"lmcache_rpc_port":"producer1"'
+    if [[ "$ENABLE_KV_OVERLAP" == "true" ]]; then
+        KV_EXTRA="${KV_EXTRA},\"lmcache.use_layerwise\":true"
+        echo "[prefill] KV overlap 已启用 (layerwise)"
+    fi
+    KV_EXTRA="${KV_EXTRA}}"
+    KV_CONFIG="{\"kv_connector\":\"LMCacheConnectorV1\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":${KV_EXTRA}}"
+
     # 环境变量（已由 ray_start.sh export，这里再设一次确保 vllm serve 也有）
     UCX_TLS=all \
     LMCACHE_CONFIG_FILE="$config_file" \
@@ -136,8 +148,7 @@ prefill)
         --max-num-seqs 256 \
         --gpu-memory-utilization 0.9 \
         --no-enable-prefix-caching \
-        --kv-transfer-config \
-        '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_producer","kv_connector_extra_config":{"discard_partial_chunks":false,"lmcache_rpc_port":"producer1"}}'
+        --kv-transfer-config "$KV_CONFIG"
     ;;
 
 # ------------------------------------------------------------------
@@ -198,6 +209,12 @@ proxy)
     echo "[proxy] Prefiller: ${PREFILL_PRIMARY_IP}:${PREFILL_PORT}"
     echo "[proxy] Decoders ($NUM_DECODERS): ${DECODE_HOSTS} port=${DECODE_PORT}"
 
+    RDMA_HOST_ARG=""
+    if [[ -n "${DECODE_RDMA_IPS:-}" ]]; then
+        RDMA_HOST_ARG="--decoder-rdma-host $DECODE_RDMA_IPS"
+        echo "[proxy] Decode RDMA hosts: ${DECODE_RDMA_IPS}"
+    fi
+
     python3 "$SCRIPT_DIR/disagg_proxy_server.py" \
         --host "0.0.0.0" \
         --port "$PROXY_PORT" \
@@ -206,7 +223,8 @@ proxy)
         --num-prefillers 1 \
         --decoder-host "$DECODE_HOSTS" \
         --decoder-port "$DECODE_PORTS" \
-        --num-decoders "$NUM_DECODERS"
+        --num-decoders "$NUM_DECODERS" \
+        $RDMA_HOST_ARG
     ;;
 
 # ------------------------------------------------------------------

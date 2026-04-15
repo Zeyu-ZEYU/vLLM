@@ -162,6 +162,22 @@ DECODE_IPS=192.168.0.39,192.168.0.41 \
   bash disagg_vllm_launcher.sh proxy
 ```
 
+**启用 KV Overlap (可选):**
+
+KV overlap 使 prefill 的 KV 传输与 GPU 计算 pipeline 化（layerwise RDMA WRITE 到 decode 节点）：
+```bash
+# Prefill 启动时加 ENABLE_KV_OVERLAP=true
+ENABLE_KV_OVERLAP=true \
+MASTER_IP=192.168.0.42 LOCAL_IP=192.168.0.42 LOCAL_RDMA_IP=fd03:4514:80:6240::1 \
+  bash disagg_vllm_launcher.sh prefill
+
+# Proxy 启动时加 DECODE_RDMA_IPS（decode 节点的 RDMA IPv6 地址）
+PREFILL_PRIMARY_IP=192.168.0.42 \
+DECODE_IPS=192.168.0.39,192.168.0.41 \
+DECODE_RDMA_IPS=fd03:4514:80:6600::1,fd03:4514:80:5f00::1 \
+  bash disagg_vllm_launcher.sh proxy
+```
+
 ### Step 6: 验证
 
 **completions 测试:**
@@ -195,5 +211,8 @@ bash clean.sh --all    # 清理所有 4 个节点 (需从 node-0 执行)
    是已知的非致命告警，不影响正常使用。
 5. **Proxy**: `disagg_proxy_server.py` 来自
    `LMCache/examples/disagg_prefill/disagg_proxy_server.py`，
-   唯一修改是 comment out 两处 `await wait_decode_kv_ready(req_id, num_tp_rank)`
-   (Mooncake Store 后端不需要 ZMQ 通知，参考 LMCache#1342)。
+   修改：comment out 两处 `await wait_decode_kv_ready` (LMCache#1342)，
+   新增 `--decoder-rdma-host` 参数支持 KV overlap。
+6. **KV Overlap**: 通过 `ENABLE_KV_OVERLAP=true` 启用 layerwise KV 传输。
+   Prefill 每计算一层就 RDMA WRITE KV 到 decode 节点的 Mooncake segment，
+   与后续层的 GPU 计算 pipeline 化。需同时在 proxy 传入 `DECODE_RDMA_IPS`。
