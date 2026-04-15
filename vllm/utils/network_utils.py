@@ -335,6 +335,12 @@ def make_zmq_socket(
         socket.setsockopt(zmq.IPV6, 1)
 
     if bind:
+        # Allow binding to TIME_WAIT ports to avoid startup failures
+        # when restarting quickly with DP=16 (many ports in use).
+        try:
+            socket.setsockopt(zmq.REUSEADDR, 1)
+        except zmq.ZMQError:
+            pass  # Not all socket types support REUSEADDR
         socket.bind(path)
     else:
         socket.connect(path)
