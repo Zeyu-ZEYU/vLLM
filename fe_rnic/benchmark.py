@@ -41,19 +41,25 @@ class RequestResult:
     ttft: float = 0.0    # seconds
     itl: list[float] = field(default_factory=list)  # inter-token latencies
     jct: float = 0.0     # job completion time (seconds)
+    # Server-side metrics (from prefill, ms)
+    prefill_time_ms: float = 0.0
+    kv_total_time_ms: float = 0.0
+    kv_exposed_time_ms: float = 0.0
     success: bool = True
     error: str = ""
 
 
+PCTL_KEYS = ("p25", "p50", "p75", "p90", "p95", "p99")
+PCTL_VALS = (25, 50, 75, 90, 95, 99)
+
+
 def _pcts(data: list[float]) -> dict:
-    """Compute P25/P50/P75/P95 for a list of values."""
+    """Compute P25/P50/P75/P90/P95/P99 for a list of values."""
     if not data:
-        return {"p25": 0, "p50": 0, "p75": 0, "p95": 0}
+        return {k: 0.0 for k in PCTL_KEYS}
     return {
-        "p25": float(np.percentile(data, 25)),
-        "p50": float(np.percentile(data, 50)),
-        "p75": float(np.percentile(data, 75)),
-        "p95": float(np.percentile(data, 95)),
+        k: float(np.percentile(data, v))
+        for k, v in zip(PCTL_KEYS, PCTL_VALS)
     }
 
 
@@ -65,22 +71,19 @@ class BenchmarkResult:
     total_time: float            # seconds
     rps: float                   # requests per second
 
-    # ITL — Inter-Token Latency (ms)
-    itl_p25: float
-    itl_p50: float
-    itl_p75: float
-    itl_p95: float
+    # TTFT — Time To First Token (ms)
+    ttft: dict  # {p25, p50, p75, p90, p95, p99}
 
-    # E2EL — End-to-End Latency (ms)
-    e2el_p25: float
-    e2el_p50: float
-    e2el_p75: float
-    e2el_p95: float
+    # ITL — Inter-Token Latency / TBT (ms)
+    itl: dict   # {p25, p50, p75, p90, p95, p99}
 
-    # TTFT (ms)
-    ttft_mean: float
-    ttft_median: float
-    ttft_p99: float
+    # E2EL — End-to-End Latency / JCT (ms)
+    e2el: dict  # {p25, p50, p75, p90, p95, p99}
+
+    # Server-side metrics (ms)
+    prefill_time: dict   # {p25..p99} prefill compute only
+    kv_total_time: dict  # {p25..p99} first layer start → last layer end
+    kv_exposed_time: dict  # {p25..p99} prefill end → last layer end
 
     # Decode
     avg_output_tokens: float
@@ -121,6 +124,7 @@ async def send_request(
             timeout=aiohttp.ClientTimeout(total=600),
         ) as resp:
             resp.raise_for_status()
+            first_chunk = True
             async for line in resp.content:
                 line_str = line.decode("utf-8").strip()
                 if not line_str.startswith("data: "):
@@ -129,6 +133,20 @@ async def send_request(
                 if data_str == "[DONE]":
                     break
                 token_times.append(time.perf_counter())
+                # Extract server-side metrics from first chunk
+                if first_chunk:
+                    first_chunk = False
+                    try:
+                        chunk_data = json.loads(data_str)
+                        sm = chunk_data.get("server_metrics", {})
+                        result.prefill_time_ms = sm.get(
+                            "prefill_time_ms", 0)
+                        result.kv_total_time_ms = sm.get(
+                            "kv_total_time_ms", 0)
+                        result.kv_exposed_time_ms = sm.get(
+                            "kv_exposed_time_ms", 0)
+                    except (json.JSONDecodeError, KeyError):
+                        pass
 
         t_end = time.perf_counter()
 
@@ -247,24 +265,22 @@ async def run_benchmark(args) -> BenchmarkResult:
 
     if not completed:
         print("ERROR: All requests failed!")
+        empty = {k: 0.0 for k in PCTL_KEYS}
         return BenchmarkResult(
             num_requests=args.num_requests,
             num_completed=0, num_failed=len(failed),
             total_time=total_time, rps=0,
-            itl_p25=0, itl_p50=0, itl_p75=0, itl_p95=0,
-            e2el_p25=0, e2el_p50=0, e2el_p75=0, e2el_p95=0,
-            ttft_mean=0, ttft_median=0, ttft_p99=0,
+            ttft=empty, itl=empty, e2el=empty,
+            prefill_time=empty, kv_total_time=empty,
+            kv_exposed_time=empty,
             avg_output_tokens=0, avg_input_tokens=0,
         )
 
     ttfts = [r.ttft * 1000 for r in completed]  # ms
-    e2els = [r.jct * 1000 for r in completed]    # ms (E2EL = JCT)
+    e2els = [r.jct * 1000 for r in completed]    # ms
     all_itls = []
     for r in completed:
         all_itls.extend([x * 1000 for x in r.itl])  # ms
-
-    itl_pcts = _pcts(all_itls)
-    e2el_pcts = _pcts(e2els)
 
     result = BenchmarkResult(
         num_requests=args.num_requests,
@@ -273,19 +289,13 @@ async def run_benchmark(args) -> BenchmarkResult:
         total_time=total_time,
         rps=len(completed) / total_time if total_time > 0 else 0,
 
-        itl_p25=itl_pcts["p25"],
-        itl_p50=itl_pcts["p50"],
-        itl_p75=itl_pcts["p75"],
-        itl_p95=itl_pcts["p95"],
+        ttft=_pcts(ttfts),
+        itl=_pcts(all_itls),
+        e2el=_pcts(e2els),
 
-        e2el_p25=e2el_pcts["p25"],
-        e2el_p50=e2el_pcts["p50"],
-        e2el_p75=e2el_pcts["p75"],
-        e2el_p95=e2el_pcts["p95"],
-
-        ttft_mean=float(np.mean(ttfts)),
-        ttft_median=float(np.median(ttfts)),
-        ttft_p99=float(np.percentile(ttfts, 99)) if len(ttfts) > 1 else ttfts[0],
+        prefill_time=_pcts([r.prefill_time_ms for r in completed]),
+        kv_total_time=_pcts([r.kv_total_time_ms for r in completed]),
+        kv_exposed_time=_pcts([r.kv_exposed_time_ms for r in completed]),
 
         avg_output_tokens=float(np.mean([r.output_tokens for r in completed])),
         avg_input_tokens=float(np.mean([r.prompt_len for r in completed])),
@@ -308,12 +318,20 @@ def print_results(result: BenchmarkResult):
     print(f"  Avg input:    {result.avg_input_tokens:.0f} tokens")
     print(f"  Avg output:   {result.avg_output_tokens:.0f} tokens")
     print()
-    print(f"  TTFT (ms):    mean={result.ttft_mean:.1f}  "
-          f"median={result.ttft_median:.1f}  p99={result.ttft_p99:.1f}")
-    print(f"  ITL  (ms):    P25={result.itl_p25:.1f}  P50={result.itl_p50:.1f}  "
-          f"P75={result.itl_p75:.1f}  P95={result.itl_p95:.1f}")
-    print(f"  E2EL (ms):    P25={result.e2el_p25:.1f}  P50={result.e2el_p50:.1f}  "
-          f"P75={result.e2el_p75:.1f}  P95={result.e2el_p95:.1f}")
+    def _fmt(d: dict) -> str:
+        return "  ".join(f"{k.upper()}={d[k]:.1f}" for k in PCTL_KEYS)
+
+    print(f"  TTFT (ms):        {_fmt(result.ttft)}")
+    print(f"  ITL  (ms):        {_fmt(result.itl)}")
+    print(f"  E2EL (ms):        {_fmt(result.e2el)}")
+    # Server-side metrics (from prefill worker logs)
+    has_server = any(v > 0 for v in result.kv_total_time.values())
+    if has_server:
+        print(f"  Prefill (ms):     {_fmt(result.prefill_time)}")
+        print(f"  KV total (ms):    {_fmt(result.kv_total_time)}")
+        print(f"  KV exposed (ms):  {_fmt(result.kv_exposed_time)}")
+    else:
+        print("  (Server-side KV metrics: see prefill log [METRICS])")
     print("=" * 60)
 
 

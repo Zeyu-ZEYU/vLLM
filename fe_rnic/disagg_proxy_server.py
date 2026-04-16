@@ -425,6 +425,15 @@ async def handle_completions(request: Request):
 
         # Stream response from decode service
         async def generate_stream():
+            # Extract server-side metrics from prefill response
+            server_metrics = {}
+            pf_params = prefill_output.get("kv_transfer_params", {})
+            if pf_params:
+                for k in ("prefill_time_ms", "kv_total_time_ms",
+                           "kv_exposed_time_ms"):
+                    if k in pf_params:
+                        server_metrics[k] = pf_params[k]
+
             head_chunk = {
                 "id": prefill_output["id"],
                 "object": "text_completion",
@@ -441,6 +450,8 @@ async def handle_completions(request: Request):
                 ],
                 "usage": None,
             }
+            if server_metrics:
+                head_chunk["server_metrics"] = server_metrics
             yield (
                 "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
             ).encode()
