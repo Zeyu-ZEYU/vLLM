@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import random
+import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -41,10 +42,12 @@ class RequestResult:
     ttft: float = 0.0    # seconds
     itl: list[float] = field(default_factory=list)  # inter-token latencies
     jct: float = 0.0     # job completion time (seconds)
-    # Server-side metrics (from prefill, ms)
+    server_id: str = ""   # completion id returned by proxy (cmpl-...)
+    # Server-side metrics (from prefill worker JSONL, ms)
     prefill_time_ms: float = 0.0
     kv_total_time_ms: float = 0.0
     kv_exposed_time_ms: float = 0.0
+    kv_mode: str = ""     # "layerwise" or "non_layerwise"
     success: bool = True
     error: str = ""
 
@@ -133,18 +136,12 @@ async def send_request(
                 if data_str == "[DONE]":
                     break
                 token_times.append(time.perf_counter())
-                # Extract server-side metrics from first chunk
+                # Capture server completion id from first chunk
                 if first_chunk:
                     first_chunk = False
                     try:
                         chunk_data = json.loads(data_str)
-                        sm = chunk_data.get("server_metrics", {})
-                        result.prefill_time_ms = sm.get(
-                            "prefill_time_ms", 0)
-                        result.kv_total_time_ms = sm.get(
-                            "kv_total_time_ms", 0)
-                        result.kv_exposed_time_ms = sm.get(
-                            "kv_exposed_time_ms", 0)
+                        result.server_id = chunk_data.get("id", "")
                     except (json.JSONDecodeError, KeyError):
                         pass
 
@@ -185,6 +182,95 @@ def generate_synthetic_prompt(input_len: int) -> str:
     num_words = int(input_len * 0.85)
     prompt_words = [random.choice(words) for _ in range(num_words)]
     return " ".join(prompt_words)
+
+
+# ---------------------------------------------------------------------------
+# Server-side metrics collection (from prefill worker JSONL files)
+# ---------------------------------------------------------------------------
+
+def _fetch_metrics_source(source: str) -> str:
+    """Fetch JSONL content from one source. Returns "" on failure.
+
+    source formats:
+      "local:/path/to/file"
+      "ssh:user@host:/path/to/file"
+    """
+    try:
+        if source.startswith("local:"):
+            path = source[len("local:"):]
+            if not os.path.exists(path):
+                return ""
+            with open(path) as f:
+                return f.read()
+        if source.startswith("ssh:"):
+            rest = source[len("ssh:"):]
+            # rest = "user@host:/path"
+            host, _, path = rest.partition(":")
+            cmd = ["ssh", "-o", "BatchMode=yes", "-o",
+                   "StrictHostKeyChecking=no", host, f"cat {path}"]
+            out = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=30)
+            return out.stdout
+    except Exception as e:
+        print(f"  [warn] failed to fetch {source}: {e}")
+    return ""
+
+
+def collect_server_metrics(sources: list[str]) -> dict[str, dict]:
+    """Fetch + parse JSONL from all sources. Key = adapter req_id."""
+    entries: dict[str, dict] = {}
+    for src in sources:
+        content = _fetch_metrics_source(src)
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rid = rec.get("req_id")
+            if not rid:
+                continue
+            # Last write wins if req_id repeats (chunked prefill).
+            if rid in entries and entries[rid].get("ts", 0) > rec.get("ts", 0):
+                continue
+            entries[rid] = rec
+    return entries
+
+
+def attach_server_metrics(
+    results: list[RequestResult], metrics: dict[str, dict],
+) -> int:
+    """Populate each result with matched server metrics.
+
+    Matching strategy: adapter's req_id looks like "cmpl-<hex>-<dp_rank>-<uuid>",
+    while the client sees server_id = "cmpl-<hex>" (or the full form). Match by
+    prefix in either direction.
+
+    Returns the count of matched results.
+    """
+    matched = 0
+    for r in results:
+        if not r.success or not r.server_id:
+            continue
+        hit = None
+        # Try exact match first
+        if r.server_id in metrics:
+            hit = metrics[r.server_id]
+        else:
+            # Prefix match: adapter req_id starts with client server_id
+            for rid, rec in metrics.items():
+                if rid.startswith(r.server_id) or r.server_id.startswith(rid):
+                    hit = rec
+                    break
+        if hit:
+            r.prefill_time_ms = float(hit.get("prefill_ms", 0))
+            r.kv_total_time_ms = float(hit.get("kv_total_ms", 0))
+            r.kv_exposed_time_ms = float(hit.get("kv_exposed_ms", 0))
+            r.kv_mode = hit.get("mode", "")
+            matched += 1
+    return matched
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +344,15 @@ async def run_benchmark(args) -> BenchmarkResult:
         t_bench_end = time.perf_counter()
 
     total_time = t_bench_end - t_bench_start
+
+    # Collect per-request server-side metrics from prefill worker JSONLs
+    if args.metrics_sources:
+        sources = [s.strip() for s in args.metrics_sources.split(",")
+                   if s.strip()]
+        metrics_map = collect_server_metrics(sources)
+        matched = attach_server_metrics(results, metrics_map)
+        print(f"  Server metrics: {matched}/{len(results)} matched "
+              f"from {len(metrics_map)} JSONL entries")
 
     # Aggregate metrics
     completed = [r for r in results if r.success]
@@ -387,6 +482,17 @@ def main():
                         help="Directory to save results JSON")
     parser.add_argument("--tag", type=str, default="",
                         help="Tag for result filename")
+
+    # Server-side metrics: comma-separated list of JSONL sources.
+    # Each source is "local:/path" or "ssh:user@host:/path". Content is
+    # merged by adapter req_id and matched to client results by prefix.
+    parser.add_argument(
+        "--metrics-sources", type=str,
+        default="local:/home/zeyu/lmcache_metrics.jsonl,"
+                "ssh:zeyu@lj1.zeyu.tw:/home/zeyu/lmcache_metrics.jsonl",
+        help="Comma-separated list of JSONL metric sources "
+             "(local:/path or ssh:user@host:/path). Empty to disable.",
+    )
 
     args = parser.parse_args()
 
