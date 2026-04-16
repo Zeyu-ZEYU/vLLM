@@ -51,6 +51,9 @@ else
 fi
 
 # ======================== 导出环境变量（Ray worker 会继承） ========================
+# NOTE: LD_LIBRARY_PATH (PyTorch libc10.so) is set permanently in the
+# conda env via: conda env config vars set LD_LIBRARY_PATH=...
+
 # NCCL — MoE EP 跨节点 all-to-all
 export GLOO_SOCKET_IFNAME=eth0
 export NCCL_SOCKET_IFNAME=eth0
