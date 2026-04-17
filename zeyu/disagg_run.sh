@@ -177,6 +177,10 @@ if $ENABLE_NSYS; then
 fi
 
 # Build the python command (possibly wrapped with nsys).
+# NOTE: nsys stats CSV exports are done on the LOCAL side after the
+# .nsys-rep file is copied back, to avoid a race where the launcher's
+# wait-for-python-PID loop exits before the remote bash wrapper finishes
+# its post-profile stats chain. Only `nsys profile` runs on remote.
 if $ENABLE_NSYS && [[ -n "$REMOTE_NSYS" ]]; then
     SM_METRICS_FLAG=""
     if $ENABLE_SM_METRICS; then
@@ -191,10 +195,7 @@ if $ENABLE_NSYS && [[ -n "$REMOTE_NSYS" ]]; then
             --output='$REMOTE_NSYS_REPORT' \
             --force-overwrite=true \
             "
-    REMOTE_NVTX_EXPORT=" && \
-    '$REMOTE_NSYS' stats -r cuda_gpu_trace --format csv --output '$REMOTE_OUT_DIR/decode/nsys_kernels' '$REMOTE_NSYS_REPORT.nsys-rep' 2>/dev/null || true; \
-    '$REMOTE_NSYS' stats -r nvtx_pushpop_trace --format csv --output '$REMOTE_OUT_DIR/decode/nsys_nvtx_pushpop' '$REMOTE_NSYS_REPORT.nsys-rep' 2>/dev/null || true; \
-    '$REMOTE_NSYS' stats -r gpu_metrics --format csv --output '$REMOTE_OUT_DIR/decode/nsys_gpu_metrics' '$REMOTE_NSYS_REPORT.nsys-rep' 2>/dev/null || true"
+    REMOTE_NVTX_EXPORT=""
     REMOTE_NVTX_ENV="export VLLM_NVTX_SCOPES_FOR_PROFILING=1 && "
 else
     REMOTE_PY_CMD_WRAP=""
@@ -329,6 +330,31 @@ for i in $(seq 1 600); do
     sleep 2
 done
 
+# If nsys is enabled, wait for the remote .nsys-rep file to stabilize
+# (mtime not changing for ≥5s). nsys runs post-profile finalization in the
+# bash wrapper after python exits, which can take tens of seconds for
+# large captures.
+if $ENABLE_NSYS; then
+    REMOTE_REP="$REMOTE_OUT_DIR/decode/nsys_report.nsys-rep"
+    echo "[launcher] Waiting for remote nsys report to finalize: $REMOTE_REP"
+    prev_size=""
+    stable_count=0
+    for i in $(seq 1 120); do
+        cur_size=$("${SSH_PREFIX[@]}" "docker exec -u $PEER_SSH_USER $CONTAINER bash -c 'stat -c %s $REMOTE_REP 2>/dev/null || echo 0'" | tr -d '[:space:]')
+        if [[ -n "$cur_size" && "$cur_size" != "0" && "$cur_size" == "$prev_size" ]]; then
+            stable_count=$((stable_count + 1))
+            if [[ "$stable_count" -ge 3 ]]; then
+                echo "[launcher] Remote nsys report stable at $cur_size bytes."
+                break
+            fi
+        else
+            stable_count=0
+        fi
+        prev_size="$cur_size"
+        sleep 2
+    done
+fi
+
 # Print last lines of remote decode log.
 echo "[launcher] Remote decode log (last 30 lines):"
 "${SSH_PREFIX[@]}" "docker exec -u $PEER_SSH_USER $CONTAINER bash -c 'tail -30 $REMOTE_DECODE_LOG 2>/dev/null'" || true
@@ -344,6 +370,21 @@ mkdir -p "$OUT_DIR/decode"
 # Also pull remote decode.log for reference.
 "${SSH_PREFIX[@]}" "cat '${REMOTE_DECODE_LOG}'" > "$OUT_DIR/decode.log" \
     2>/dev/null || true
+
+# ---------- Export decode-side nsys CSVs locally (avoids remote race) ----------
+if $ENABLE_NSYS && [[ -s "$OUT_DIR/decode/nsys_report.nsys-rep" ]]; then
+    echo "[launcher] Exporting decode nsys CSVs locally ..."
+    DECODE_NSYS_REPORT="$OUT_DIR/decode/nsys_report"
+    "$LOCAL_NSYS" stats -r cuda_gpu_trace --format csv \
+        --output "$OUT_DIR/decode/nsys_kernels" \
+        "$DECODE_NSYS_REPORT.nsys-rep" 2>/dev/null || true
+    "$LOCAL_NSYS" stats -r nvtx_pushpop_trace --format csv \
+        --output "$OUT_DIR/decode/nsys_nvtx_pushpop" \
+        "$DECODE_NSYS_REPORT.nsys-rep" 2>/dev/null || true
+    "$LOCAL_NSYS" stats -r gpu_metrics --format csv \
+        --output "$OUT_DIR/decode/nsys_gpu_metrics" \
+        "$DECODE_NSYS_REPORT.nsys-rep" 2>/dev/null || true
+fi
 
 # ---------- Run analyze_profile on each role's data (if nsys enabled) ----------
 if $ENABLE_NSYS; then
