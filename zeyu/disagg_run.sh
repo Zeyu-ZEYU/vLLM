@@ -118,7 +118,7 @@ fi
 REMOTE_CMD="\
 mkdir -p '$REMOTE_OUT_DIR/decode' && \
 cd '$REMOTE_REPO' && \
-nohup bash -lc '\
+(nohup bash -lc '\
     source ~/miniforge3/etc/profile.d/conda.sh && \
     conda activate $CONDA_ENV && \
     export VLLM_LOG_ITERATIONS=1 && \
@@ -137,8 +137,9 @@ nohup bash -lc '\
         --gpu-memory-utilization $GPU_MEM_UTIL \
         --output-dir $REMOTE_OUT_DIR \
         $INPUT_ARG \
-' >'$REMOTE_DECODE_LOG' 2>&1 & \
-echo \$! > '$REMOTE_DECODE_PID_FILE'"
+' >'$REMOTE_DECODE_LOG' 2>&1 </dev/null &) && \
+sleep 1 && \
+pgrep -f 'role decode' | tail -1 > '$REMOTE_DECODE_PID_FILE'"
 
 SSH_PREFIX=(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${PEER_SSH_USER}@${PEER_HOST}")
 
