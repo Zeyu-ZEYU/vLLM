@@ -23,7 +23,9 @@ decode outputs back and produces a single consolidated summary.
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
 - [All command-line flags](#all-command-line-flags)
+- [Providing your own dataset](#providing-your-own-dataset)
 - [Output layout](#output-layout)
+- [Viewing and processing metrics](#viewing-and-processing-metrics)
 - [Metrics reference](#metrics-reference)
 - [Optional: nsys profiling](#optional-nsys-profiling)
 - [Optional: per-SM metrics](#optional-per-sm-metrics)
@@ -201,7 +203,8 @@ flags:
 | `--ctrl-port N` | `25500` | Control-channel ZMQ port (prefill binds, decode connects) |
 | `--prefill-gpu IDX` | `0` | Physical GPU index on the prefill node (as seen by `nvidia-smi`) |
 | `--decode-gpu IDX` | `0` | Physical GPU index on the decode node |
-| `--input PATH` | *(none)* | JSONL file of `{prompt, image_url}` records. Overrides `--num-prompts` |
+| `--input PATH` | *(none)* | Path to a JSONL dataset file (one request per line, format described in [Providing your own dataset](#providing-your-own-dataset)). Overrides `--num-prompts` |
+| `--delay N` | *(none)* | Global per-request delay in ms (overrides the `delay` field in JSONL). Mostly for simulating request arrival patterns |
 | `--remote-repo PATH` | same as local | vLLM repo path on the decode node |
 | `--container NAME` | `fe_rnic` | Docker container on decode node. Set to empty string to skip `docker exec` and run directly via SSH |
 | `--conda-env NAME` | `mono_kernel` | Conda env to `conda activate` on decode node |
@@ -212,6 +215,88 @@ flags:
 
 Change the defaults in `zeyu/disagg_run.sh` if your cluster has a
 different convention (see the `---- Defaults ----` block near the top).
+
+---
+
+## Providing your own dataset
+
+If you don't pass `--input`, the launcher uses 4 built-in toy prompts
+cycled over `--num-prompts` requests. Good for a smoke test, useless
+for real measurement (all requests have near-identical input length /
+image size and the same two images, so you get no workload diversity).
+
+### JSONL format
+
+Pass `--input /path/to/data.jsonl`. One request per line. Each line
+is a JSON object with these fields:
+
+| Field | Type | Required? | Description |
+|---|---|---|---|
+| `text` | string | **yes** | The user-side prompt. The launcher wraps it in the Qwen3 chat template automatically — just put the raw user question. |
+| `images` | string **or** list of strings | no | One or more **local file paths** to images (JPEG/PNG/WebP — anything PIL can open). If omitted or empty, the request is text-only. HTTP/S URLs are **not** fetched; download them to disk first. |
+| `delay` | integer | no | Milliseconds to sleep before submitting this request (simulates arrival spacing). Default `0`. Overridden by `--delay` if that flag is set. |
+
+### Example — `my_dataset.jsonl`
+
+```jsonl
+{"text": "What is in this picture?", "images": "/data/images/cat.jpg"}
+{"text": "Summarize the chart.", "images": ["/data/images/chart.png"]}
+{"text": "Compare these two screenshots.", "images": ["/data/a.png", "/data/b.png"]}
+{"text": "Write a haiku about autumn.", "delay": 50}
+{"text": "Describe the key finding.", "images": "/data/figure2.webp", "delay": 100}
+```
+
+Notes:
+- **Image paths must exist on both nodes at the same absolute path**
+  when running disagg (the prefill node reads them to compute the
+  vision encoder; the decode node re-reads them through its own input
+  processor for tokenization). Either sync the dataset directory with
+  `rsync` / a shared filesystem, or use a common NFS mount.
+- **Multi-image requests** are supported (pass a list). Each image is
+  emitted as one `<image>` placeholder in the prompt.
+- **Text-only requests** (no `images`) are allowed and go through the
+  text-only fast path — no vision encoder, no multimodal cache.
+- The chat template is fixed to Qwen3's `<|im_start|>user ...
+  <|im_end|>` format. If you want a different template, edit
+  `build_prompt()` in `run_qwen35_vision_offline.py`.
+
+### Validate your dataset before running disagg
+
+Don't debug a broken dataset across two nodes — validate it locally
+on a single GPU first:
+
+```bash
+python zeyu/run_qwen35_vision_offline.py \
+    --model /path/to/Qwen3-VL-8B-Instruct \
+    --input /path/to/my_dataset.jsonl \
+    --max-tokens 32
+```
+
+This prints per-request metrics and writes latency to
+`zeyu/outputs/run_<timestamp>/latency.json`. If every request
+completes with non-empty output and sensible `prefill_time_ms`,
+you're good.
+
+### Building a dataset from a common multimodal benchmark
+
+There's no benchmark-specific loader in the repo — convert your
+benchmark of choice into the JSONL schema above. Quick recipes:
+
+- **COCO VQA / VQAv2**: for each question JSON record, emit one line
+  with `text = question`, `images = image_path`.
+- **MMBench / MME / MMMU**: flatten the multiple-choice question plus
+  options into one string: `text = f"{question}\nA. {a}\nB. {b}\n
+  ..."`, then optionally append `"Answer with the letter only."`.
+- **ShareGPT4V / LLaVA-Bench**: just use the `question` + `image`
+  fields directly.
+- **TextVQA / DocVQA** (long prompts): no special handling needed;
+  watch that `--max-model-len` covers the concatenated prompt +
+  image-token count.
+
+For throughput measurement it's important the requests have
+**varied** text length and image size — identical requests let the
+scheduler batch too cleanly and don't stress chunked prefill /
+continuous batching.
 
 ---
 
@@ -239,6 +324,203 @@ zeyu/outputs/disagg_<YYYYMMDD_HHMMSS_UTC>/
 ```
 
 A human-readable table is also printed to stdout at the end of the run.
+
+---
+
+## Viewing and processing metrics
+
+After a run finishes, **`disagg_summary.json`** is the file you should
+open first. It has two top-level sections:
+
+```json
+{
+  "model": "/path/to/Qwen3-VL-8B-Instruct",
+  "mode": "disagg",
+  "summary": {
+     "num_requests": 20,
+     "avg_vision_encoder_time_ms": 61.28,
+     "avg_prefill_time_ms": 312.75,
+     "avg_kv_transfer_time_ms": 2.53,
+     "avg_decode_time_ms": 1262.79,
+     "avg_tpot_ms": 20.04,
+     "avg_jct_ms": 1584.19,
+     "rps_end_to_end": 1.95,
+     "rps_decode_only": 2.88,
+     "tbt_stats": {"count": 1240, "mean_ms": 20.02, "p50_ms": 19.91, "p95_ms": 21.36, "p99_ms": 22.67, ...},
+     "vision_encoder": { ...per-phase averages... },
+     "prefill":        { ...per-phase averages... },
+     "decode":         { ...per-phase averages... }
+  },
+  "requests": [
+     {"request_index": 0, "image_source": "cherry_blossom.jpg",
+      "question": "What is in this picture?",
+      "vision_encoder_time_ms": 68.19, "prefill_time_ms": 846.02,
+      "kv_transfer_time_ms": 2.53, "decode_time_ms": 1284.0,
+      "num_generation_tokens": 64, "tpot_ms": 20.38, "jct_ms": 2200.73,
+      "per_token_tbt_ms": [60.9, 19.1, 19.0, ...],
+      "tbt_stats": { ... },
+      "vision_encoder": { ... }, "prefill": { ... }, "decode": { ... },
+      "generated_text": "This image shows a cherry blossom tree..."},
+     ... one per request ...
+  ]
+}
+```
+
+See the [Metrics reference](#metrics-reference) below for every field.
+
+### The stdout table
+
+At end-of-run the launcher prints a compact per-request table:
+
+```
+# | Image Source | VE(ms) | Pref(ms) | KV(ms) | Dec(ms) | GenTok | TPOT | p50TBT | JCT(ms)
+0 | cherry.jpg   |  68.19 |   846.02 |   2.53 | 1284.00 |     64 | 20.38 |  20.05 |  2200.73
+...
+AVG|              |  61.28 |   312.75 |   2.53 | 1262.79 |     64 | 20.04 |  19.91 |  1584.19
+RPS (end-to-end) = 1.946 | RPS (decode-only) = 2.877 | ...
+```
+
+That same data lives in `disagg_summary.json["requests"]` — useful
+for eyeballing; export from the JSON if you need to plot or report.
+
+### Quick queries with `jq`
+
+```bash
+OUT=zeyu/outputs/disagg_20260417_141119   # ← your run's dir
+
+# Top-line numbers
+jq '.summary | {num_requests, avg_prefill_time_ms, avg_decode_time_ms,
+                avg_tpot_ms, avg_jct_ms, rps_end_to_end, rps_decode_only}' \
+   $OUT/disagg_summary.json
+
+# p50 / p95 / p99 TBT across all tokens
+jq '.summary.tbt_stats' $OUT/disagg_summary.json
+
+# Per-request table as CSV (idx, prefill_ms, decode_ms, jct_ms)
+jq -r '.requests[] | [.request_index, .prefill_time_ms,
+                      .decode_time_ms, .jct_ms] | @csv' \
+   $OUT/disagg_summary.json
+
+# Requests slower than 2 s end-to-end (by request_index)
+jq '.requests | map(select(.jct_ms > 2000)) | [.[].request_index]' \
+   $OUT/disagg_summary.json
+
+# GPU utilization during the decode phase (pynvml + nsys)
+jq '.summary.decode | {avg_nvml_gpu_util_pct_mean, avg_gpu_util_pct,
+                       avg_text_forward_gpu_util_pct}' \
+   $OUT/disagg_summary.json
+```
+
+### Python recipes for plotting / analysis
+
+```python
+import json, numpy as np, matplotlib.pyplot as plt
+
+s = json.load(open("zeyu/outputs/disagg_20260417_141119/disagg_summary.json"))
+
+# 1. TBT distribution across all tokens
+tbts = [t for r in s["requests"] for t in r["per_token_tbt_ms"]]
+print(f"TBT mean={np.mean(tbts):.2f} p50={np.median(tbts):.2f} "
+      f"p95={np.percentile(tbts,95):.2f} p99={np.percentile(tbts,99):.2f}")
+plt.hist(tbts, bins=80); plt.xlabel("TBT (ms)"); plt.show()
+
+# 2. JCT breakdown stacked bar, per request
+import numpy as np
+reqs = s["requests"]
+N = len(reqs)
+ve   = [r["vision_encoder_time_ms"] for r in reqs]
+pre  = [r["prefill_time_ms"]        for r in reqs]
+kv   = [r["kv_transfer_time_ms"]    for r in reqs]
+dec  = [r["decode_time_ms"]         for r in reqs]
+x = np.arange(N)
+plt.bar(x, ve, label="VE")
+plt.bar(x, pre, bottom=ve, label="Prefill")
+plt.bar(x, kv, bottom=np.add(ve, pre), label="KV transfer")
+plt.bar(x, dec, bottom=np.add(np.add(ve, pre), kv), label="Decode")
+plt.legend(); plt.xlabel("Request #"); plt.ylabel("Time (ms)"); plt.show()
+
+# 3. Per-phase GPU utilization comparison (pynvml vs nsys if present)
+for phase in ("vision_encoder", "prefill", "decode"):
+    p = s["summary"].get(phase, {})
+    print(f"{phase:15s}  nvml_util={p.get('avg_nvml_gpu_util_pct_mean','-'):>6}  "
+          f"nsys_util={p.get('avg_gpu_util_pct','-'):>6}")
+```
+
+### Raw per-iteration data
+
+`disagg_summary.json` aggregates; if you want every scheduler step,
+open `<role>/iterations.jsonl`:
+
+```bash
+# Step count per phase (decode side)
+jq -s 'group_by(.prefill_req_ids | length > 0) | map({n: length})' \
+   $OUT/decode/iterations.jsonl
+
+# Step latency of every iteration (decode side) as CSV
+jq -r '[.iter, .step_latency_ms, .num_decode_tokens,
+        .nvml_gpu_util_pct_mean] | @csv' \
+   $OUT/decode/iterations.jsonl > decode_iter_timeline.csv
+```
+
+With `--nsys`, `<role>/consolidated_iterations.jsonl` has the same
+shape plus kernel-derived fields (`gpu_util_pct`,
+`kernel_launch_gap_pct`, `total_kernel_time_ns`,
+`vision_encoder_gpu_util_pct`, `text_forward_gpu_util_pct`).
+
+### Raw per-request data
+
+`<role>/latency.json` is the canonical per-request output from each
+side before merging. Use it if you need fields that `disagg_summary`
+rolls up:
+
+```bash
+jq '.requests[0]' $OUT/prefill/latency.json    # prefill-side raw record
+jq '.requests[0]' $OUT/decode/latency.json     # decode-side raw record
+```
+
+### Re-running the merger
+
+If you tweak `merge_disagg.py` (or if the run finished but the final
+merge failed for any reason) you can rebuild `disagg_summary.json`
+without re-running the workload:
+
+```bash
+python zeyu/merge_disagg.py zeyu/outputs/disagg_20260417_141119/
+```
+
+Same for re-running the nsys analysis separately:
+
+```bash
+python zeyu/analyze_profile.py zeyu/outputs/disagg_20260417_141119/prefill/
+python zeyu/analyze_profile.py zeyu/outputs/disagg_20260417_141119/decode/
+```
+
+### Comparing multiple runs
+
+The directory-per-run layout makes A/B comparison straightforward.
+Small helper:
+
+```python
+import json, glob, pandas as pd
+
+rows = []
+for d in sorted(glob.glob("zeyu/outputs/disagg_*/")):
+    try:
+        s = json.load(open(f"{d}disagg_summary.json"))["summary"]
+    except FileNotFoundError:
+        continue
+    rows.append({
+        "run": d.rstrip("/").split("/")[-1],
+        **{k: s[k] for k in ("avg_vision_encoder_time_ms",
+                             "avg_prefill_time_ms",
+                             "avg_kv_transfer_time_ms",
+                             "avg_decode_time_ms",
+                             "avg_tpot_ms", "avg_jct_ms",
+                             "rps_end_to_end", "rps_decode_only")},
+    })
+df = pd.DataFrame(rows)
+print(df.to_string(index=False))
+```
 
 ---
 
