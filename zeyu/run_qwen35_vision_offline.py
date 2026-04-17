@@ -367,8 +367,9 @@ def main():
         type=str,
         default=None,
         help="IP address of the peer node/process. "
-        "For --role prefill: IP of the decode process. "
-        "For --role decode: IP of the prefill process. "
+        "REQUIRED for --role decode (decode connects to this IP). "
+        "OPTIONAL for --role prefill (prefill only binds and waits; "
+        "decode's IP is learned from the first READY message). "
         "For same-node test, use 127.0.0.1.",
     )
     parser.add_argument(
@@ -565,12 +566,13 @@ def _local_ip_for(iface: str) -> str:
 # Disaggregation: prefill role (cross-node capable)
 # ---------------------------------------------------------------------------
 def run_prefill_role(args, examples: list[dict]):
-    """Run vision encoder + prefill as a kv_producer."""
-    if not args.peer_ip:
-        raise ValueError(
-            "--peer-ip is required for --role prefill "
-            "(the decode process's IP)."
-        )
+    """Run vision encoder + prefill as a kv_producer.
+
+    The prefill side only needs to *bind* the ZMQ ctrl socket and wait
+    for the decode side to connect; decode's IP arrives in the READY
+    message. ``--peer-ip`` is therefore optional on this side and is
+    only used for logging if supplied.
+    """
 
     # P2pNcclConnector relies on request_ids carrying both endpoints'
     # ZMQ addresses. Disable vLLM's random suffixing so our IDs are
@@ -596,7 +598,7 @@ def run_prefill_role(args, examples: list[dict]):
     decode_kv_port = args.kv_port + 100  # decode uses a different port
     print(
         f"[Prefill] Role=kv_producer  local_ip={local_ip}  "
-        f"peer_ip={args.peer_ip}  "
+        f"peer_ip={args.peer_ip or '<wait-for-connect>'}  "
         f"prefill_kv_port={prefill_kv_port}  decode_kv_port={decode_kv_port}  "
         f"iface={args.iface}"
     )

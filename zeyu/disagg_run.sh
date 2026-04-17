@@ -1,37 +1,62 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Cross-node disaggregation launcher for Qwen3-VL-8B-Instruct.
+# One-side launcher for cross-node PD disaggregation.
 #
-# Runs vision encoder + prefill on THIS node (the "prefill node") and
-# decode on a REMOTE node over SSH. Collects all metrics on the prefill
-# node (tar'd from decode node at the end) and produces a merged
-# summary JSON.
+# This script launches EXACTLY ONE side of a PD-disaggregated run. You
+# must invoke it twice — once on the prefill node (--role prefill) and
+# once on the decode node (--role decode) — in two separate terminals.
+# There is NO SSH between the nodes; each terminal acts on its own
+# local node only.
 #
-# By default, nsys profiling is ON on both sides. This collects:
-# per-iteration GPU utilization, kernel-launch gap, per-phase (VE /
-# prefill / decode) GPU / kernel / memory stats. Use --no-nsys to
-# disable. Pass --sm-metrics to also collect aggregate "SM active %"
-# and "num active SMs" via nsys --gpu-metrics-devices (requires
-# unrestricted GPU performance counters on the host; see
-# https://developer.nvidia.com/ERR_NVGPUCTRPERM ).
+# The two sides coordinate over a plain TCP ZMQ ctrl channel (prefill
+# binds, decode connects to `--peer-ip`) and a NCCL connection for the
+# actual KV cache transfer.
 #
-# Usage (run on the prefill node, Node 0):
+# ----- Order of operations (do it in this order) -----
 #
-#   bash zeyu/disagg_run.sh \
-#       --peer-host lj1.zeyu.tw \
-#       --peer-ssh-user zeyu \
-#       --model /home/zeyu/models/Qwen3-VL-8B-Instruct \
-#       --num-prompts 20 \
-#       --max-tokens 64
+#   1. On PREFILL NODE, terminal A:
+#        bash zeyu/disagg_run.sh --role prefill \
+#            --iface eth0 \
+#            --gpu 0 \
+#            --num-prompts 20 --max-tokens 64
+#      (The prefill side prints its own IP and waits for decode.)
 #
-# Requires passwordless SSH from THIS node to --peer-host.
-# Both nodes must have the repo at the same path (default /home/zeyu/vllm/mono_kernel).
-# Both nodes must be inside the fe_rnic container with mono_kernel env active.
+#   2. On DECODE NODE, terminal B (use prefill's IP from step 1):
+#        bash zeyu/disagg_run.sh --role decode \
+#            --peer-ip 192.0.2.42 \
+#            --iface eth0 \
+#            --gpu 0 \
+#            --num-prompts 20 --max-tokens 64
+#
+#   3. Both processes exit when decode finishes. Each writes to its own
+#      local output directory:
+#         <OUT_DIR>/prefill/    (on the prefill node)
+#         <OUT_DIR>/decode/     (on the decode node)
+#      where <OUT_DIR> defaults to zeyu/outputs/disagg_<UTC-timestamp>.
+#
+#   4. Copy the decode side's <OUT_DIR>/decode/ directory into the
+#      prefill side's <OUT_DIR>/ (anywhere that gives you a single
+#      directory with both prefill/ and decode/ subdirs). If both nodes
+#      share an NFS mount, pass --output-dir to the SAME path on both
+#      sides and this step is a no-op.
+#
+#   5. On the node that now has both subdirs, run:
+#         python zeyu/merge_disagg.py <OUT_DIR>
+#      This produces <OUT_DIR>/disagg_summary.json.
+#
+# Both sides must use IDENTICAL values for these flags (otherwise the
+# handshake / KV exchange won't match):
+#    --kv-port   --ctrl-port   --num-prompts   --max-tokens   --model
+#    --max-model-len   (and --input if using a custom dataset)
+#
+# You can differ on: --iface (each side uses its own NIC name),
+#    --gpu (each side picks a local GPU), --output-dir (per-side paths).
 
 set -euo pipefail
 
 # ---------- Defaults ----------
+ROLE=""                         # MUST be set: prefill | decode
 MODEL="/home/zeyu/models/Qwen3-VL-8B-Instruct"
 NUM_PROMPTS=4
 MAX_TOKENS=64
@@ -40,31 +65,31 @@ GPU_MEM_UTIL=0.85
 IFACE="eth0"
 KV_PORT=25555
 CTRL_PORT=25500
-PREFILL_GPU=0
-DECODE_GPU=0
+GPU=0
 INPUT=""
-PEER_HOST=""
-PEER_SSH_USER="zeyu"
-REMOTE_REPO="/home/zeyu/vllm/mono_kernel"
-CONTAINER="fe_rnic"
-CONDA_ENV="mono_kernel"
-OUTPUT_ROOT=""
-ENABLE_NSYS=false              # Requires working nsys; pynvml is the default path
-ENABLE_SM_METRICS=false        # Requires GPU perf-counter privilege
-NSYS_GPU_METRICS_FREQ=10000    # 10 kHz = 100 us between samples
+PEER_IP=""                      # Required for --role decode.
+OUTPUT_DIR=""                   # Empty → auto-timestamped subdir.
+ENABLE_NSYS=false               # pynvml path is always on; nsys is opt-in.
+ENABLE_SM_METRICS=false         # Requires GPU perf-counter privilege.
+NSYS_GPU_METRICS_FREQ=10000     # 10 kHz = 100 us between samples.
 # Candidate paths for nsys (checked in order, first found wins).
 NSYS_PATH_CANDIDATES=(
     "nsys"
+    "/usr/local/bin/nsys"
     "/usr/local/cuda/bin/nsys"
     "/opt/nvidia/nsight-systems/bin/nsys"
     "/opt/nvidia/nsight-compute/2025.2.1/host/target-linux-x64/nsys"
 )
 
 # ---------- Parse args ----------
+usage() {
+    sed -n '1,60p' "$0"
+    exit 0
+}
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --peer-host) PEER_HOST="$2"; shift 2;;
-        --peer-ssh-user) PEER_SSH_USER="$2"; shift 2;;
+        --role) ROLE="$2"; shift 2;;
+        --peer-ip) PEER_IP="$2"; shift 2;;
         --model) MODEL="$2"; shift 2;;
         --num-prompts) NUM_PROMPTS="$2"; shift 2;;
         --max-tokens) MAX_TOKENS="$2"; shift 2;;
@@ -73,52 +98,62 @@ while [[ $# -gt 0 ]]; do
         --iface) IFACE="$2"; shift 2;;
         --kv-port) KV_PORT="$2"; shift 2;;
         --ctrl-port) CTRL_PORT="$2"; shift 2;;
-        --prefill-gpu) PREFILL_GPU="$2"; shift 2;;
-        --decode-gpu) DECODE_GPU="$2"; shift 2;;
+        --gpu) GPU="$2"; shift 2;;
         --input) INPUT="$2"; shift 2;;
-        --remote-repo) REMOTE_REPO="$2"; shift 2;;
-        --container) CONTAINER="$2"; shift 2;;
-        --conda-env) CONDA_ENV="$2"; shift 2;;
-        --output-root) OUTPUT_ROOT="$2"; shift 2;;
+        --output-dir) OUTPUT_DIR="$2"; shift 2;;
         --nsys) ENABLE_NSYS=true; shift 1;;
         --no-nsys) ENABLE_NSYS=false; shift 1;;
         --sm-metrics) ENABLE_SM_METRICS=true; shift 1;;
         --no-sm-metrics) ENABLE_SM_METRICS=false; shift 1;;
         --nsys-freq) NSYS_GPU_METRICS_FREQ="$2"; shift 2;;
-        -h|--help)
-            sed -n '1,60p' "$0"
-            exit 0
-            ;;
+        -h|--help) usage;;
         *)
             echo "Unknown flag: $1" >&2
+            echo "Run with --help for usage." >&2
             exit 1
             ;;
     esac
 done
 
-if [[ -z "$PEER_HOST" ]]; then
-    echo "ERROR: --peer-host is required (hostname or IP of decode node)" >&2
+# ---------- Validate required flags ----------
+if [[ -z "$ROLE" ]]; then
+    echo "ERROR: --role {prefill|decode} is required." >&2
+    echo "Run with --help for usage." >&2
+    exit 1
+fi
+if [[ "$ROLE" != "prefill" && "$ROLE" != "decode" ]]; then
+    echo "ERROR: --role must be 'prefill' or 'decode' (got: $ROLE)." >&2
+    exit 1
+fi
+if [[ "$ROLE" == "decode" && -z "$PEER_IP" ]]; then
+    echo "ERROR: --peer-ip <PREFILL_NODE_IP> is required for --role decode." >&2
+    echo "  Get it from the prefill side's startup log (look for 'local_ip=')." >&2
     exit 1
 fi
 
 # ---------- Paths ----------
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOCAL_REPO="$(dirname "$SCRIPT_DIR")"
-TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUTPUT_ROOT:-$SCRIPT_DIR/outputs}/disagg_${TIMESTAMP}"
-mkdir -p "$OUT_DIR/prefill" "$OUT_DIR/decode"
 
-# Remote mirror — same relative path under the remote repo.
-REMOTE_OUT_DIR="${REMOTE_REPO}/zeyu/outputs/disagg_${TIMESTAMP}"
+if [[ -z "$OUTPUT_DIR" ]]; then
+    TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
+    OUTPUT_DIR="$SCRIPT_DIR/outputs/disagg_${TIMESTAMP}"
+fi
+# This side's role-specific subdir. The OTHER side will (after you copy
+# its data over) populate the sibling subdir, so that merge_disagg.py
+# can see both under one parent.
+ROLE_DIR="$OUTPUT_DIR/$ROLE"
+mkdir -p "$ROLE_DIR"
 
-# ---------- Detect local eth0 IP ----------
+# ---------- Detect local IP on --iface ----------
 LOCAL_IP="$(ip -4 -o addr show "$IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
 if [[ -z "$LOCAL_IP" ]]; then
-    echo "ERROR: could not detect IP on interface $IFACE" >&2
+    echo "ERROR: could not detect IPv4 address on interface '$IFACE'." >&2
+    echo "  Try: ip -4 -o addr   (then pass --iface <the right name>)" >&2
     exit 1
 fi
 
-# ---------- Locate nsys (local) ----------
+# ---------- Locate nsys ----------
 LOCAL_NSYS=""
 if $ENABLE_NSYS; then
     for cand in "${NSYS_PATH_CANDIDATES[@]}"; do
@@ -128,285 +163,155 @@ if $ENABLE_NSYS; then
         fi
     done
     if [[ -z "$LOCAL_NSYS" ]]; then
-        echo "[launcher] WARN: nsys not found on this node; disabling profiling."
+        echo "[launcher] WARN: nsys not found; falling back to pynvml-only path."
         ENABLE_NSYS=false
-    else
-        echo "[launcher] Using nsys: $LOCAL_NSYS"
     fi
 fi
 
-### nsys path resolution: detect ahead of time on each node so we can
-### embed a concrete absolute path into the remote command (avoids
-### quoting hell with nested bash -lc invocations).
-
+# ---------- Print launch banner ----------
 echo "============================================================"
-echo "  Cross-node disaggregation launcher"
+echo "  PD-disagg launcher: role=$ROLE"
 echo "============================================================"
-echo "  Prefill (local) : $(hostname -s)  $IFACE=$LOCAL_IP  GPU=$PREFILL_GPU"
-echo "  Decode  (remote): $PEER_HOST                  GPU=$DECODE_GPU"
-echo "  Model           : $MODEL"
-echo "  Prompts         : $NUM_PROMPTS  max_tokens=$MAX_TOKENS"
-echo "  KV port         : $KV_PORT  ctrl_port=$CTRL_PORT"
-echo "  Profiling       : nsys=$ENABLE_NSYS  sm_metrics=$ENABLE_SM_METRICS  (gpu_metrics_freq=$NSYS_GPU_METRICS_FREQ)"
-echo "  Output dir      : $OUT_DIR"
+echo "  Host        : $(hostname -s)"
+echo "  Iface/IP    : $IFACE = $LOCAL_IP"
+echo "  GPU         : $GPU"
+echo "  Peer IP     : ${PEER_IP:-<unset (prefill binds & waits)>}"
+echo "  KV port     : $KV_PORT         (decode connects to kv_port+100 on peer)"
+echo "  Ctrl port   : $CTRL_PORT"
+echo "  Model       : $MODEL"
+echo "  Prompts     : $NUM_PROMPTS         max_tokens=$MAX_TOKENS"
+echo "  Output dir  : $OUTPUT_DIR"
+echo "                (this side will write under $ROLE_DIR)"
+if $ENABLE_NSYS; then
+    echo "  Profiling   : nsys=ON ($LOCAL_NSYS)   sm_metrics=$ENABLE_SM_METRICS"
+else
+    echo "  Profiling   : pynvml-only (nsys OFF)"
+fi
+if [[ "$ROLE" == "prefill" ]]; then
+    echo
+    echo "  >>> After this side is up and printing 'waiting for decode"
+    echo "  >>> READY...', go to the DECODE node and run:"
+    echo "  >>>"
+    echo "  >>>   bash zeyu/disagg_run.sh --role decode \\"
+    echo "  >>>       --peer-ip $LOCAL_IP \\"
+    echo "  >>>       --iface <decode-nic> --gpu <decode-gpu-idx> \\"
+    echo "  >>>       --kv-port $KV_PORT --ctrl-port $CTRL_PORT \\"
+    echo "  >>>       --num-prompts $NUM_PROMPTS --max-tokens $MAX_TOKENS \\"
+    echo "  >>>       --model $MODEL"
+    echo
+fi
 echo "============================================================"
 
-# ---------- Remote decode start ----------
-REMOTE_DECODE_LOG="$REMOTE_OUT_DIR/decode.log"
-REMOTE_DECODE_PID_FILE="$REMOTE_OUT_DIR/decode.pid"
-REMOTE_NSYS_REPORT="$REMOTE_OUT_DIR/decode/nsys_report"
-
+# ---------- Assemble optional args ----------
 INPUT_ARG=""
 if [[ -n "$INPUT" ]]; then
     INPUT_ARG="--input $INPUT"
 fi
 
-SSH_PREFIX=(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${PEER_SSH_USER}@${PEER_HOST}")
-
-### Detect remote nsys path (inside container) via a probe SSH.
-REMOTE_NSYS=""
-if $ENABLE_NSYS; then
-    REMOTE_NSYS="$(
-        "${SSH_PREFIX[@]}" "docker exec -u $PEER_SSH_USER $CONTAINER bash -lc 'for c in nsys /usr/local/cuda/bin/nsys /opt/nvidia/nsight-systems/bin/nsys /opt/nvidia/nsight-compute/2025.2.1/host/target-linux-x64/nsys; do if command -v \"\$c\" >/dev/null 2>&1 || [[ -x \"\$c\" ]]; then echo \"\$c\"; exit 0; fi; done'" 2>/dev/null | tr -d '[:space:]'
-    )"
-    if [[ -z "$REMOTE_NSYS" ]]; then
-        echo "[launcher] WARN: nsys not found on $PEER_HOST; disabling decode-side profiling."
-    else
-        echo "[launcher] Remote nsys: $REMOTE_NSYS"
-    fi
+PEER_IP_ARG=""
+if [[ -n "$PEER_IP" ]]; then
+    PEER_IP_ARG="--peer-ip $PEER_IP"
 fi
 
-# Build the python command (possibly wrapped with nsys).
-# NOTE: nsys stats CSV exports are done on the LOCAL side after the
-# .nsys-rep file is copied back, to avoid a race where the launcher's
-# wait-for-python-PID loop exits before the remote bash wrapper finishes
-# its post-profile stats chain. Only `nsys profile` runs on remote.
-if $ENABLE_NSYS && [[ -n "$REMOTE_NSYS" ]]; then
-    SM_METRICS_FLAG=""
-    if $ENABLE_SM_METRICS; then
-        SM_METRICS_FLAG="--gpu-metrics-devices=all --gpu-metrics-frequency=$NSYS_GPU_METRICS_FREQ"
-    fi
-    REMOTE_PY_CMD_WRAP="\
-        '$REMOTE_NSYS' profile \
-            --trace=cuda,nvtx \
-            --cuda-graph-trace=node \
-            --trace-fork-before-exec=true \
-            $SM_METRICS_FLAG \
-            --output='$REMOTE_NSYS_REPORT' \
-            --force-overwrite=true \
-            "
-    REMOTE_NVTX_EXPORT=""
-    REMOTE_NVTX_ENV="export VLLM_NVTX_SCOPES_FOR_PROFILING=1 && "
-else
-    REMOTE_PY_CMD_WRAP=""
-    REMOTE_NVTX_EXPORT=""
-    REMOTE_NVTX_ENV=""
-fi
-
-REMOTE_CMD="\
-mkdir -p '$REMOTE_OUT_DIR/decode' && \
-cd '$REMOTE_REPO' && \
-(nohup bash -lc '\
-    source ~/miniforge3/etc/profile.d/conda.sh && \
-    conda activate $CONDA_ENV && \
-    export VLLM_LOG_ITERATIONS=1 && \
-    export VLLM_ITERATION_LOG_DIR=\"$REMOTE_OUT_DIR\" && \
-    export CUDA_VISIBLE_DEVICES=$DECODE_GPU && \
-    ${REMOTE_NVTX_ENV}\
-    ${REMOTE_PY_CMD_WRAP}python zeyu/run_qwen35_vision_offline.py \
-        --role decode \
-        --peer-ip $LOCAL_IP \
-        --kv-port $KV_PORT \
-        --ctrl-port $CTRL_PORT \
-        --iface $IFACE \
-        --gpu 0 \
-        --model $MODEL \
-        --num-prompts $NUM_PROMPTS \
-        --max-tokens $MAX_TOKENS \
-        --max-model-len $MAX_MODEL_LEN \
-        --gpu-memory-utilization $GPU_MEM_UTIL \
-        --output-dir $REMOTE_OUT_DIR \
-        $INPUT_ARG ${REMOTE_NVTX_EXPORT}\
-' >'$REMOTE_DECODE_LOG' 2>&1 </dev/null &) && \
-sleep 1 && \
-pgrep -f 'role decode' | tail -1 > '$REMOTE_DECODE_PID_FILE'"
-
-echo "[launcher] Starting decode on $PEER_HOST ..."
-"${SSH_PREFIX[@]}" "docker exec -u $PEER_SSH_USER $CONTAINER bash -lc \"$REMOTE_CMD\"" \
-    || { echo "[launcher] FAILED to start remote decode"; exit 2; }
-
-REMOTE_DECODE_PID="$("${SSH_PREFIX[@]}" "docker exec -u $PEER_SSH_USER $CONTAINER bash -lc 'cat $REMOTE_DECODE_PID_FILE 2>/dev/null || echo'" | tr -d '[:space:]')"
-echo "[launcher] Remote decode PID=$REMOTE_DECODE_PID, log=$REMOTE_DECODE_LOG"
-
-# Cleanup function: kill remote decode if we die mid-run.
-cleanup() {
-    echo "[launcher] Cleaning up ..."
-    if [[ -n "${REMOTE_DECODE_PID:-}" ]]; then
-        "${SSH_PREFIX[@]}" "docker exec -u $PEER_SSH_USER $CONTAINER bash -c 'kill -TERM $REMOTE_DECODE_PID 2>/dev/null; sleep 2; kill -KILL $REMOTE_DECODE_PID 2>/dev/null'" >/dev/null 2>&1 || true
-    fi
-}
-trap cleanup EXIT INT TERM
-
-# ---------- Local prefill run ----------
+# ---------- Set up env for this process ----------
 export VLLM_LOG_ITERATIONS=1
-export VLLM_ITERATION_LOG_DIR="$OUT_DIR"
-# Select the prefill GPU via CUDA_VISIBLE_DEVICES BEFORE Python starts so
-# that vLLM's engine subprocess (spawned later) inherits the correct mask.
-export CUDA_VISIBLE_DEVICES="$PREFILL_GPU"
-
-LOCAL_NSYS_REPORT="$OUT_DIR/prefill/nsys_report"
-
-echo "[launcher] Starting prefill on $(hostname -s) GPU $PREFILL_GPU (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES) ..."
+export VLLM_ITERATION_LOG_DIR="$OUTPUT_DIR"
+# CUDA_VISIBLE_DEVICES must be set BEFORE python imports torch so that
+# the vLLM engine subprocess inherits the correct mask.
+export CUDA_VISIBLE_DEVICES="$GPU"
 if $ENABLE_NSYS; then
     export VLLM_NVTX_SCOPES_FOR_PROFILING=1
+fi
+
+LOG_FILE="$OUTPUT_DIR/${ROLE}.log"
+
+# ---------- Build the python invocation ----------
+PY=(python "$LOCAL_REPO/zeyu/run_qwen35_vision_offline.py"
+    --role "$ROLE"
+    $PEER_IP_ARG
+    --kv-port "$KV_PORT"
+    --ctrl-port "$CTRL_PORT"
+    --iface "$IFACE"
+    --gpu 0    # inside-process GPU index after CUDA_VISIBLE_DEVICES masks it to 1 GPU
+    --model "$MODEL"
+    --num-prompts "$NUM_PROMPTS"
+    --max-tokens "$MAX_TOKENS"
+    --max-model-len "$MAX_MODEL_LEN"
+    --gpu-memory-utilization "$GPU_MEM_UTIL"
+    --output-dir "$OUTPUT_DIR"
+    $INPUT_ARG)
+
+# ---------- Run ----------
+echo "[launcher] Starting $ROLE ..."
+if $ENABLE_NSYS; then
+    NSYS_REPORT="$ROLE_DIR/nsys_report"
     SM_FLAGS=()
     if $ENABLE_SM_METRICS; then
         SM_FLAGS=(--gpu-metrics-devices=all --gpu-metrics-frequency="$NSYS_GPU_METRICS_FREQ")
     fi
-    # shellcheck disable=SC2086
     "$LOCAL_NSYS" profile \
         --trace=cuda,nvtx \
         --cuda-graph-trace=node \
         --trace-fork-before-exec=true \
         "${SM_FLAGS[@]}" \
-        --output="$LOCAL_NSYS_REPORT" \
+        --output="$NSYS_REPORT" \
         --force-overwrite=true \
-        python "$LOCAL_REPO/zeyu/run_qwen35_vision_offline.py" \
-            --role prefill \
-            --peer-ip "$PEER_HOST" \
-            --kv-port "$KV_PORT" \
-            --ctrl-port "$CTRL_PORT" \
-            --iface "$IFACE" \
-            --gpu 0 \
-            --model "$MODEL" \
-            --num-prompts "$NUM_PROMPTS" \
-            --max-tokens "$MAX_TOKENS" \
-            --max-model-len "$MAX_MODEL_LEN" \
-            --gpu-memory-utilization "$GPU_MEM_UTIL" \
-            --output-dir "$OUT_DIR" \
-            $INPUT_ARG \
-        2>&1 | tee "$OUT_DIR/prefill.log"
-    PREFILL_RC=${PIPESTATUS[0]}
-
-    echo "[launcher] Exporting prefill nsys CSVs ..."
-    "$LOCAL_NSYS" stats -r cuda_gpu_trace --format csv \
-        --output "$OUT_DIR/prefill/nsys_kernels" \
-        "$LOCAL_NSYS_REPORT.nsys-rep" 2>/dev/null || true
-    "$LOCAL_NSYS" stats -r nvtx_pushpop_trace --format csv \
-        --output "$OUT_DIR/prefill/nsys_nvtx_pushpop" \
-        "$LOCAL_NSYS_REPORT.nsys-rep" 2>/dev/null || true
-    "$LOCAL_NSYS" stats -r gpu_metrics --format csv \
-        --output "$OUT_DIR/prefill/nsys_gpu_metrics" \
-        "$LOCAL_NSYS_REPORT.nsys-rep" 2>/dev/null || true
+        "${PY[@]}" \
+        2>&1 | tee "$LOG_FILE"
+    PY_RC=${PIPESTATUS[0]}
 else
-    # shellcheck disable=SC2086
-    python "$LOCAL_REPO/zeyu/run_qwen35_vision_offline.py" \
-        --role prefill \
-        --peer-ip "$PEER_HOST" \
-        --kv-port "$KV_PORT" \
-        --ctrl-port "$CTRL_PORT" \
-        --iface "$IFACE" \
-        --gpu 0 \
-        --model "$MODEL" \
-        --num-prompts "$NUM_PROMPTS" \
-        --max-tokens "$MAX_TOKENS" \
-        --max-model-len "$MAX_MODEL_LEN" \
-        --gpu-memory-utilization "$GPU_MEM_UTIL" \
-        --output-dir "$OUT_DIR" \
-        $INPUT_ARG \
-        2>&1 | tee "$OUT_DIR/prefill.log"
-    PREFILL_RC=${PIPESTATUS[0]}
+    "${PY[@]}" 2>&1 | tee "$LOG_FILE"
+    PY_RC=${PIPESTATUS[0]}
 fi
+echo "[launcher] Python exit code: $PY_RC"
 
-echo "[launcher] Prefill exit code: $PREFILL_RC"
-
-# ---------- Wait for remote decode to finish ----------
-echo "[launcher] Waiting for remote decode to complete ..."
-for i in $(seq 1 600); do
-    if ! "${SSH_PREFIX[@]}" "docker exec -u $PEER_SSH_USER $CONTAINER bash -c 'kill -0 $REMOTE_DECODE_PID 2>/dev/null'" >/dev/null 2>&1; then
-        echo "[launcher] Remote decode finished."
-        break
-    fi
-    sleep 2
-done
-
-# If nsys is enabled, wait for the remote .nsys-rep file to stabilize
-# (mtime not changing for ≥5s). nsys runs post-profile finalization in the
-# bash wrapper after python exits, which can take tens of seconds for
-# large captures.
-if $ENABLE_NSYS; then
-    REMOTE_REP="$REMOTE_OUT_DIR/decode/nsys_report.nsys-rep"
-    echo "[launcher] Waiting for remote nsys report to finalize: $REMOTE_REP"
-    prev_size=""
-    stable_count=0
-    for i in $(seq 1 120); do
-        cur_size=$("${SSH_PREFIX[@]}" "docker exec -u $PEER_SSH_USER $CONTAINER bash -c 'stat -c %s $REMOTE_REP 2>/dev/null || echo 0'" | tr -d '[:space:]')
-        if [[ -n "$cur_size" && "$cur_size" != "0" && "$cur_size" == "$prev_size" ]]; then
-            stable_count=$((stable_count + 1))
-            if [[ "$stable_count" -ge 3 ]]; then
-                echo "[launcher] Remote nsys report stable at $cur_size bytes."
-                break
-            fi
-        else
-            stable_count=0
-        fi
-        prev_size="$cur_size"
-        sleep 2
-    done
-fi
-
-# Print last lines of remote decode log.
-echo "[launcher] Remote decode log (last 30 lines):"
-"${SSH_PREFIX[@]}" "docker exec -u $PEER_SSH_USER $CONTAINER bash -c 'tail -30 $REMOTE_DECODE_LOG 2>/dev/null'" || true
-
-# ---------- Pull remote decode outputs back ----------
-# rsync may not be installed in the container; use tar-over-ssh instead.
-echo "[launcher] Copying remote decode outputs back ..."
-mkdir -p "$OUT_DIR/decode"
-"${SSH_PREFIX[@]}" "tar -C '${REMOTE_OUT_DIR}' -cf - decode" \
-    | tar -C "$OUT_DIR" -xf - \
-    || { echo "[launcher] tar copy FAILED (decode dir may be empty)"; }
-
-# Also pull remote decode.log for reference.
-"${SSH_PREFIX[@]}" "cat '${REMOTE_DECODE_LOG}'" > "$OUT_DIR/decode.log" \
-    2>/dev/null || true
-
-# ---------- Export decode-side nsys CSVs locally (avoids remote race) ----------
-if $ENABLE_NSYS && [[ -s "$OUT_DIR/decode/nsys_report.nsys-rep" ]]; then
-    echo "[launcher] Exporting decode nsys CSVs locally ..."
-    DECODE_NSYS_REPORT="$OUT_DIR/decode/nsys_report"
+# ---------- Post-processing (this side only) ----------
+if $ENABLE_NSYS && [[ -s "$ROLE_DIR/nsys_report.nsys-rep" ]]; then
+    echo "[launcher] Exporting ${ROLE} nsys CSVs ..."
     "$LOCAL_NSYS" stats -r cuda_gpu_trace --format csv \
-        --output "$OUT_DIR/decode/nsys_kernels" \
-        "$DECODE_NSYS_REPORT.nsys-rep" 2>/dev/null || true
+        --output "$ROLE_DIR/nsys_kernels" \
+        "$ROLE_DIR/nsys_report.nsys-rep" 2>/dev/null || true
     "$LOCAL_NSYS" stats -r nvtx_pushpop_trace --format csv \
-        --output "$OUT_DIR/decode/nsys_nvtx_pushpop" \
-        "$DECODE_NSYS_REPORT.nsys-rep" 2>/dev/null || true
+        --output "$ROLE_DIR/nsys_nvtx_pushpop" \
+        "$ROLE_DIR/nsys_report.nsys-rep" 2>/dev/null || true
     "$LOCAL_NSYS" stats -r gpu_metrics --format csv \
-        --output "$OUT_DIR/decode/nsys_gpu_metrics" \
-        "$DECODE_NSYS_REPORT.nsys-rep" 2>/dev/null || true
+        --output "$ROLE_DIR/nsys_gpu_metrics" \
+        "$ROLE_DIR/nsys_report.nsys-rep" 2>/dev/null || true
+
+    if [[ -s "$ROLE_DIR/iterations.jsonl" ]]; then
+        echo "[launcher] Running analyze_profile.py on ${ROLE} ..."
+        python "$LOCAL_REPO/zeyu/analyze_profile.py" "$ROLE_DIR" \
+            2>&1 | tee -a "$OUTPUT_DIR/analyze_${ROLE}.log" \
+            || echo "[launcher] analyze_profile failed (non-fatal)"
+    fi
 fi
 
-# ---------- Run analyze_profile on each role's data (if nsys enabled) ----------
-if $ENABLE_NSYS; then
-    for role in prefill decode; do
-        if [[ -s "$OUT_DIR/$role/iterations.jsonl" ]]; then
-            echo "[launcher] Analyzing $role ..."
-            python "$LOCAL_REPO/zeyu/analyze_profile.py" "$OUT_DIR/$role" \
-                2>&1 | tee -a "$OUT_DIR/analyze_$role.log" \
-                || echo "[launcher] analyze_profile for $role failed (non-fatal)"
-        fi
-    done
+# ---------- Final instructions ----------
+echo "============================================================"
+echo "  $ROLE side done. Exit code: $PY_RC"
+echo "============================================================"
+echo "  Output written to: $ROLE_DIR"
+echo
+if [[ "$ROLE" == "prefill" ]]; then
+    echo "  Next steps:"
+    echo "    1. Wait for the decode side to finish on the other node."
+    echo "    2. Copy its '<their-OUT>/decode/' directory INTO this"
+    echo "       output dir:"
+    echo "         $OUTPUT_DIR/"
+    echo "       so that it contains BOTH 'prefill/' and 'decode/'"
+    echo "       subdirs. (Use scp / rsync / a shared NFS mount.)"
+    echo "    3. Produce the merged summary:"
+    echo "         python zeyu/merge_disagg.py $OUTPUT_DIR"
+elif [[ "$ROLE" == "decode" ]]; then
+    echo "  Next steps:"
+    echo "    1. Copy THIS output dir back to the prefill node (or to"
+    echo "       wherever the prefill-side output lives). The prefill"
+    echo "       side expects its own '<their-OUT>/' to end up with a"
+    echo "       'decode/' sibling of 'prefill/'. Example:"
+    echo "         scp -r $ROLE_DIR prefill-host:/path/to/<their-OUT>/"
+    echo "    2. On that node:"
+    echo "         python zeyu/merge_disagg.py /path/to/<their-OUT>"
 fi
-
-# ---------- Merge into disagg_summary.json ----------
-echo "[launcher] Merging metrics ..."
-python "$LOCAL_REPO/zeyu/merge_disagg.py" "$OUT_DIR" \
-    || { echo "[launcher] merge_disagg.py failed"; exit 3; }
-
 echo "============================================================"
-echo "  Done. Output: $OUT_DIR"
-echo "============================================================"
-ls -la "$OUT_DIR"
 
-trap - EXIT
-exit $PREFILL_RC
+exit $PY_RC
