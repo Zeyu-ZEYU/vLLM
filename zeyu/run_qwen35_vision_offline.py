@@ -769,7 +769,14 @@ def run_decode_role(args, examples: list[dict]):
 
     print("[Decode] Waiting for prefill to complete ...")
     prefill_info = _wait_for_done(args, role="decode")
-    prefill_done_ts = prefill_info.get("wall_end", time.time())
+    # Wall-clock timestamps: prefill_done_ts came from prefill node's
+    # time.time() at wall_end; decode_start_ts is our time.time() right
+    # after we received the signal. If the two nodes' clocks are NTP-
+    # synced, their difference approximates the KV/coordination
+    # transfer wall time.
+    decode_signal_ts = time.time()
+    prefill_done_ts = prefill_info.get("wall_end", decode_signal_ts)
+    coordination_transfer_s = max(0.0, decode_signal_ts - prefill_done_ts)
 
     # Run full inference (max_tokens=N). P2pNcclConnector on the consumer
     # side will skip prefill if the producer has already produced KV.
@@ -788,9 +795,10 @@ def run_decode_role(args, examples: list[dict]):
 
     vision_times = get_vision_encoder_times(llm)
 
-    # KV transfer time estimate: scheduled_ts - prefill_done_ts on decode
-    # side. If decode's scheduled_ts < prefill_done_ts (different clocks),
-    # fall back to min(0, diff).
+    # KV/coordination transfer time estimate (single batch-level
+    # measurement, applied uniformly to all requests in this batch).
+    # Uses wall-clock deltas between the two nodes — accuracy depends
+    # on their NTP synchronization.
     decode_metrics = []
     for i, output in enumerate(outputs):
         m = extract_request_metrics(output, vision_times)
@@ -801,15 +809,10 @@ def run_decode_role(args, examples: list[dict]):
         m["generated_text"] = (
             output.outputs[0].text if output.outputs else ""
         )
-
-        # Compute KV transfer wall-clock estimate from peer's completion
-        # timestamp to our scheduled_ts. Clocks may differ; report both
-        # raw and clamped.
-        sched_ts = m.get("scheduled_ts", 0.0)
-        if sched_ts > 0:
-            raw_kv = sched_ts - prefill_done_ts
-            m["kv_transfer_time_s"] = round(raw_kv, 6)
-            m["kv_transfer_time_ms"] = round(raw_kv * 1000, 3)
+        m["kv_transfer_time_s"] = round(coordination_transfer_s, 6)
+        m["kv_transfer_time_ms"] = round(
+            coordination_transfer_s * 1000, 3
+        )
         decode_metrics.append(m)
 
     # Write decode latency JSON.

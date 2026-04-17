@@ -202,18 +202,16 @@ done
 echo "[launcher] Remote decode log (last 30 lines):"
 "${SSH_PREFIX[@]}" "docker exec -u $PEER_SSH_USER $CONTAINER bash -c 'tail -30 $REMOTE_DECODE_LOG 2>/dev/null'" || true
 
-# ---------- Rsync remote decode outputs back ----------
-echo "[launcher] Rsyncing remote decode outputs back ..."
-# The decode process writes into $REMOTE_OUT_DIR/decode. Copy to local.
-rsync -avz -e "ssh -o StrictHostKeyChecking=no" \
-    "${PEER_SSH_USER}@${PEER_HOST}:${REMOTE_OUT_DIR}/decode/" \
-    "$OUT_DIR/decode/" \
-    || { echo "[launcher] rsync FAILED (decode dir may be empty)"; }
+# ---------- Pull remote decode outputs back ----------
+# rsync may not be installed in the container; use tar-over-ssh instead.
+echo "[launcher] Copying remote decode outputs back ..."
+mkdir -p "$OUT_DIR/decode"
+"${SSH_PREFIX[@]}" "tar -C '${REMOTE_OUT_DIR}' -cf - decode" \
+    | tar -C "$OUT_DIR" -xf - \
+    || { echo "[launcher] tar copy FAILED (decode dir may be empty)"; }
 
 # Also pull remote decode.log for reference.
-rsync -avz -e "ssh -o StrictHostKeyChecking=no" \
-    "${PEER_SSH_USER}@${PEER_HOST}:${REMOTE_DECODE_LOG}" \
-    "$OUT_DIR/decode.log" \
+"${SSH_PREFIX[@]}" "cat '${REMOTE_DECODE_LOG}'" > "$OUT_DIR/decode.log" \
     2>/dev/null || true
 
 # ---------- Merge into disagg_summary.json ----------
