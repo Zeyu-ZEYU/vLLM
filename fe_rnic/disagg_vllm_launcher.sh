@@ -121,7 +121,11 @@ prefill)
     KV_EXTRA='{"discard_partial_chunks":false,"lmcache_rpc_port":"producer1"'
     if [[ "$ENABLE_KV_OVERLAP" == "true" ]]; then
         KV_EXTRA="${KV_EXTRA},\"lmcache.use_layerwise\":true"
-        echo "[prefill] KV overlap 已启用 (layerwise)"
+        # Opt into the zero-copy put/get path (batch_put_from / batch_get_into)
+        # so layerwise per-chunk Put doesn't pay the put_parts metadata penalty
+        # and can RDMA-WRITE directly to the decode segment via preferred_segment.
+        KV_EXTRA="${KV_EXTRA},\"save_chunk_meta\":false"
+        echo "[prefill] KV overlap 已启用 (layerwise, zero-copy Mooncake Put)"
     fi
     if [[ "$ENABLE_HEAD_NIC_SPLIT" == "true" ]]; then
         HEAD_CFG="${LMCACHE_HEAD_NIC_CONFIG_FILE:-/tmp/mooncake-head-nic-config.yaml}"
@@ -179,6 +183,13 @@ decode)
 
     # Build decode kv-transfer-config
     DEC_KV_EXTRA='{"discard_partial_chunks":false,"lmcache_rpc_port":"consumer1"'
+    if [[ "$ENABLE_KV_OVERLAP" == "true" ]]; then
+        # Decode must match prefill: per-layer chunks + zero-copy get
+        # (batch_get_into) with per-layer meta_shapes.
+        DEC_KV_EXTRA="${DEC_KV_EXTRA},\"lmcache.use_layerwise\":true"
+        DEC_KV_EXTRA="${DEC_KV_EXTRA},\"save_chunk_meta\":false"
+        echo "[decode] KV overlap 已启用 (layerwise, zero-copy Mooncake Get)"
+    fi
     if [[ "$ENABLE_HEAD_NIC_SPLIT" == "true" ]]; then
         HEAD_CFG="${LMCACHE_HEAD_NIC_CONFIG_FILE:-/tmp/mooncake-head-nic-config.yaml}"
         DEC_KV_EXTRA="${DEC_KV_EXTRA},\"lmcache.enable_head_nic_split\":true"
