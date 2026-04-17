@@ -134,13 +134,46 @@ zeyu/outputs/disagg_<YYYYMMDD_HHMMSS>/
 └── decode.log                    # stdout from decode side
 ```
 
-## Metrics available
+## Metrics pipeline
+
+Two independent collection paths feed into `disagg_summary.json`:
+
+1. **In-process timing + pynvml sampling** (default, always on).
+   The iteration logger runs inside each role's engine process,
+   writes one line per scheduler step to `iterations.jsonl`. A
+   background thread samples `nvmlDeviceGetUtilizationRates` at
+   100 Hz, and each iteration's record carries the mean/max of
+   samples that fell within its ts_mono window.
+
+   Metrics: per-iteration GPU util %, memory util %, memory used
+   MiB, memory allocated (torch), request phase classification,
+   step latency, step RPS.
+
+2. **nsys profiling** (opt-in via `--nsys`). When enabled and the
+   environment has a working standalone nsys, collects:
+   - Per-kernel CUDA timeline (analyze_profile.py derives per-
+     iteration "kernel-busy %" and kernel-launch gap from this).
+   - Per-NVTX-range breakdown (vision_encoder / text_forward).
+   - (Optional) `--sm-metrics` enables `nsys profile
+     --gpu-metrics-devices=all` for aggregate SM active %. This
+     requires GPU performance counters to be unrestricted on
+     the host (ERR_NVGPUCTRPERM). See NVIDIA documentation.
+
+   When nsys is on, analyze_profile.py is invoked by the launcher
+   to produce `consolidated_iterations.jsonl` with GPU util, kernel
+   time, SM metrics. merge_disagg.py then picks these up.
+
+**Note**: the Nsight-Compute-bundled nsys in some environments fails
+to finalize `.qdstrm` files (cannot retrieve importer version).
+Standalone Nsight Systems ≥ 2024.x is recommended if you want
+nsys-derived kernel / SM metrics. Otherwise pynvml-based GPU-util
+sampling (path 1) is the primary source and is always available.
 
 All metrics are in `disagg_summary.json`. Per-iteration raw data is
 additionally in `prefill/iterations.jsonl`,
 `decode/iterations.jsonl`, and `<role>/consolidated_iterations.jsonl`
 (the latter two include nsys-derived GPU/SM metrics when profiling
-is on — it is on by default, use `--no-nsys` to disable).
+is on — off by default, use `--nsys` to enable).
 
 ### Per request (in `disagg_summary.json["requests"]`)
 
@@ -161,25 +194,40 @@ is on — it is on by default, use `--no-nsys` to disable).
 Each sub-object contains averages/sums across the iterations in that
 phase of the request.
 
+Always present (pynvml path):
+
 | Field | Description |
 |---|---|
 | `num_iterations` | Number of iterations in this phase for this request |
-| `avg_gpu_util_pct` | Mean GPU utilization (kernel-busy %) across the phase's iterations |
-| `avg_kernel_launch_gap_pct` | Mean kernel-launch gap % (= 100 − gpu_util) |
 | `avg_gpu_mem_allocated_MiB` | Mean PyTorch-allocated GPU memory during the phase |
-| `avg_sm_active_pct_mean` | Mean "SM Active %" (fraction of SMs busy) sampled by nsys GPU metrics |
-| `avg_sm_occupancy_pct_mean` | Mean "SM Warp Occupancy %" sampled by nsys |
-| `avg_num_active_sms_mean` | Mean count of active SMs sampled by nsys |
+| `avg_nvml_gpu_util_pct_mean` | Mean GPU utilization % from pynvml samples in this phase |
+| `avg_nvml_gpu_util_pct_max` | Max per-iteration peak GPU utilization |
+| `avg_nvml_mem_util_pct_mean` | Mean memory-bus utilization % |
+| `avg_nvml_mem_used_MiB_mean` | Mean total GPU memory used (MiB) |
+| `avg_nvml_mem_used_MiB_max` | Max total memory used (MiB) |
+
+Present when nsys is enabled:
+
+| Field | Description |
+|---|---|
+| `avg_gpu_util_pct` | Mean kernel-busy % from nsys kernel timeline |
+| `avg_kernel_launch_gap_pct` | Mean kernel-launch gap % (= 100 − gpu_util) |
 | `sum_total_kernel_time_ns` | Total GPU busy time across all phase iterations (absolute) |
 | `sum_kernel_launch_gap_ns` | Total GPU idle time (absolute) |
 | `avg_vision_encoder_gpu_util_pct` / `avg_text_forward_gpu_util_pct` | Sub-range GPU util when the iteration ran the vision encoder or text forward kernel |
 | `sum_vision_encoder_kernel_time_ns` / `sum_text_forward_kernel_time_ns` | Same, absolute |
 
-The "SM" fields come from `nsys profile --gpu-metrics-devices`.
-This is aggregate per-GPU sampling — it tells you what fraction of
-SMs were active and how many, but NOT the utilization of each
-individual SM. For per-SM breakdown, you need to run `ncu`
-separately (see section below).
+Present when nsys + `--sm-metrics` is enabled AND GPU counters are
+unrestricted on the host:
+
+| Field | Description |
+|---|---|
+| `avg_sm_active_pct_mean` | Mean "SM Active %" (fraction of SMs busy) sampled by nsys GPU metrics |
+| `avg_sm_occupancy_pct_mean` | Mean "SM Warp Occupancy %" sampled by nsys |
+| `avg_num_active_sms_mean` | Mean count of active SMs sampled by nsys |
+
+True per-SM breakdown (each SM's own utilization %) requires ncu and
+is out of scope for this launcher; see "per-SM breakdown" section.
 
 ### Per iteration (in `<role>/consolidated_iterations.jsonl`)
 
