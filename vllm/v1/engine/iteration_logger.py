@@ -13,12 +13,107 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 
 from vllm.v1.core.sched.output import SchedulerOutput
+
+
+class _NvmlSampler:
+    """Background thread that samples GPU utilization + memory via pynvml.
+
+    Samples are (ts_mono, gpu_util_pct, mem_util_pct, mem_used_bytes).
+    The sampler runs for the life of the process; shutdown stops the
+    thread cleanly.
+    """
+
+    def __init__(self, interval_s: float = 0.01):
+        self._interval_s = interval_s
+        self._samples: list[tuple[float, float, float, int]] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._handle = None
+        self._nvml = None
+
+    def start(self):
+        try:
+            import pynvml
+        except ImportError:
+            return False
+        try:
+            pynvml.nvmlInit()
+        except Exception:
+            return False
+        # CUDA_VISIBLE_DEVICES masks physical GPUs; the process sees
+        # device index 0 as the FIRST visible one. But pynvml uses the
+        # physical NVIDIA index — we need to map from CUDA's view back
+        # to NVML's via the CUDA_VISIBLE_DEVICES env var.
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        # Take first entry (our process only uses one GPU).
+        first = cvd.split(",")[0].strip()
+        try:
+            nvml_idx = int(first) if first else 0
+        except ValueError:
+            nvml_idx = 0
+        try:
+            self._handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_idx)
+        except Exception:
+            return False
+        self._nvml = pynvml
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return True
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                util = self._nvml.nvmlDeviceGetUtilizationRates(self._handle)
+                mem = self._nvml.nvmlDeviceGetMemoryInfo(self._handle)
+                ts = time.monotonic()
+                with self._lock:
+                    self._samples.append(
+                        (ts, float(util.gpu), float(util.memory), int(mem.used))
+                    )
+            except Exception:
+                pass
+            self._stop.wait(self._interval_s)
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self._nvml is not None:
+            try:
+                self._nvml.nvmlShutdown()
+            except Exception:
+                pass
+
+    def aggregate_window(
+        self, start_ts: float, end_ts: float
+    ) -> dict | None:
+        """Average samples in [start_ts, end_ts]. Returns None if no samples."""
+        with self._lock:
+            snap = list(self._samples)
+        in_range = [s for s in snap if start_ts <= s[0] <= end_ts]
+        if not in_range:
+            return None
+        n = len(in_range)
+        return {
+            "nvml_samples": n,
+            "nvml_gpu_util_pct_mean": round(sum(s[1] for s in in_range) / n, 2),
+            "nvml_gpu_util_pct_max": round(max(s[1] for s in in_range), 2),
+            "nvml_mem_util_pct_mean": round(sum(s[2] for s in in_range) / n, 2),
+            "nvml_mem_used_MiB_mean": round(
+                sum(s[3] for s in in_range) / n / (1024**2), 2
+            ),
+            "nvml_mem_used_MiB_max": round(
+                max(s[3] for s in in_range) / (1024**2), 2
+            ),
+        }
 
 
 class IterationLogger:
@@ -34,6 +129,17 @@ class IterationLogger:
         self._iteration_index = 0
         self._prev_ts_mono: float | None = None
 
+        # Start NVML sampler for GPU util/memory.
+        self._nvml_sampler = _NvmlSampler(interval_s=0.01)
+        if self._nvml_sampler.start():
+            import logging
+
+            logging.getLogger(__name__).info(
+                "[IterationLogger] NVML sampler started"
+            )
+        else:
+            self._nvml_sampler = None
+
         # request_id -> {"encoder_iters": [], "prefill_iters": [],
         #                 "decode_iters": [], "first_iter": N}
         self._request_map: dict[str, dict] = defaultdict(
@@ -48,6 +154,8 @@ class IterationLogger:
 
     def close(self):
         """Write requests.jsonl and close file handles."""
+        if self._nvml_sampler is not None:
+            self._nvml_sampler.stop()
         self._iter_file.close()
         self._write_requests()
 
@@ -193,6 +301,18 @@ class IterationLogger:
                 else None
             ),
         }
+
+        # Aggregate NVML samples that fell within this iteration window.
+        # This gives per-iteration GPU utilization % and memory %.
+        if self._nvml_sampler is not None and self._prev_ts_mono is not None:
+            # ts_mono is the END of this iteration (inter-iteration delta).
+            # The iteration ran from (ts_mono - step_latency_s) to ts_mono.
+            window_start = ts_mono - step_latency_s
+            nvml_agg = self._nvml_sampler.aggregate_window(
+                window_start, ts_mono
+            )
+            if nvml_agg:
+                record.update(nvml_agg)
         self._iter_file.write(
             json.dumps(record, ensure_ascii=False) + "\n"
         )

@@ -49,7 +49,7 @@ REMOTE_REPO="/home/zeyu/vllm/mono_kernel"
 CONTAINER="fe_rnic"
 CONDA_ENV="mono_kernel"
 OUTPUT_ROOT=""
-ENABLE_NSYS=true
+ENABLE_NSYS=false              # Requires working nsys; pynvml is the default path
 ENABLE_SM_METRICS=false        # Requires GPU perf-counter privilege
 NSYS_GPU_METRICS_FREQ=10000    # 10 kHz = 100 us between samples
 # Candidate paths for nsys (checked in order, first found wins).

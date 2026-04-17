@@ -108,6 +108,7 @@ def _aggregate_iter_metrics(iterations: list[dict]) -> dict:
 
     out: dict = {"num_iterations": len(iterations)}
     for k in (
+        # nsys-derived (when analyze_profile.py ran with nsys data):
         "gpu_util_pct",
         "kernel_launch_gap_pct",
         "vision_encoder_gpu_util_pct",
@@ -119,6 +120,12 @@ def _aggregate_iter_metrics(iterations: list[dict]) -> dict:
         "sm_active_pct_mean",
         "sm_occupancy_pct_mean",
         "num_active_sms_mean",
+        # pynvml-derived (always available):
+        "nvml_gpu_util_pct_mean",
+        "nvml_gpu_util_pct_max",
+        "nvml_mem_util_pct_mean",
+        "nvml_mem_used_MiB_mean",
+        "nvml_mem_used_MiB_max",
     ):
         v = _mean_of(k)
         if v is not None:
@@ -369,6 +376,11 @@ def main():
                 "avg_vision_encoder_kernel_launch_gap_pct",
                 "avg_text_forward_gpu_util_pct",
                 "avg_text_forward_kernel_launch_gap_pct",
+                "avg_nvml_gpu_util_pct_mean",
+                "avg_nvml_gpu_util_pct_max",
+                "avg_nvml_mem_util_pct_mean",
+                "avg_nvml_mem_used_MiB_mean",
+                "avg_nvml_mem_used_MiB_max",
                 "sum_kernel_launch_gap_ns",
                 "sum_total_kernel_time_ns",
                 "sum_vision_encoder_kernel_launch_gap_ns",
