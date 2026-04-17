@@ -443,7 +443,12 @@ def main():
 # ---------------------------------------------------------------------------
 def run_single_gpu(args, examples: list[dict]):
     """Run all requests on a single GPU (default mode)."""
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    # NOTE: CUDA_VISIBLE_DEVICES should be set BEFORE running this script
+    # (e.g. in the launcher shell) so that vLLM's engine subprocesses
+    # inherit it correctly. Setting it here at the Python level is too
+    # late if any prior import already initialized CUDA.
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
     print(f"Loading model: {args.model} ...")
     llm = LLM(**_common_llm_kwargs(args, examples))
@@ -573,7 +578,12 @@ def run_prefill_role(args, examples: list[dict]):
     # tensor key to match on both sides).
     os.environ["VLLM_DISABLE_REQUEST_ID_RANDOMIZATION"] = "1"
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    # NOTE: CUDA_VISIBLE_DEVICES should be set BEFORE running this script
+    # (e.g. in the launcher shell) so that vLLM's engine subprocesses
+    # inherit it correctly. Setting it here at the Python level is too
+    # late if any prior import already initialized CUDA.
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     _setup_network_env(args.iface)
 
     # Route iteration logs into prefill/ subdir.
@@ -702,7 +712,12 @@ def run_decode_role(args, examples: list[dict]):
     # See explanation in run_prefill_role.
     os.environ["VLLM_DISABLE_REQUEST_ID_RANDOMIZATION"] = "1"
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    # NOTE: CUDA_VISIBLE_DEVICES should be set BEFORE running this script
+    # (e.g. in the launcher shell) so that vLLM's engine subprocesses
+    # inherit it correctly. Setting it here at the Python level is too
+    # late if any prior import already initialized CUDA.
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     _setup_network_env(args.iface)
 
     log_dir = Path(os.environ.get("VLLM_ITERATION_LOG_DIR", str(OUTPUT_DIR)))

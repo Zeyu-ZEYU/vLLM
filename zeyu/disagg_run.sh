@@ -123,13 +123,14 @@ cd '$REMOTE_REPO' && \
     conda activate $CONDA_ENV && \
     export VLLM_LOG_ITERATIONS=1 && \
     export VLLM_ITERATION_LOG_DIR=\"$REMOTE_OUT_DIR\" && \
+    export CUDA_VISIBLE_DEVICES=$DECODE_GPU && \
     python zeyu/run_qwen35_vision_offline.py \
         --role decode \
         --peer-ip $LOCAL_IP \
         --kv-port $KV_PORT \
         --ctrl-port $CTRL_PORT \
         --iface $IFACE \
-        --gpu $DECODE_GPU \
+        --gpu 0 \
         --model $MODEL \
         --num-prompts $NUM_PROMPTS \
         --max-tokens $MAX_TOKENS \
@@ -162,8 +163,11 @@ trap cleanup EXIT INT TERM
 # ---------- Local prefill run ----------
 export VLLM_LOG_ITERATIONS=1
 export VLLM_ITERATION_LOG_DIR="$OUT_DIR"
+# Select the prefill GPU via CUDA_VISIBLE_DEVICES BEFORE Python starts so
+# that vLLM's engine subprocess (spawned later) inherits the correct mask.
+export CUDA_VISIBLE_DEVICES="$PREFILL_GPU"
 
-echo "[launcher] Starting prefill on $(hostname -s) GPU $PREFILL_GPU ..."
+echo "[launcher] Starting prefill on $(hostname -s) GPU $PREFILL_GPU (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES) ..."
 # shellcheck disable=SC2086
 python "$LOCAL_REPO/zeyu/run_qwen35_vision_offline.py" \
     --role prefill \
@@ -171,7 +175,7 @@ python "$LOCAL_REPO/zeyu/run_qwen35_vision_offline.py" \
     --kv-port "$KV_PORT" \
     --ctrl-port "$CTRL_PORT" \
     --iface "$IFACE" \
-    --gpu "$PREFILL_GPU" \
+    --gpu 0 \
     --model "$MODEL" \
     --num-prompts "$NUM_PROMPTS" \
     --max-tokens "$MAX_TOKENS" \
