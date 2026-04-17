@@ -161,6 +161,21 @@ if [[ -n "$INPUT" ]]; then
     INPUT_ARG="--input $INPUT"
 fi
 
+SSH_PREFIX=(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${PEER_SSH_USER}@${PEER_HOST}")
+
+### Detect remote nsys path (inside container) via a probe SSH.
+REMOTE_NSYS=""
+if $ENABLE_NSYS; then
+    REMOTE_NSYS="$(
+        "${SSH_PREFIX[@]}" "docker exec -u $PEER_SSH_USER $CONTAINER bash -lc 'for c in nsys /usr/local/cuda/bin/nsys /opt/nvidia/nsight-systems/bin/nsys /opt/nvidia/nsight-compute/2025.2.1/host/target-linux-x64/nsys; do if command -v \"\$c\" >/dev/null 2>&1 || [[ -x \"\$c\" ]]; then echo \"\$c\"; exit 0; fi; done'" 2>/dev/null | tr -d '[:space:]'
+    )"
+    if [[ -z "$REMOTE_NSYS" ]]; then
+        echo "[launcher] WARN: nsys not found on $PEER_HOST; disabling decode-side profiling."
+    else
+        echo "[launcher] Remote nsys: $REMOTE_NSYS"
+    fi
+fi
+
 # Build the python command (possibly wrapped with nsys).
 if $ENABLE_NSYS && [[ -n "$REMOTE_NSYS" ]]; then
     SM_METRICS_FLAG=""
@@ -214,21 +229,6 @@ cd '$REMOTE_REPO' && \
 ' >'$REMOTE_DECODE_LOG' 2>&1 </dev/null &) && \
 sleep 1 && \
 pgrep -f 'role decode' | tail -1 > '$REMOTE_DECODE_PID_FILE'"
-
-SSH_PREFIX=(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${PEER_SSH_USER}@${PEER_HOST}")
-
-### Detect remote nsys path (inside container) via a probe SSH.
-REMOTE_NSYS=""
-if $ENABLE_NSYS; then
-    REMOTE_NSYS="$(
-        "${SSH_PREFIX[@]}" "docker exec -u $PEER_SSH_USER $CONTAINER bash -lc 'for c in nsys /usr/local/cuda/bin/nsys /opt/nvidia/nsight-systems/bin/nsys /opt/nvidia/nsight-compute/2025.2.1/host/target-linux-x64/nsys; do if command -v \"\$c\" >/dev/null 2>&1 || [[ -x \"\$c\" ]]; then echo \"\$c\"; exit 0; fi; done'" 2>/dev/null | tr -d '[:space:]'
-    )"
-    if [[ -z "$REMOTE_NSYS" ]]; then
-        echo "[launcher] WARN: nsys not found on $PEER_HOST; disabling decode-side profiling."
-    else
-        echo "[launcher] Remote nsys: $REMOTE_NSYS"
-    fi
-fi
 
 echo "[launcher] Starting decode on $PEER_HOST ..."
 "${SSH_PREFIX[@]}" "docker exec -u $PEER_SSH_USER $CONTAINER bash -lc \"$REMOTE_CMD\"" \
