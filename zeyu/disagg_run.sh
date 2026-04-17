@@ -5,8 +5,13 @@
 #
 # Runs vision encoder + prefill on THIS node (the "prefill node") and
 # decode on a REMOTE node over SSH. Collects all metrics on the prefill
-# node (rsync'd from decode node at the end) and produces a merged
+# node (tar'd from decode node at the end) and produces a merged
 # summary JSON.
+#
+# By default, nsys profiling is ON with GPU metrics sampling enabled on
+# both sides. This collects: per-iteration GPU utilization, kernel-launch
+# gap, per-phase (VE/prefill/decode) GPU/kernel/memory stats, aggregate
+# SM active %, and active-SM count. Use --no-nsys to disable.
 #
 # Usage (run on the prefill node, Node 0):
 #
@@ -41,6 +46,15 @@ REMOTE_REPO="/home/zeyu/vllm/mono_kernel"
 CONTAINER="fe_rnic"
 CONDA_ENV="mono_kernel"
 OUTPUT_ROOT=""
+ENABLE_NSYS=true
+NSYS_GPU_METRICS_FREQ=10000   # 10 kHz = 100 us between samples
+# Candidate paths for nsys (checked in order, first found wins).
+NSYS_PATH_CANDIDATES=(
+    "nsys"
+    "/usr/local/cuda/bin/nsys"
+    "/opt/nvidia/nsight-systems/bin/nsys"
+    "/opt/nvidia/nsight-compute/2025.2.1/host/target-linux-x64/nsys"
+)
 
 # ---------- Parse args ----------
 while [[ $# -gt 0 ]]; do
@@ -62,8 +76,11 @@ while [[ $# -gt 0 ]]; do
         --container) CONTAINER="$2"; shift 2;;
         --conda-env) CONDA_ENV="$2"; shift 2;;
         --output-root) OUTPUT_ROOT="$2"; shift 2;;
+        --nsys) ENABLE_NSYS=true; shift 1;;
+        --no-nsys) ENABLE_NSYS=false; shift 1;;
+        --nsys-freq) NSYS_GPU_METRICS_FREQ="$2"; shift 2;;
         -h|--help)
-            sed -n '1,30p' "$0"
+            sed -n '1,60p' "$0"
             exit 0
             ;;
         *)
@@ -95,6 +112,27 @@ if [[ -z "$LOCAL_IP" ]]; then
     exit 1
 fi
 
+# ---------- Locate nsys (local) ----------
+LOCAL_NSYS=""
+if $ENABLE_NSYS; then
+    for cand in "${NSYS_PATH_CANDIDATES[@]}"; do
+        if command -v "$cand" >/dev/null 2>&1 || [[ -x "$cand" ]]; then
+            LOCAL_NSYS="$cand"
+            break
+        fi
+    done
+    if [[ -z "$LOCAL_NSYS" ]]; then
+        echo "[launcher] WARN: nsys not found on this node; disabling profiling."
+        ENABLE_NSYS=false
+    else
+        echo "[launcher] Using nsys: $LOCAL_NSYS"
+    fi
+fi
+
+# Shell snippet (shared by local and remote) that resolves the path
+# to nsys when running on a node. Embedded into remote command.
+NSYS_RESOLVE_SNIPPET='NSYS=""; for c in nsys /usr/local/cuda/bin/nsys /opt/nvidia/nsight-systems/bin/nsys /opt/nvidia/nsight-compute/2025.2.1/host/target-linux-x64/nsys; do if command -v "$c" >/dev/null 2>&1 || [[ -x "$c" ]]; then NSYS="$c"; break; fi; done'
+
 echo "============================================================"
 echo "  Cross-node disaggregation launcher"
 echo "============================================================"
@@ -103,16 +141,42 @@ echo "  Decode  (remote): $PEER_HOST                  GPU=$DECODE_GPU"
 echo "  Model           : $MODEL"
 echo "  Prompts         : $NUM_PROMPTS  max_tokens=$MAX_TOKENS"
 echo "  KV port         : $KV_PORT  ctrl_port=$CTRL_PORT"
+echo "  Profiling       : nsys=$ENABLE_NSYS (gpu_metrics_freq=$NSYS_GPU_METRICS_FREQ)"
 echo "  Output dir      : $OUT_DIR"
 echo "============================================================"
 
 # ---------- Remote decode start ----------
 REMOTE_DECODE_LOG="$REMOTE_OUT_DIR/decode.log"
 REMOTE_DECODE_PID_FILE="$REMOTE_OUT_DIR/decode.pid"
+REMOTE_NSYS_REPORT="$REMOTE_OUT_DIR/decode/nsys_report"
 
 INPUT_ARG=""
 if [[ -n "$INPUT" ]]; then
     INPUT_ARG="--input $INPUT"
+fi
+
+# Build the python command (possibly wrapped with nsys).
+if $ENABLE_NSYS; then
+    REMOTE_PY_CMD_WRAP="\
+        $NSYS_RESOLVE_SNIPPET; \
+        \"\$NSYS\" profile \
+            --trace=cuda,nvtx \
+            --cuda-graph-trace=node \
+            --trace-fork-before-exec=true \
+            --gpu-metrics-devices=cuda-visible \
+            --gpu-metrics-frequency=$NSYS_GPU_METRICS_FREQ \
+            --output='$REMOTE_NSYS_REPORT' \
+            --force-overwrite=true \
+            "
+    REMOTE_NVTX_EXPORT=" && \
+    \"\$NSYS\" stats -r cuda_gpu_trace --format csv --output '$REMOTE_OUT_DIR/decode/nsys_kernels' '$REMOTE_NSYS_REPORT.nsys-rep' 2>/dev/null || true; \
+    \"\$NSYS\" stats -r nvtx_pushpop_trace --format csv --output '$REMOTE_OUT_DIR/decode/nsys_nvtx_pushpop' '$REMOTE_NSYS_REPORT.nsys-rep' 2>/dev/null || true; \
+    \"\$NSYS\" stats -r gpu_metrics --format csv --output '$REMOTE_OUT_DIR/decode/nsys_gpu_metrics' '$REMOTE_NSYS_REPORT.nsys-rep' 2>/dev/null || true"
+    REMOTE_NVTX_ENV="export VLLM_NVTX_SCOPES_FOR_PROFILING=1 && "
+else
+    REMOTE_PY_CMD_WRAP=""
+    REMOTE_NVTX_EXPORT=""
+    REMOTE_NVTX_ENV=""
 fi
 
 REMOTE_CMD="\
@@ -124,7 +188,8 @@ cd '$REMOTE_REPO' && \
     export VLLM_LOG_ITERATIONS=1 && \
     export VLLM_ITERATION_LOG_DIR=\"$REMOTE_OUT_DIR\" && \
     export CUDA_VISIBLE_DEVICES=$DECODE_GPU && \
-    python zeyu/run_qwen35_vision_offline.py \
+    ${REMOTE_NVTX_ENV}\
+    ${REMOTE_PY_CMD_WRAP}python zeyu/run_qwen35_vision_offline.py \
         --role decode \
         --peer-ip $LOCAL_IP \
         --kv-port $KV_PORT \
@@ -137,7 +202,7 @@ cd '$REMOTE_REPO' && \
         --max-model-len $MAX_MODEL_LEN \
         --gpu-memory-utilization $GPU_MEM_UTIL \
         --output-dir $REMOTE_OUT_DIR \
-        $INPUT_ARG \
+        $INPUT_ARG ${REMOTE_NVTX_EXPORT}\
 ' >'$REMOTE_DECODE_LOG' 2>&1 </dev/null &) && \
 sleep 1 && \
 pgrep -f 'role decode' | tail -1 > '$REMOTE_DECODE_PID_FILE'"
@@ -167,25 +232,67 @@ export VLLM_ITERATION_LOG_DIR="$OUT_DIR"
 # that vLLM's engine subprocess (spawned later) inherits the correct mask.
 export CUDA_VISIBLE_DEVICES="$PREFILL_GPU"
 
-echo "[launcher] Starting prefill on $(hostname -s) GPU $PREFILL_GPU (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES) ..."
-# shellcheck disable=SC2086
-python "$LOCAL_REPO/zeyu/run_qwen35_vision_offline.py" \
-    --role prefill \
-    --peer-ip "$PEER_HOST" \
-    --kv-port "$KV_PORT" \
-    --ctrl-port "$CTRL_PORT" \
-    --iface "$IFACE" \
-    --gpu 0 \
-    --model "$MODEL" \
-    --num-prompts "$NUM_PROMPTS" \
-    --max-tokens "$MAX_TOKENS" \
-    --max-model-len "$MAX_MODEL_LEN" \
-    --gpu-memory-utilization "$GPU_MEM_UTIL" \
-    --output-dir "$OUT_DIR" \
-    $INPUT_ARG \
-    2>&1 | tee "$OUT_DIR/prefill.log"
+LOCAL_NSYS_REPORT="$OUT_DIR/prefill/nsys_report"
 
-PREFILL_RC=${PIPESTATUS[0]}
+echo "[launcher] Starting prefill on $(hostname -s) GPU $PREFILL_GPU (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES) ..."
+if $ENABLE_NSYS; then
+    export VLLM_NVTX_SCOPES_FOR_PROFILING=1
+    # shellcheck disable=SC2086
+    "$LOCAL_NSYS" profile \
+        --trace=cuda,nvtx \
+        --cuda-graph-trace=node \
+        --trace-fork-before-exec=true \
+        --gpu-metrics-devices=cuda-visible \
+        --gpu-metrics-frequency="$NSYS_GPU_METRICS_FREQ" \
+        --output="$LOCAL_NSYS_REPORT" \
+        --force-overwrite=true \
+        python "$LOCAL_REPO/zeyu/run_qwen35_vision_offline.py" \
+            --role prefill \
+            --peer-ip "$PEER_HOST" \
+            --kv-port "$KV_PORT" \
+            --ctrl-port "$CTRL_PORT" \
+            --iface "$IFACE" \
+            --gpu 0 \
+            --model "$MODEL" \
+            --num-prompts "$NUM_PROMPTS" \
+            --max-tokens "$MAX_TOKENS" \
+            --max-model-len "$MAX_MODEL_LEN" \
+            --gpu-memory-utilization "$GPU_MEM_UTIL" \
+            --output-dir "$OUT_DIR" \
+            $INPUT_ARG \
+        2>&1 | tee "$OUT_DIR/prefill.log"
+    PREFILL_RC=${PIPESTATUS[0]}
+
+    echo "[launcher] Exporting prefill nsys CSVs ..."
+    "$LOCAL_NSYS" stats -r cuda_gpu_trace --format csv \
+        --output "$OUT_DIR/prefill/nsys_kernels" \
+        "$LOCAL_NSYS_REPORT.nsys-rep" 2>/dev/null || true
+    "$LOCAL_NSYS" stats -r nvtx_pushpop_trace --format csv \
+        --output "$OUT_DIR/prefill/nsys_nvtx_pushpop" \
+        "$LOCAL_NSYS_REPORT.nsys-rep" 2>/dev/null || true
+    "$LOCAL_NSYS" stats -r gpu_metrics --format csv \
+        --output "$OUT_DIR/prefill/nsys_gpu_metrics" \
+        "$LOCAL_NSYS_REPORT.nsys-rep" 2>/dev/null || true
+else
+    # shellcheck disable=SC2086
+    python "$LOCAL_REPO/zeyu/run_qwen35_vision_offline.py" \
+        --role prefill \
+        --peer-ip "$PEER_HOST" \
+        --kv-port "$KV_PORT" \
+        --ctrl-port "$CTRL_PORT" \
+        --iface "$IFACE" \
+        --gpu 0 \
+        --model "$MODEL" \
+        --num-prompts "$NUM_PROMPTS" \
+        --max-tokens "$MAX_TOKENS" \
+        --max-model-len "$MAX_MODEL_LEN" \
+        --gpu-memory-utilization "$GPU_MEM_UTIL" \
+        --output-dir "$OUT_DIR" \
+        $INPUT_ARG \
+        2>&1 | tee "$OUT_DIR/prefill.log"
+    PREFILL_RC=${PIPESTATUS[0]}
+fi
+
 echo "[launcher] Prefill exit code: $PREFILL_RC"
 
 # ---------- Wait for remote decode to finish ----------
@@ -214,14 +321,22 @@ mkdir -p "$OUT_DIR/decode"
 "${SSH_PREFIX[@]}" "cat '${REMOTE_DECODE_LOG}'" > "$OUT_DIR/decode.log" \
     2>/dev/null || true
 
+# ---------- Run analyze_profile on each role's data (if nsys enabled) ----------
+if $ENABLE_NSYS; then
+    for role in prefill decode; do
+        if [[ -s "$OUT_DIR/$role/iterations.jsonl" ]]; then
+            echo "[launcher] Analyzing $role ..."
+            python "$LOCAL_REPO/zeyu/analyze_profile.py" "$OUT_DIR/$role" \
+                2>&1 | tee -a "$OUT_DIR/analyze_$role.log" \
+                || echo "[launcher] analyze_profile for $role failed (non-fatal)"
+        fi
+    done
+fi
+
 # ---------- Merge into disagg_summary.json ----------
 echo "[launcher] Merging metrics ..."
 python "$LOCAL_REPO/zeyu/merge_disagg.py" "$OUT_DIR" \
     || { echo "[launcher] merge_disagg.py failed"; exit 3; }
-
-# ---------- Analyze (optional: iteration+kernel correlation) ----------
-# Skip analyze_profile.py if no nsys report is present; disagg_summary
-# already has per-request and per-iteration metrics.
 
 echo "============================================================"
 echo "  Done. Output: $OUT_DIR"

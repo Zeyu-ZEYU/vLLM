@@ -206,6 +206,116 @@ def parse_nsys_kernels(path: Path) -> list[dict]:
     return kernels
 
 
+# ---------------------------------------------------------------------------
+# Parse nsys gpu_metrics CSV (SM-level aggregate metrics)
+# ---------------------------------------------------------------------------
+def parse_nsys_gpu_metrics(path: Path) -> list[dict]:
+    """Parse nsys gpu_metrics CSV.
+
+    Columns vary by nsys version but typically include:
+      * ``Timestamp``/``Timestamp (ns)``  — sample time in ns
+      * ``SM Active %`` / ``SM Active``    — fraction of GPU SMs active
+      * ``SM Warp Occupancy`` / similar
+      * ``SMs busy`` / ``Active SMs``      — count of active SMs
+
+    Returns a list of dicts: ``{ts_ns, sm_active_pct, sm_occupancy_pct,
+    num_active_sms}``. Fields that aren't present in the CSV are
+    omitted.
+    """
+    if not path.exists():
+        return []
+
+    samples = []
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        cols = reader.fieldnames or []
+        # Resolve column names heuristically.
+        ts_col = None
+        for c in cols:
+            low = c.lower()
+            if "timestamp" in low and "ns" in low:
+                ts_col = c
+                break
+        if ts_col is None:
+            # fallback: any "Start (ns)" or "Timestamp"
+            for c in cols:
+                low = c.lower()
+                if "timestamp" in low or "time" in low:
+                    ts_col = c
+                    break
+        sm_active_col = None
+        sm_occ_col = None
+        active_sms_col = None
+        for c in cols:
+            low = c.lower()
+            if sm_active_col is None and (
+                "sm active" in low
+                or "smactive" in low
+                or low.startswith("sms active")
+            ):
+                sm_active_col = c
+            if sm_occ_col is None and (
+                "warp occupancy" in low or "sm occupancy" in low
+            ):
+                sm_occ_col = c
+            if active_sms_col is None and (
+                "active sms" in low or "smsbusy" in low or "sms busy" in low
+            ):
+                active_sms_col = c
+
+        for row in reader:
+            try:
+                if ts_col:
+                    ts_ns = int(float(row.get(ts_col, 0)))
+                else:
+                    continue
+            except (ValueError, TypeError):
+                continue
+            entry = {"ts_ns": ts_ns}
+            if sm_active_col:
+                try:
+                    entry["sm_active_pct"] = float(row.get(sm_active_col, 0))
+                except (ValueError, TypeError):
+                    pass
+            if sm_occ_col:
+                try:
+                    entry["sm_occupancy_pct"] = float(row.get(sm_occ_col, 0))
+                except (ValueError, TypeError):
+                    pass
+            if active_sms_col:
+                try:
+                    entry["num_active_sms"] = float(row.get(active_sms_col, 0))
+                except (ValueError, TypeError):
+                    pass
+            samples.append(entry)
+
+    samples.sort(key=lambda s: s["ts_ns"])
+    return samples
+
+
+def aggregate_gpu_metrics_in_window(
+    samples: list[dict], start_ns: int, end_ns: int
+) -> dict:
+    """Average SM metrics across samples that fall in [start_ns, end_ns)."""
+    if not samples:
+        return {}
+    # Binary-search could be done; linear fine for small N.
+    in_range = [s for s in samples if start_ns <= s["ts_ns"] < end_ns]
+    if not in_range:
+        return {}
+    out: dict = {"num_gpu_metric_samples": len(in_range)}
+    for field, outk in (
+        ("sm_active_pct", "sm_active_pct_mean"),
+        ("sm_occupancy_pct", "sm_occupancy_pct_mean"),
+        ("num_active_sms", "num_active_sms_mean"),
+    ):
+        vals = [s[field] for s in in_range if field in s]
+        if vals:
+            out[outk] = round(sum(vals) / len(vals), 3)
+            out[outk.replace("_mean", "_max")] = round(max(vals), 3)
+    return out
+
+
 def correlate_kernels_to_ranges(
     kernels: list[dict], ranges: list[dict]
 ) -> list[list[dict]]:
@@ -525,6 +635,28 @@ def process_single_dir(
             break
     ncu_by_name = parse_ncu_csv(ncu_csv_path) if ncu_csv_path else {}
 
+    # --- Parse nsys GPU metrics (SM active etc.) ---
+    gpu_metrics_csv = None
+    for d in search_dirs:
+        for candidate in [
+            "nsys_gpu_metrics_gpu_metrics.csv",
+            "nsys_gpu_metrics.csv",
+        ]:
+            p = d / candidate
+            if p.exists():
+                gpu_metrics_csv = p
+                break
+        if gpu_metrics_csv is not None:
+            break
+    gpu_metric_samples = (
+        parse_nsys_gpu_metrics(gpu_metrics_csv) if gpu_metrics_csv else []
+    )
+    if gpu_metric_samples:
+        print(
+            f"  {label}Parsed {len(gpu_metric_samples)} GPU metric samples "
+            f"from {gpu_metrics_csv.name}"
+        )
+
     # --- Correlate ---
     kernels_per_iter = correlate_kernels_to_ranges(kernels, nvtx_ranges)
 
@@ -607,6 +739,15 @@ def process_single_dir(
             if ncu_by_name and iter_kernels:
                 sm_metrics = enrich_with_ncu(iter_kernels, ncu_by_name)
                 record.update(sm_metrics)
+
+            # Add GPU metrics sampled by nsys during this iteration's NVTX
+            # window (aggregate SM active %, active-SM count, etc.).
+            if gpu_metric_samples:
+                gpu_mx = aggregate_gpu_metrics_in_window(
+                    gpu_metric_samples, rng["start_ns"], rng["end_ns"]
+                )
+                if gpu_mx:
+                    record.update(gpu_mx)
 
         per_req_phases = []
         for req_id in it.get("prefill_req_ids", []):
