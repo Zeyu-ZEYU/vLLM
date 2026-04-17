@@ -567,6 +567,12 @@ def run_prefill_role(args, examples: list[dict]):
             "(the decode process's IP)."
         )
 
+    # P2pNcclConnector relies on request_ids carrying both endpoints'
+    # ZMQ addresses. Disable vLLM's random suffixing so our IDs are
+    # identical on prefill and decode sides (required for the KV
+    # tensor key to match on both sides).
+    os.environ["VLLM_DISABLE_REQUEST_ID_RANDOMIZATION"] = "1"
+
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     _setup_network_env(args.iface)
 
@@ -576,9 +582,12 @@ def run_prefill_role(args, examples: list[dict]):
     os.environ["VLLM_ITERATION_LOG_DIR"] = str(prefill_log_dir)
 
     local_ip = _local_ip_for(args.iface)
+    prefill_kv_port = args.kv_port
+    decode_kv_port = args.kv_port + 100  # decode uses a different port
     print(
         f"[Prefill] Role=kv_producer  local_ip={local_ip}  "
-        f"peer_ip={args.peer_ip}  kv_port={args.kv_port}  "
+        f"peer_ip={args.peer_ip}  "
+        f"prefill_kv_port={prefill_kv_port}  decode_kv_port={decode_kv_port}  "
         f"iface={args.iface}"
     )
 
@@ -593,9 +602,9 @@ def run_prefill_role(args, examples: list[dict]):
         kv_rank=0,
         kv_parallel_size=2,
         kv_buffer_size=1e9,
-        kv_port=str(args.kv_port),
+        kv_ip=local_ip,
+        kv_port=str(prefill_kv_port),
         kv_connector_extra_config={
-            # Direct peer addressing (no proxy).
             "send_type": "PUT_ASYNC",
             "nccl_num_channels": "8",
         },
@@ -604,8 +613,26 @@ def run_prefill_role(args, examples: list[dict]):
     print("[Prefill] Loading model ...")
     llm = LLM(**llm_kwargs)
 
-    # Wait for decode peer to be ready (simple synchronization via ZMQ).
-    _sync_ready(args, role="prefill")
+    # Sync with decode peer: exchange addresses and request IDs.
+    _sync_ready(
+        args,
+        role="prefill",
+        local_ip=local_ip,
+        local_kv_port=prefill_kv_port,
+    )
+    peer_info = args._peer_info
+    decode_ip = peer_info["ip"]
+
+    # Build request_ids that encode both endpoints' addresses.
+    req_ids = _build_disagg_request_ids(
+        num=len(examples),
+        prefill_ip=local_ip,
+        prefill_port=prefill_kv_port,
+        decode_ip=decode_ip,
+        decode_port=decode_kv_port,
+    )
+    # Send the generated request IDs to decode side so it uses the same IDs.
+    args._ctrl_sock.send_json({"op": "req_ids", "ids": req_ids})
 
     vllm_inputs = _build_vllm_inputs(examples)
     prefill_params = SamplingParams(
@@ -615,7 +642,9 @@ def run_prefill_role(args, examples: list[dict]):
 
     print(f"[Prefill] Running prefill for {len(vllm_inputs)} requests ...")
     wall_start = time.time()
-    outputs = llm.generate(vllm_inputs, sampling_params=prefill_params)
+    outputs = _generate_with_request_ids(
+        llm, vllm_inputs, prefill_params, req_ids
+    )
     wall_end = time.time()
 
     vision_times = get_vision_encoder_times(llm)
@@ -670,6 +699,9 @@ def run_decode_role(args, examples: list[dict]):
             "(the prefill process's IP)."
         )
 
+    # See explanation in run_prefill_role.
+    os.environ["VLLM_DISABLE_REQUEST_ID_RANDOMIZATION"] = "1"
+
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     _setup_network_env(args.iface)
 
@@ -678,9 +710,12 @@ def run_decode_role(args, examples: list[dict]):
     os.environ["VLLM_ITERATION_LOG_DIR"] = str(decode_log_dir)
 
     local_ip = _local_ip_for(args.iface)
+    prefill_kv_port = args.kv_port
+    decode_kv_port = args.kv_port + 100
     print(
         f"[Decode] Role=kv_consumer  local_ip={local_ip}  "
-        f"peer_ip={args.peer_ip}  kv_port={args.kv_port}  "
+        f"peer_ip={args.peer_ip}  "
+        f"prefill_kv_port={prefill_kv_port}  decode_kv_port={decode_kv_port}  "
         f"iface={args.iface}"
     )
 
@@ -694,7 +729,8 @@ def run_decode_role(args, examples: list[dict]):
         kv_rank=1,
         kv_parallel_size=2,
         kv_buffer_size=8e9,
-        kv_port=str(args.kv_port + 1),  # Consumer binds on port+1
+        kv_ip=local_ip,
+        kv_port=str(decode_kv_port),
         kv_connector_extra_config={
             "send_type": "PUT_ASYNC",
             "nccl_num_channels": "8",
@@ -704,8 +740,18 @@ def run_decode_role(args, examples: list[dict]):
     print("[Decode] Loading model ...")
     llm = LLM(**llm_kwargs)
 
-    # Signal ready to prefill, then wait for prefill to finish.
-    _sync_ready(args, role="decode")
+    # Exchange addresses with prefill side.
+    _sync_ready(
+        args,
+        role="decode",
+        local_ip=local_ip,
+        local_kv_port=decode_kv_port,
+    )
+    # Receive the request IDs chosen by prefill side.
+    msg = args._ctrl_sock.recv_json()
+    assert msg.get("op") == "req_ids", f"unexpected msg: {msg}"
+    req_ids: list[str] = msg["ids"]
+
     print("[Decode] Waiting for prefill to complete ...")
     prefill_info = _wait_for_done(args, role="decode")
     prefill_done_ts = prefill_info.get("wall_end", time.time())
@@ -720,7 +766,9 @@ def run_decode_role(args, examples: list[dict]):
 
     print(f"[Decode] Running decode for {len(vllm_inputs)} requests ...")
     wall_start = time.time()
-    outputs = llm.generate(vllm_inputs, sampling_params=decode_params)
+    outputs = _generate_with_request_ids(
+        llm, vllm_inputs, decode_params, req_ids
+    )
     wall_end = time.time()
 
     vision_times = get_vision_encoder_times(llm)
@@ -777,42 +825,116 @@ def run_decode_role(args, examples: list[dict]):
 # ---------------------------------------------------------------------------
 # Cross-node coordination (ZMQ PAIR sockets over eth0)
 # ---------------------------------------------------------------------------
-def _sync_ready(args, role: str):
-    """Prefill binds, decode connects. Both exchange a READY message
-    and return once both sides have acknowledged."""
+def _sync_ready(args, role: str, local_ip: str, local_kv_port: int):
+    """Prefill binds, decode connects. Both exchange addresses and
+    ensure the peer is ready."""
     import zmq
 
     ctx = zmq.Context.instance()
-    local_ip = _local_ip_for(args.iface)
 
     if role == "prefill":
         sock = ctx.socket(zmq.PAIR)
+        sock.setsockopt(zmq.LINGER, 0)
         sock.bind(f"tcp://0.0.0.0:{args.ctrl_port}")
         print(
             f"[Prefill] Ctrl bound on 0.0.0.0:{args.ctrl_port}, "
             f"waiting for decode READY ..."
         )
         msg = sock.recv_json()
-        assert msg.get("op") == "ready"
-        sock.send_json({"op": "ack", "ts": time.time(), "ip": local_ip})
+        assert msg.get("op") == "ready", f"unexpected msg: {msg}"
+        peer_info = {
+            "ip": msg.get("ip"),
+            "kv_port": msg.get("kv_port"),
+        }
+        sock.send_json({
+            "op": "ack",
+            "ts": time.time(),
+            "ip": local_ip,
+            "kv_port": local_kv_port,
+        })
         args._ctrl_sock = sock
+        args._peer_info = peer_info
     else:  # decode
         sock = ctx.socket(zmq.PAIR)
+        sock.setsockopt(zmq.LINGER, 0)
         url = f"tcp://{args.peer_ip}:{args.ctrl_port}"
         sock.connect(url)
         print(f"[Decode] Ctrl connected to {url}, sending READY ...")
-        # Small retry loop: give prefill time to bind.
-        for attempt in range(20):
-            try:
-                sock.send_json({"op": "ready", "ts": time.time(), "ip": local_ip})
-                break
-            except Exception as e:
-                if attempt == 19:
-                    raise
-                time.sleep(1)
+        sock.send_json({
+            "op": "ready",
+            "ts": time.time(),
+            "ip": local_ip,
+            "kv_port": local_kv_port,
+        })
         msg = sock.recv_json()
-        assert msg.get("op") == "ack"
+        assert msg.get("op") == "ack", f"unexpected msg: {msg}"
         args._ctrl_sock = sock
+        args._peer_info = {
+            "ip": msg.get("ip"),
+            "kv_port": msg.get("kv_port"),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Request ID helpers for P2pNcclConnector
+# ---------------------------------------------------------------------------
+def _build_disagg_request_ids(
+    num: int,
+    prefill_ip: str,
+    prefill_port: int,
+    decode_ip: str,
+    decode_port: int,
+) -> list[str]:
+    """Build request IDs that encode both endpoints' ZMQ addresses.
+
+    P2pNcclConnector parses these to route KV tensors between prefill
+    and decode. The format must match the regex in
+    ``P2pNcclConnector.parse_request_id``:
+      * prefill side:  ``___decode_addr_<ip>:<port>``
+      * decode side:   ``___prefill_addr_<ip>:<port>___``
+
+    We put both markers in a single shared ID so prefill and decode can
+    use identical IDs (required for tensor key matching).
+    """
+    import uuid
+
+    ids = []
+    for i in range(num):
+        uid = uuid.uuid4().hex[:12]
+        rid = (
+            f"req{i}"
+            f"___prefill_addr_{prefill_ip}:{prefill_port}"
+            f"___decode_addr_{decode_ip}:{decode_port}"
+            f"_{uid}"
+        )
+        ids.append(rid)
+    return ids
+
+
+def _generate_with_request_ids(
+    llm: LLM,
+    vllm_inputs: list[dict],
+    sampling_params: SamplingParams,
+    request_ids: list[str],
+):
+    """Submit requests with caller-provided request IDs and return
+    outputs in the same order as request_ids."""
+    from vllm.outputs import RequestOutput
+
+    assert len(vllm_inputs) == len(request_ids), (
+        f"Got {len(vllm_inputs)} inputs and {len(request_ids)} IDs"
+    )
+    for inp, rid in zip(vllm_inputs, request_ids):
+        llm.llm_engine.add_request(rid, inp, sampling_params)
+
+    # Drive the engine until all requests finish.
+    outputs: list[RequestOutput] = llm._run_engine(
+        RequestOutput, use_tqdm=True
+    )
+    # _run_engine returns outputs sorted by request_id (string sort), so
+    # re-sort by our injected order.
+    by_id = {o.request_id: o for o in outputs}
+    return [by_id[r] for r in request_ids if r in by_id]
 
 
 def _signal_done(args, role: str, payload: dict):
