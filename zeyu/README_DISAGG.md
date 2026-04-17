@@ -902,10 +902,13 @@ ping <peer-iface-ip>
 nc -zv <peer-iface-ip> <kv-port>  # from decode, to prefill's kv_port
 nc -zv <peer-iface-ip> <kv-port+100>  # from prefill, to decode's
 ```
-The launcher exports `NCCL_SOCKET_IFNAME=$IFACE` and
-`NCCL_IB_DISABLE=1` by default. If you want to use InfiniBand /
-RDMA, pass `--iface <ib-name>` AND remove the `NCCL_IB_DISABLE=1`
-line from `disagg_run.sh` manually.
+The python entrypoint sets `NCCL_SOCKET_IFNAME=$IFACE`,
+`GLOO_SOCKET_IFNAME=$IFACE`, and `NCCL_IB_DISABLE=1` by default
+(see `_setup_network_env` in `run_qwen35_vision_offline.py`). All
+three are set with `setdefault`, so exporting them yourself in the
+shell before running the launcher takes precedence. To use
+InfiniBand / RDMA, export `NCCL_IB_DISABLE=0` (and the relevant
+`NCCL_IB_HCA` etc.) in your shell first.
 
 **`Request id ... does not contain hostname and port`**
 P2pNcclConnector's regex couldn't parse the request ID. Make sure

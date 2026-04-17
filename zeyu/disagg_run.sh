@@ -67,6 +67,7 @@ KV_PORT=25555
 CTRL_PORT=25500
 GPU=0
 INPUT=""
+DELAY=""                        # Optional global inter-arrival delay (ms).
 PEER_IP=""                      # Required for --role decode.
 OUTPUT_DIR=""                   # Empty → auto-timestamped subdir.
 ENABLE_NSYS=false               # pynvml path is always on; nsys is opt-in.
@@ -102,6 +103,7 @@ while [[ $# -gt 0 ]]; do
         --ctrl-port) CTRL_PORT="$2"; shift 2;;
         --gpu) GPU="$2"; shift 2;;
         --input) INPUT="$2"; shift 2;;
+        --delay) DELAY="$2"; shift 2;;
         --output-dir) OUTPUT_DIR="$2"; shift 2;;
         --nsys) ENABLE_NSYS=true; shift 1;;
         --no-nsys) ENABLE_NSYS=false; shift 1;;
@@ -210,6 +212,11 @@ if [[ -n "$INPUT" ]]; then
     INPUT_ARG="--input $INPUT"
 fi
 
+DELAY_ARG=""
+if [[ -n "$DELAY" ]]; then
+    DELAY_ARG="--delay $DELAY"
+fi
+
 PEER_IP_ARG=""
 if [[ -n "$PEER_IP" ]]; then
     PEER_IP_ARG="--peer-ip $PEER_IP"
@@ -241,7 +248,7 @@ PY=(python "$LOCAL_REPO/zeyu/run_qwen35_vision_offline.py"
     --max-model-len "$MAX_MODEL_LEN"
     --gpu-memory-utilization "$GPU_MEM_UTIL"
     --output-dir "$OUTPUT_DIR"
-    $INPUT_ARG)
+    $INPUT_ARG $DELAY_ARG)
 
 # ---------- Run ----------
 echo "[launcher] Starting $ROLE ..."
