@@ -83,7 +83,9 @@ NSYS_PATH_CANDIDATES=(
 
 # ---------- Parse args ----------
 usage() {
-    sed -n '1,60p' "$0"
+    # Print the top comment block (up to, but not including, the
+    # `set -euo pipefail` line).
+    sed -n '1,55p' "$0"
     exit 0
 }
 while [[ $# -gt 0 ]]; do
@@ -268,15 +270,25 @@ echo "[launcher] Python exit code: $PY_RC"
 # ---------- Post-processing (this side only) ----------
 if $ENABLE_NSYS && [[ -s "$ROLE_DIR/nsys_report.nsys-rep" ]]; then
     echo "[launcher] Exporting ${ROLE} nsys CSVs ..."
-    "$LOCAL_NSYS" stats -r cuda_gpu_trace --format csv \
+    # `nsys stats` exports a .sqlite beside the .nsys-rep on first
+    # invocation. Subsequent invocations refuse to re-use the .sqlite
+    # with 'File is older than input file, use --force-export=true'
+    # unless we pass that flag. (Without the flag the second/third
+    # stats command silently produces no CSV.)
+    NSYS_STATS_OPTS=(stats --force-export=true --format csv)
+    "$LOCAL_NSYS" "${NSYS_STATS_OPTS[@]}" -r cuda_gpu_trace \
         --output "$ROLE_DIR/nsys_kernels" \
         "$ROLE_DIR/nsys_report.nsys-rep" 2>/dev/null || true
-    "$LOCAL_NSYS" stats -r nvtx_pushpop_trace --format csv \
+    "$LOCAL_NSYS" "${NSYS_STATS_OPTS[@]}" -r nvtx_pushpop_trace \
         --output "$ROLE_DIR/nsys_nvtx_pushpop" \
         "$ROLE_DIR/nsys_report.nsys-rep" 2>/dev/null || true
-    "$LOCAL_NSYS" stats -r gpu_metrics --format csv \
-        --output "$ROLE_DIR/nsys_gpu_metrics" \
-        "$ROLE_DIR/nsys_report.nsys-rep" 2>/dev/null || true
+    if $ENABLE_SM_METRICS; then
+        # gpu_metrics is only meaningful when --gpu-metrics-devices
+        # was active at profile time.
+        "$LOCAL_NSYS" "${NSYS_STATS_OPTS[@]}" -r gpu_metrics \
+            --output "$ROLE_DIR/nsys_gpu_metrics" \
+            "$ROLE_DIR/nsys_report.nsys-rep" 2>/dev/null || true
+    fi
 
     if [[ -s "$ROLE_DIR/iterations.jsonl" ]]; then
         echo "[launcher] Running analyze_profile.py on ${ROLE} ..."

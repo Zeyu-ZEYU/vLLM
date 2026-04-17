@@ -11,9 +11,15 @@ nodes** and collects per-request / per-phase metrics.
   on a user-chosen NIC (any IP-reachable interface works; the fast
   path is whichever one connects the two hosts).
 
-The orchestrator runs on the **prefill** node, SSHes into the decode
-node to launch the decode process, runs prefill locally, then copies
-decode outputs back and produces a single consolidated summary.
+**No SSH between nodes is required.** The launcher is invoked
+SEPARATELY on each node — once with `--role prefill`, once with
+`--role decode` — in two independent terminals. The two sides
+coordinate over a plain TCP ZMQ ctrl channel (prefill binds, decode
+connects) and a NCCL peer-to-peer connection for the actual KV
+transfer. After both sides finish, you copy the decode side's output
+directory next to the prefill side's (scp / rsync / shared NFS — any
+path that ends up with both subdirs under one parent works), and run
+a merge command to produce a single `disagg_summary.json`.
 
 ---
 
@@ -45,176 +51,252 @@ Everything below must hold on **both** nodes (unless otherwise noted).
 - A network path between the two nodes with at least one IP address
   reachable from each side (any NIC; Ethernet / IB-over-IP / etc.).
 
-### Software
+### Software (same on **both** nodes)
 
 - Linux + CUDA toolkit + a working Python environment (venv / conda).
-- This repository cloned at **the same absolute path on both nodes**
-  (the launcher assumes identical paths for simplicity; change it via
-  `--remote-repo` if you must).
-- `pip install -e .` of the vLLM repo, OR an existing vLLM install
+- This repository cloned somewhere (doesn't have to be the same path
+  on both nodes — each invocation stays local).
+- `pip install -e .` of this vLLM repo, OR an existing vLLM install
   whose source matches the one checked out here. In particular, this
   fork contains:
     - `zeyu/` launcher scripts (the entry point),
     - `vllm/v1/engine/iteration_logger.py` (per-iteration JSONL +
       pynvml sampling),
   so you must run the vLLM in *this* repo, not the pypi build.
-- `pip install msgpack pynvml` — both are imported at runtime
-  (`P2pNcclConnector` uses msgpack; the iteration logger uses pynvml).
-- The model weights at the same absolute path on both nodes. Default
-  is `Qwen/Qwen3-VL-8B-Instruct`; pass `--model /your/path` otherwise.
+- `pip install msgpack pynvml pyzmq` — all imported at runtime
+  (`P2pNcclConnector` uses msgpack; the iteration logger uses pynvml;
+  the cross-node ctrl channel uses pyzmq).
+- The model weights available on both nodes. The two sides don't
+  need *identical* paths, but each side has to point at a local copy
+  via `--model`. Default is `Qwen/Qwen3-VL-8B-Instruct`.
 
-### SSH
+### Network
 
-- **Passwordless SSH** from the prefill node to the decode node as
-  whatever user will run the job (configure with `--peer-ssh-user`).
-  Test with: `ssh <decode-user>@<decode-host> echo ok`.
-- On the decode side, the remote shell must source the normal login
-  profile (so `conda` / `mamba` / `pip` are on `$PATH` under a
-  non-interactive SSH). If your setup requires an extra activation
-  step, wrap it in a login shell script and point `--conda-env`
-  (or the `ssh` command in the launcher) at it.
-
-### Optional: Docker
-
-If both nodes run the workload inside a Docker container, set
-`--container <name>`; the launcher will `docker exec -u <user>
-<container> bash -lc "..."` to reach the conda env. If you run
-bare-metal, pass `--container ''` (empty) — the launcher will
-execute the remote command directly via SSH.
+- One NIC on each node with an IPv4 address the other node can reach.
+  The launcher auto-detects the local IP on the `--iface` you pass.
+- Two TCP ports must be open between the nodes (defaults `25500` for
+  ctrl, `25555` and `25655` for KV-NCCL). Set these via
+  `--ctrl-port` / `--kv-port` if your cluster firewall or pod network
+  policy requires specific ones.
+- Cross-node SSH is **not** needed for running the experiment. You
+  only need it once, after the run, to copy the decode side's output
+  directory back to the prefill side (and even that is optional if
+  both nodes share a common filesystem).
 
 ### Optional: Nsight Systems (for kernel-level metrics)
 
-Not required for basic metrics. See the
-[nsys profiling section](#optional-nsys-profiling) below for install
+Not required for basic metrics. See
+[Optional: nsys profiling](#optional-nsys-profiling) for install
 notes.
 
 ---
 
 ## Quick start
 
-1. **Pick the network interface** the two nodes should use:
+You will open **two terminals** — one on each node — and run the
+same script with a different `--role`. Then you'll run a third
+(short) command to merge the outputs.
 
-   ```bash
-   ip -4 -o addr                   # list IPv4 interfaces
-   ping <other-node-ip> -I eth0    # confirm the NIC is routable
-   ```
+### Step 0 — on BOTH nodes, find the NIC + a free GPU
 
-   Use the management NIC (the one you SSH over) unless you
-   specifically have a faster RDMA-over-TCP path you want to test.
+```bash
+# Find the NIC you'll use for NCCL/ZMQ. Pick any IPv4 interface
+# that can reach the other node.
+ip -4 -o addr
 
-2. **Pick two free GPUs** (one per node):
+# Confirm reachability (replace with the OTHER node's IP):
+ping -c 2 -I eth0 <other-node-ip>
 
-   ```bash
-   nvidia-smi --query-gpu=index,memory.free,utilization.gpu \
-              --format=csv,noheader
-   ```
+# Pick a free GPU:
+nvidia-smi --query-gpu=index,memory.free --format=csv,noheader
+```
 
-3. **Verify single-node sanity** first:
+### Step 1 — sanity-check single-node first
 
-   ```bash
-   python zeyu/run_qwen35_vision_offline.py \
-       --model /path/to/Qwen3-VL-8B-Instruct \
-       --num-prompts 4 --max-tokens 64
-   ```
+Always verify the model + environment work on one GPU before
+attempting disagg (saves hours of debugging):
 
-   If this run fails, fix it before attempting cross-node.
+```bash
+python zeyu/run_qwen35_vision_offline.py \
+    --model /path/to/Qwen3-VL-8B-Instruct \
+    --num-prompts 4 --max-tokens 64
+```
 
-4. **Run the cross-node disagg** from the prefill node:
+### Step 2 — on the PREFILL node, terminal A
 
-   ```bash
-   bash zeyu/disagg_run.sh \
-       --peer-host  decode.example.org \
-       --peer-ssh-user alice \
-       --model      /path/to/Qwen3-VL-8B-Instruct \
-       --iface      eth0 \
-       --prefill-gpu 0 \
-       --decode-gpu  0 \
-       --num-prompts 20 \
-       --max-tokens  64
-   ```
+```bash
+bash zeyu/disagg_run.sh --role prefill \
+    --iface eth0 \
+    --gpu 0 \
+    --num-prompts 20 --max-tokens 64 \
+    --model /path/to/Qwen3-VL-8B-Instruct
+```
 
-5. When it finishes, the merged summary is written to:
+The prefill side loads the model (~30 s), prints its own IP address,
+binds the ZMQ ctrl socket, and waits for decode. Note down two
+things from its banner:
 
-   ```
-   zeyu/outputs/disagg_<UTC-TIMESTAMP>/disagg_summary.json
-   ```
+- **Prefill IP** (line labelled `Iface/IP   : eth0 = A.B.C.D`)
+- **Output dir** (line labelled `Output dir  : ...`)
 
-   A human-readable per-request table is also printed to stdout.
+### Step 3 — on the DECODE node, terminal B
+
+Use the prefill IP from step 2 as `--peer-ip`:
+
+```bash
+bash zeyu/disagg_run.sh --role decode \
+    --peer-ip A.B.C.D \
+    --iface eth0 \
+    --gpu 0 \
+    --num-prompts 20 --max-tokens 64 \
+    --model /path/to/Qwen3-VL-8B-Instruct
+```
+
+**IMPORTANT**: the following flags must be **identical on both
+sides**, otherwise the handshake / KV exchange won't match:
+`--num-prompts`, `--max-tokens`, `--model`, `--max-model-len`,
+`--kv-port`, `--ctrl-port`, and `--input` (if used).
+
+Each side can differ on: `--iface` (each uses its own NIC name),
+`--gpu` (each picks its own local GPU), `--output-dir` (per-side
+output paths — see step 4).
+
+### Step 4 — merge the outputs
+
+When both terminals finish, each side has written to its own local
+output dir:
+
+```
+PREFILL node: <prefill-OUT>/prefill/
+DECODE  node: <decode-OUT>/decode/
+```
+
+Copy the decode side's `decode/` directory next to the prefill
+side's `prefill/` so they become siblings under one parent. Pick
+whichever method applies to your cluster:
+
+```bash
+# Option A — you have SSH / scp working between the nodes:
+scp -r <decode-user>@<decode-host>:<decode-OUT>/decode \
+       <prefill-OUT>/
+
+# Option B — you have a shared filesystem (NFS / Lustre / GPFS):
+# Pass the SAME --output-dir /mnt/shared/disagg_run1 on BOTH sides
+# in steps 2 and 3. Nothing to copy — skip straight to the merge.
+
+# Option C — use an intermediate host you can reach from both nodes
+# (e.g. the cluster's login node):
+#   login> scp <decode-host>:<decode-OUT>/decode <prefill-host>:<prefill-OUT>/
+```
+
+Then, on the node that now has both `prefill/` and `decode/`
+subdirs:
+
+```bash
+python zeyu/merge_disagg.py <prefill-OUT>
+```
+
+The merged summary is written to `<prefill-OUT>/disagg_summary.json`
+and a human-readable per-request table is printed to stdout.
 
 ---
 
 ## How it works
 
+Two independent processes, one per node, coordinate over two channels:
+
 ```
-Prefill node                                Decode node
-──────────────                              ──────────────
- 1. Launcher binds ZMQ ctrl                  1. Launcher SSHes in and
-    socket on ctrl-port.                        starts the decode
-                                                process.
- 2. Prefill process loads the LLM            2. Decode process loads the
-    with kv_role=kv_producer on                 LLM with kv_role=
-    <iface IP>:kv_port.                         kv_consumer on
- 3. Prefill sends its ZMQ address               <iface IP>:(kv_port+100).
-    over ctrl.                               3. Decode sends its ZMQ
- 4. Prefill mints request_ids                   address over ctrl.
-    that encode BOTH endpoints'              4. Decode receives request
-    addresses in the format                     ids; both sides use the
-    P2pNcclConnector requires                   SAME ids so KV tensor
-    (`reqN___prefill_addr_IP:PORT___            keys match on producer
-    decode_addr_IP:PORT_UID`).                  and consumer.
- 5. Prefill calls                            5. Decode waits for
-    generate(max_tokens=1).                     "prefill_done" signal.
-    Encoder + prefill + first                6. Decode calls
-    token are computed; KV is                   generate(max_tokens=N).
-    pushed to decode via NCCL.                  The consumer sees
- 6. Prefill signals "prefill_done"              that KV already arrived
-    and waits for the decode to                 and skips prefill
-    signal "exit" before tearing                compute — just decodes.
-    down NCCL.                               7. Decode writes
- 7. Launcher tar-copies decode's                latency.json, signals
-    output dir back, runs                       "exit", tears down NCCL.
-    analyze_profile.py (if nsys
-    was enabled) and
-    merge_disagg.py.
+ Prefill node (terminal A)                   Decode node (terminal B)
+ ─────────────────────────                   ────────────────────────
+ 1. You launch:                              1. You launch:
+       disagg_run.sh --role prefill             disagg_run.sh --role decode
+       (no --peer-ip needed)                    --peer-ip <prefill-IP>
+ 2. Prefill loads Qwen3-VL with              2. Decode loads Qwen3-VL with
+    kv_role=kv_producer on                      kv_role=kv_consumer on
+    <iface IP>:kv_port.                         <iface IP>:(kv_port+100).
+ 3. Prefill binds a ZMQ PAIR                 3. Decode connects its
+    ctrl socket on 0.0.0.0:ctrl-                ZMQ PAIR ctrl socket to
+    port and waits for READY.                   <peer-IP>:ctrl-port and
+                                                 sends a READY with its
+ 4. Prefill receives READY, learns              own IP + kv_port.
+    decode's IP + kv_port, replies           4. Decode receives the ACK
+    with an ACK carrying its own                 with prefill's IP +
+    IP + kv_port.                                kv_port.
+ 5. Prefill mints request_ids of the form
+    `reqN___prefill_addr_PIP:PPORT___decode_addr_DIP:DPORT_UID`
+    (the format P2pNcclConnector's regex requires) and sends them
+    to decode over ctrl. Both sides now use the SAME request IDs
+    so the KV tensor keys match.
+ 6. Prefill runs                             6. Decode waits for
+    generate(max_tokens=1). The                "prefill_done" on ctrl.
+    vision encoder + prefill +              7. Decode runs
+    first token are computed.                  generate(max_tokens=N).
+    KV cache is pushed to decode               The consumer sees that KV
+    over NCCL.                                 has already arrived and
+                                                skips prefill compute —
+ 7. Prefill signals "prefill_done"             just decodes.
+    over ctrl and waits for                  8. Decode writes latency.json
+    "exit" before tearing down                  and iterations.jsonl
+    NCCL.                                       to <OUT>/decode/, signals
+ 8. Prefill writes latency.json                 "exit" over ctrl, tears
+    and iterations.jsonl to                     down NCCL, exits.
+    <OUT>/prefill/. Exits.
 ```
 
-All GPU-to-GPU KV traffic goes over NCCL. The control channel is
-plain TCP ZMQ PAIR sockets (bind on prefill, connect from decode)
-and is only used for tiny sync messages (addresses, "done", "exit").
+**Two inter-node channels**, both over ordinary TCP:
+
+| Channel | Use | Traffic volume |
+|---|---|---|
+| ZMQ PAIR (ctrl-port) | Handshake + tiny "done"/"exit" messages | < 1 KB total |
+| NCCL (kv-port / kv-port+100) | GPU-to-GPU KV cache transfer | MBs–GBs per request |
+
+Nothing else crosses the node boundary during the run. After the
+run, the user (not the scripts) copies decode's output directory
+back to the prefill side and runs `merge_disagg.py` locally.
 
 ---
 
 ## All command-line flags
 
-`bash zeyu/disagg_run.sh --help` prints the header comment. Supported
-flags:
+`bash zeyu/disagg_run.sh --help` prints the full header comment from
+the script. Supported flags:
+
+### Required
+
+| Flag | Applies to | Description |
+|---|---|---|
+| `--role {prefill\|decode}` | both sides | Which half of the pipeline this invocation runs. Mandatory. |
+| `--peer-ip IP` | **decode only** | IP of the prefill node (the one decode connects to over ZMQ). **Not** required on `--role prefill` (prefill just binds and waits). |
+
+### Must be identical on both sides
+
+Mismatches cause the handshake to fail or the KV exchange to deadlock.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--peer-host HOST` | *(required)* | Hostname/IP of the decode node (whatever you SSH to) |
-| `--peer-ssh-user USER` | `$USER` of current shell | SSH user on the decode side |
-| `--model PATH` | `/home/$USER/models/Qwen3-VL-8B-Instruct` (example) | Model path, must exist on **both** nodes at the same location |
-| `--num-prompts N` | `4` | Number of built-in example prompts to cycle through |
-| `--max-tokens N` | `64` | Max tokens to generate per request (decode length) |
-| `--max-model-len N` | `4096` | Context length |
-| `--gpu-memory-utilization F` | `0.85` | Fraction of GPU memory for KV cache + model |
-| `--iface IFACE` | `eth0` | Name of the NIC to bind NCCL/GLOO to on both nodes |
-| `--kv-port N` | `25555` | KV ZMQ port on prefill side. Decode uses `N+100`. Must be open on both nodes' firewall / pod policy |
-| `--ctrl-port N` | `25500` | Control-channel ZMQ port (prefill binds, decode connects) |
-| `--prefill-gpu IDX` | `0` | Physical GPU index on the prefill node (as seen by `nvidia-smi`) |
-| `--decode-gpu IDX` | `0` | Physical GPU index on the decode node |
-| `--input PATH` | *(none)* | Path to a JSONL dataset file (one request per line, format described in [Providing your own dataset](#providing-your-own-dataset)). Overrides `--num-prompts` |
-| `--delay N` | *(none)* | Global per-request delay in ms (overrides the `delay` field in JSONL). Mostly for simulating request arrival patterns |
-| `--remote-repo PATH` | same as local | vLLM repo path on the decode node |
-| `--container NAME` | `fe_rnic` | Docker container on decode node. Set to empty string to skip `docker exec` and run directly via SSH |
-| `--conda-env NAME` | `mono_kernel` | Conda env to `conda activate` on decode node |
-| `--output-root DIR` | `zeyu/outputs/` | Where to write the `disagg_<timestamp>/` directory |
-| `--nsys` / `--no-nsys` | `--no-nsys` | Enable Nsight Systems profiling on both sides (see section below) |
-| `--sm-metrics` / `--no-sm-metrics` | `--no-sm-metrics` | Sample `SM Active %` / active-SM count via `nsys --gpu-metrics-devices` (requires host-level GPU counter privilege) |
-| `--nsys-freq N` | `10000` | GPU-metrics sampling rate in Hz when `--sm-metrics` is on |
+| `--model PATH` | `/home/zeyu/models/Qwen3-VL-8B-Instruct` | Model path. The two sides load their own local copy; the PATHS don't need to match, but the MODEL weights must. |
+| `--num-prompts N` | `4` | Number of built-in prompts to cycle through (ignored if `--input`). |
+| `--max-tokens N` | `64` | Max tokens to generate per request. |
+| `--max-model-len N` | `4096` | Context length. |
+| `--input PATH` | *(none)* | JSONL dataset, see [Providing your own dataset](#providing-your-own-dataset). |
+| `--kv-port N` | `25555` | Prefill side binds `N`; decode side binds `N+100` and connects to prefill's `N`. Must be open in both directions. |
+| `--ctrl-port N` | `25500` | Control-channel ZMQ port (prefill binds, decode connects). Must be open decode→prefill. |
 
-Change the defaults in `zeyu/disagg_run.sh` if your cluster has a
-different convention (see the `---- Defaults ----` block near the top).
+### Per-side (can differ between the two terminals)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--iface IFACE` | `eth0` | NIC to bind NCCL/ZMQ to. Each side uses its own local NIC name; the IPs will differ. |
+| `--gpu IDX` | `0` | Local GPU index (as seen in `nvidia-smi` on *this* node). |
+| `--gpu-memory-utilization F` | `0.85` | Fraction of GPU memory for KV cache + model. |
+| `--output-dir DIR` | `zeyu/outputs/disagg_<UTC-timestamp>` | Base output directory. The role-specific subdir (`prefill/` or `decode/`) is created under it. |
+| `--nsys` | off | Wrap this side's python in `nsys profile --trace=cuda,nvtx`. See [Optional: nsys profiling](#optional-nsys-profiling). Each side is independent — you can turn nsys on for one side only. |
+| `--sm-metrics` | off | Additionally enable `--gpu-metrics-devices=all` (requires GPU counter privilege). |
+| `--nsys-freq N` | `10000` | GPU-metrics sampling rate in Hz when `--sm-metrics` is on. |
+| `--delay N` | *(none)* | Global per-request inter-arrival delay in ms. |
+
+Change the defaults in the `---- Defaults ----` block at the top of
+`zeyu/disagg_run.sh` if your cluster has a stable convention.
 
 ---
 
@@ -247,15 +329,22 @@ is a JSON object with these fields:
 ```
 
 Notes:
-- **Image paths must exist on both nodes at the same absolute path**
-  when running disagg (the prefill node reads them to compute the
-  vision encoder; the decode node re-reads them through its own input
-  processor for tokenization). Either sync the dataset directory with
-  `rsync` / a shared filesystem, or use a common NFS mount.
-- **Multi-image requests** are supported (pass a list). Each image is
-  emitted as one `<image>` placeholder in the prompt.
-- **Text-only requests** (no `images`) are allowed and go through the
-  text-only fast path — no vision encoder, no multimodal cache.
+- **Each image path must be readable by BOTH the prefill and the
+  decode process** (each side reads the dataset independently — the
+  prefill side to compute the vision encoder, the decode side to
+  tokenize the image placeholders). The paths don't have to be
+  literally identical between the two nodes as long as each side
+  gets the same bytes at the path you pass it; common options are a
+  shared NFS / GPFS mount (both sides see the same path) or a
+  per-node copy of the dataset directory (each side sees the same
+  path locally).
+- **The same `--input PATH` must be passed to both sides.** If the
+  JSONL lists are different, the two sides will run different
+  workloads and the KV transfer will deadlock or produce garbage.
+- **Multi-image requests** are supported (pass a list). Each image
+  is emitted as one `<image>` placeholder in the prompt.
+- **Text-only requests** (no `images`) are allowed and go through
+  the text-only fast path — no vision encoder, no multimodal cache.
 - The chat template is fixed to Qwen3's `<|im_start|>user ...
   <|im_end|>` format. If you want a different template, edit
   `build_prompt()` in `run_qwen35_vision_offline.py`.
@@ -302,28 +391,55 @@ continuous batching.
 
 ## Output layout
 
-Every run creates a new timestamped directory:
+During the run, **each side writes only its own subdir on its own
+node**:
 
 ```
-zeyu/outputs/disagg_<YYYYMMDD_HHMMSS_UTC>/
+# On the PREFILL node:
+<prefill-OUT>/
 ├── prefill/
-│   ├── iterations.jsonl      # one line per scheduler iteration (prefill side)
+│   ├── iterations.jsonl      # one line per scheduler iteration (prefill)
 │   ├── requests.jsonl        # request_id → iteration indices mapping
 │   ├── latency.json          # per-request: VE time, prefill time, wall ts
 │   └── nsys_*.csv / *.nsys-rep      (only if --nsys)
-├── decode/
-│   ├── iterations.jsonl      # copied back from the decode node
-│   ├── requests.jsonl
-│   ├── latency.json          # per-request: decode time, TBT, KV transfer
-│   └── nsys_*.csv / *.nsys-rep      (only if --nsys)
-├── disagg_summary.json       # <-- the main output: per-request + aggregates
 ├── prefill.log               # stdout/stderr from prefill
-├── decode.log                # stdout/stderr from decode (tail'd back)
-├── analyze_prefill.log       # (only if --nsys) output of analyze_profile.py
+└── analyze_prefill.log       # (only if --nsys) output of analyze_profile.py
+
+# On the DECODE node:
+<decode-OUT>/
+├── decode/
+│   ├── iterations.jsonl      # one line per scheduler iteration (decode)
+│   ├── requests.jsonl
+│   ├── latency.json          # per-request: decode time, TBT
+│   └── nsys_*.csv / *.nsys-rep      (only if --nsys)
+├── decode.log                # stdout/stderr from decode
 └── analyze_decode.log        # (only if --nsys) output of analyze_profile.py
 ```
 
-A human-readable table is also printed to stdout at the end of the run.
+After you copy the decode side's `decode/` directory into the prefill
+side's `<prefill-OUT>/`, it looks like:
+
+```
+<prefill-OUT>/
+├── prefill/      (was already here)
+├── decode/       (copied from decode node — NEW)
+├── prefill.log
+├── analyze_prefill.log
+└── (now run: python zeyu/merge_disagg.py <prefill-OUT>)
+```
+
+And `merge_disagg.py` adds:
+
+```
+<prefill-OUT>/
+├── disagg_summary.json   ← merged per-request + aggregates (the main output)
+├── prefill/consolidated_iterations.jsonl    (if nsys was on for prefill)
+├── prefill/consolidated_requests.jsonl
+├── decode/consolidated_iterations.jsonl     (if nsys was on for decode)
+└── decode/consolidated_requests.jsonl
+```
+
+A human-readable table is also printed to stdout by `merge_disagg.py`.
 
 ---
 
@@ -642,17 +758,24 @@ text_forward_kernel_time_ns` (+ `sm_*` when `--sm-metrics`).
 
 ## Optional: nsys profiling
 
-Pass `--nsys` to enable. The launcher wraps both processes in
-`nsys profile --trace=cuda,nvtx --cuda-graph-trace=node
---trace-fork-before-exec=true`. Outputs are in each role's dir:
+Pass `--nsys` to this side's invocation. The launcher wraps the
+python process in `nsys profile --trace=cuda,nvtx
+--cuda-graph-trace=node --trace-fork-before-exec=true`, then
+exports the kernel + NVTX CSVs, then runs `analyze_profile.py` to
+produce a `consolidated_iterations.jsonl` — all locally. Outputs
+land under the role subdir:
 
 ```
-<out>/{prefill,decode}/
+<OUT>/{prefill|decode}/
 ├── nsys_report.nsys-rep
 ├── nsys_report.sqlite
 ├── nsys_kernels_cuda_gpu_trace.csv           # every kernel launch
-└── nsys_nvtx_pushpop_nvtx_pushpop_trace.csv  # NVTX ranges (iter boundaries)
+├── nsys_nvtx_pushpop_nvtx_pushpop_trace.csv  # NVTX ranges (iter boundaries)
+└── consolidated_iterations.jsonl             # iteration logs enriched with nsys data
 ```
+
+You can turn `--nsys` on for one side only. `merge_disagg.py` uses
+whatever data is available on each side.
 
 ### Installing a working nsys
 
@@ -738,52 +861,69 @@ LLaVA-class models work.
 
 **`Free memory on device cuda:0 ... less than desired`**
 Another process is using the GPU, or `--gpu-memory-utilization` is
-too high. Check `nvidia-smi`, pick a different `--prefill-gpu` /
-`--decode-gpu`, or lower `--gpu-memory-utilization 0.7`.
+too high. Check `nvidia-smi`, pick a different `--gpu` index, or
+lower `--gpu-memory-utilization 0.7`.
 
-**`ModuleNotFoundError: No module named 'msgpack'` (or `pynvml`)**
+**`ModuleNotFoundError: No module named 'msgpack'` (or `pynvml` / `zmq`)**
 ```bash
-pip install msgpack pynvml
+pip install msgpack pynvml pyzmq
 ```
-In whichever env you use on *both* nodes.
+In whichever env you use on **both** nodes.
 
 **`Address already in use`**
 A previous run left a socket in `TIME_WAIT`. Pick a different
-`--ctrl-port` / `--kv-port` (any high free port) or wait ~60 s.
+`--ctrl-port` / `--kv-port` (any high free port) or wait ~60 s. If
+BOTH previous sides were killed mid-run, also check for leftover
+python processes with `pgrep -fa run_qwen35_vision_offline`.
 
-**Decode hangs at `Waiting for prefill to complete ...`**
-The ZMQ ctrl channel didn't connect. Check:
-- Is `--peer-host` reachable from the prefill side? (`ping`, `nc -zv`)
-- Is `--ctrl-port` open on both sides' firewall / k8s NetworkPolicy?
-- Did the prefill process actually bind? Look at `prefill.log` for
-  `[Prefill] Ctrl bound on 0.0.0.0:<port>`.
+**Decode side hangs at `Waiting for prefill to complete ...`**
+The ZMQ ctrl channel connected but no `prefill_done` signal ever
+arrived. Almost always a prefill-side crash. Look at the prefill
+terminal for the real error; common causes are OOM on the prefill
+GPU or a model-load failure.
 
-**NCCL hangs at engine init / `ncclCommInitRank`**
-The NCCL transport can't connect. Verify:
+**Decode errors with `Connection refused` on `ctrl-port`**
+Prefill hasn't started yet, or `--peer-ip` on the decode side is
+wrong. Confirm by:
 ```bash
-# Both nodes, inside the conda env:
-echo $NCCL_SOCKET_IFNAME  # should be what you passed as --iface
-ping <peer-iface-ip>      # must succeed over that NIC
+nc -zv <prefill-ip> <ctrl-port>     # from the decode node
+```
+Prefill must be running first (or at least far enough along that
+it's past the "Ctrl bound on 0.0.0.0:..." line). You can start
+decode AFTER prefill is waiting — the scripts don't require tight
+synchronization.
+
+**NCCL hangs at `ncclCommInitRank`**
+The NCCL TCP transport can't establish a peer-to-peer connection.
+Verify from each node:
+```bash
+echo $NCCL_SOCKET_IFNAME        # must match what you passed as --iface
+ping <peer-iface-ip>
+nc -zv <peer-iface-ip> <kv-port>  # from decode, to prefill's kv_port
+nc -zv <peer-iface-ip> <kv-port+100>  # from prefill, to decode's
 ```
 The launcher exports `NCCL_SOCKET_IFNAME=$IFACE` and
 `NCCL_IB_DISABLE=1` by default. If you want to use InfiniBand /
-RDMA, pass `--iface <ib-name>` AND unset the IB-disable in
-`disagg_run.sh` manually.
+RDMA, pass `--iface <ib-name>` AND remove the `NCCL_IB_DISABLE=1`
+line from `disagg_run.sh` manually.
 
 **`Request id ... does not contain hostname and port`**
 P2pNcclConnector's regex couldn't parse the request ID. Make sure
-both nodes are on the **same** commit (`git log -1` should match).
-The launcher sets `VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1`
-automatically; if something else overrides it, the IDs will get
-mangled.
+both nodes are on the **same commit** of this repo (`git log -1`
+should match). The script sets
+`VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1` automatically; if your
+environment overrides it, the IDs will get mangled.
 
 **Garbage / mismatched output from decode**
-The KV producer-consumer handshake is timing out silently and the
-consumer falls back to its own prefill. This shouldn't normally
-happen; see
-[Notes on correctness](#notes-on-correctness). Usually it's a
-symptom of the two nodes running different model weights or a
-network flake during NCCL setup.
+The KV producer-consumer handshake silently failed and the consumer
+ran its own prefill fallback. Usually a symptom of the two nodes
+having different model weights, or a network flake during NCCL
+setup. Re-run and watch for `ncclCommInitRank Success` on both
+sides — if you don't see it, the KV transfer never happened.
+
+**`merge_disagg.py` complains that `decode/latency.json` is missing**
+You ran the merge on the prefill side before copying decode's
+output over. See step 4 in [Quick start](#quick-start).
 
 **`Unable to retrieve the importer version` at end of nsys run**
 The bundled Nsight-Compute nsys cannot finalize `.qdstrm` files.
@@ -792,14 +932,8 @@ Install standalone Nsight Systems — see
 
 **`Illegal --gpu-metrics-devices usage: Insufficient privilege`**
 GPU performance counters are not accessible to non-admin users.
-See [Optional: per-SM metrics](#optional-per-sm-metrics) for how the
-cluster admin enables this; otherwise drop `--sm-metrics` and rely
-on the pynvml path.
-
-**`tar: ...: Cannot open: No such file or directory` when copying decode back**
-The remote decode process never wrote its output dir. Inspect
-`decode.log` for the real error — typical causes are module import
-failures, model-path mismatch between the two nodes, or NCCL timeout.
+See [Optional: per-SM metrics](#optional-per-sm-metrics); otherwise
+drop `--sm-metrics` and rely on the pynvml path.
 
 ---
 
