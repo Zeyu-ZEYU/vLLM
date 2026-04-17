@@ -163,11 +163,23 @@ Two independent collection paths feed into `disagg_summary.json`:
    to produce `consolidated_iterations.jsonl` with GPU util, kernel
    time, SM metrics. merge_disagg.py then picks these up.
 
-**Note**: the Nsight-Compute-bundled nsys in some environments fails
-to finalize `.qdstrm` files (cannot retrieve importer version).
-Standalone Nsight Systems ≥ 2024.x is recommended if you want
-nsys-derived kernel / SM metrics. Otherwise pynvml-based GPU-util
-sampling (path 1) is the primary source and is always available.
+**Note — Nsight Systems install**: some PyTorch/CUDA installs ship
+with a Nsight-Compute-bundled `nsys` that **cannot finalize `.qdstrm`
+files** ("Unable to retrieve the importer version" error). Install a
+standalone Nsight Systems on **both nodes**:
+
+```bash
+# Inside the container (needs sudo + apt + Internet):
+distro=$(. /etc/os-release; echo ${ID}${VERSION_ID//./})   # ubuntu2204
+sudo dpkg -i https://developer.download.nvidia.com/compute/cuda/repos/$distro/x86_64/cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+sudo apt-get install -y nsight-systems-2025.6.3   # ≥ 2024.x works
+which nsys    # → /usr/local/bin/nsys (new) or /usr/local/cuda/bin/nsys
+```
+
+The launcher auto-detects `nsys` at run time. If absent or broken,
+it silently falls back to pynvml-only (path 1), which is always
+available and gives a reasonable GPU-util approximation.
 
 All metrics are in `disagg_summary.json`. Per-iteration raw data is
 additionally in `prefill/iterations.jsonl`,
