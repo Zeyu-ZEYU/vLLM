@@ -136,9 +136,11 @@ zeyu/outputs/disagg_<YYYYMMDD_HHMMSS>/
 
 ## Metrics available
 
-All metrics listed below are in `disagg_summary.json`. Per-iteration
-metrics are additionally in `prefill/iterations.jsonl` and
-`decode/iterations.jsonl`.
+All metrics are in `disagg_summary.json`. Per-iteration raw data is
+additionally in `prefill/iterations.jsonl`,
+`decode/iterations.jsonl`, and `<role>/consolidated_iterations.jsonl`
+(the latter two include nsys-derived GPU/SM metrics when profiling
+is on — it is on by default, use `--no-nsys` to disable).
 
 ### Per request (in `disagg_summary.json["requests"]`)
 
@@ -148,16 +150,45 @@ metrics are additionally in `prefill/iterations.jsonl` and
 | `prefill_time_ms` | `first_token_ts − scheduled_ts` during prefill | Node 0 |
 | `kv_transfer_time_ms` | Wall-clock delta between prefill `time.time()` at wall_end and decode `time.time()` at signal arrival (approximate, depends on NTP sync) | Launcher |
 | `decode_time_ms` | `last_token_ts − first_token_ts` during decode | Node 1 |
-| `num_generation_tokens` | Number of output tokens produced | Node 1 |
+| `num_generation_tokens` | Number of output tokens produced (= # decode iterations) | Node 1 |
 | `tpot_ms` | Average time per output token = decode_time / (N − 1) | Node 1 |
+| `per_token_tbt_ms` | Array of inter-token latencies (ms), one per decode step | From decode iterations.jsonl |
+| `tbt_stats` | `{count, mean_ms, min_ms, p50_ms, p95_ms, p99_ms, max_ms}` of TBT for this request | Computed |
 | `jct_ms` | Job completion time ≈ VE + prefill + KV transfer + decode | Computed |
 
-### Per iteration (in `<role>/iterations.jsonl`)
+### Per phase, per request (sub-objects `vision_encoder`, `prefill`, `decode`)
 
-Already documented in `zeyu/README.md`. Includes GPU utilization
-percentage, active kernel gap, per-SM throughput (when ncu enabled),
-GPU memory allocated, per-request phase classification, and
-per-step latency/RPS.
+Each sub-object contains averages/sums across the iterations in that
+phase of the request.
+
+| Field | Description |
+|---|---|
+| `num_iterations` | Number of iterations in this phase for this request |
+| `avg_gpu_util_pct` | Mean GPU utilization (kernel-busy %) across the phase's iterations |
+| `avg_kernel_launch_gap_pct` | Mean kernel-launch gap % (= 100 − gpu_util) |
+| `avg_gpu_mem_allocated_MiB` | Mean PyTorch-allocated GPU memory during the phase |
+| `avg_sm_active_pct_mean` | Mean "SM Active %" (fraction of SMs busy) sampled by nsys GPU metrics |
+| `avg_sm_occupancy_pct_mean` | Mean "SM Warp Occupancy %" sampled by nsys |
+| `avg_num_active_sms_mean` | Mean count of active SMs sampled by nsys |
+| `sum_total_kernel_time_ns` | Total GPU busy time across all phase iterations (absolute) |
+| `sum_kernel_launch_gap_ns` | Total GPU idle time (absolute) |
+| `avg_vision_encoder_gpu_util_pct` / `avg_text_forward_gpu_util_pct` | Sub-range GPU util when the iteration ran the vision encoder or text forward kernel |
+| `sum_vision_encoder_kernel_time_ns` / `sum_text_forward_kernel_time_ns` | Same, absolute |
+
+The "SM" fields come from `nsys profile --gpu-metrics-devices`.
+This is aggregate per-GPU sampling — it tells you what fraction of
+SMs were active and how many, but NOT the utilization of each
+individual SM. For per-SM breakdown, you need to run `ncu`
+separately (see section below).
+
+### Per iteration (in `<role>/consolidated_iterations.jsonl`)
+
+Already documented in `zeyu/README.md`. When nsys is on, each record
+additionally carries `gpu_util_pct`, `kernel_launch_gap_pct`,
+`kernel_launch_gap_ns`, `total_kernel_time_ns`,
+`vision_encoder_gpu_util_pct`/`text_forward_gpu_util_pct`,
+`sm_active_pct_mean`, `sm_occupancy_pct_mean`,
+`num_active_sms_mean`.
 
 ### Summary (in `disagg_summary.json["summary"]`)
 
@@ -166,7 +197,8 @@ per-step latency/RPS.
 | `avg_vision_encoder_time_ms` | Mean across requests that had a VE call (cache-hit requests excluded) |
 | `avg_prefill_time_ms` | Mean prefill time |
 | `avg_decode_time_ms` | Mean decode time |
-| `avg_tpot_ms` | Mean TPOT |
+| `avg_tpot_ms` | Mean TPOT (average inter-token latency) |
+| `tbt_stats` | Aggregate `{count, mean_ms, min_ms, p50_ms, p95_ms, p99_ms, max_ms}` across all TBT samples from all requests |
 | `avg_kv_transfer_time_ms` | Mean KV coordination transfer time |
 | `avg_jct_ms` | Mean JCT |
 | `total_decode_tokens` | Sum of all generated tokens |
@@ -174,16 +206,48 @@ per-step latency/RPS.
 | `decode_wall_time_s` | Node 1's `llm.generate()` wall clock |
 | `rps_end_to_end` | N / (prefill_wall + decode_wall) |
 | `rps_decode_only` | N / decode_wall |
+| `vision_encoder` / `prefill` / `decode` | Per-phase aggregated iteration metrics (means over all requests' phase aggregates) |
 
-## Using ncu for per-SM metrics (optional)
+## nsys profiling (on by default)
 
-`disagg_run.sh` does NOT invoke `ncu` by default. To enable per-SM
-metrics, run `zeyu/profile_run.sh` with the same model on a SINGLE
-node first to collect ncu data; the measurements generalize to the
-per-role GPU utilization since the kernels invoked per phase are the
-same as in single-GPU mode. For cross-node ncu, you'd need to run
-`ncu` on each node's inference command — that is out of scope for
-this launcher.
+The launcher profiles **both** prefill and decode with `nsys profile
+--trace=cuda,nvtx --gpu-metrics-devices=cuda-visible`. Outputs:
+
+```
+<out_dir>/prefill/
+├── nsys_report.nsys-rep
+├── nsys_kernels_cuda_gpu_trace.csv
+├── nsys_nvtx_pushpop_nvtx_pushpop_trace.csv
+├── nsys_gpu_metrics_gpu_metrics.csv          # aggregate SM metrics
+└── consolidated_iterations.jsonl             # enriched by analyze_profile.py
+```
+
+Same structure under `<out_dir>/decode/`. `merge_disagg.py` reads
+these at the end of the run and produces per-request per-phase
+aggregates in `disagg_summary.json`.
+
+Flags:
+- `--no-nsys` disables profiling (faster, but you lose GPU util /
+  SM metrics / kernel overhead numbers).
+- `--nsys-freq N` sets GPU-metrics sampling rate in Hz. Default
+  10000 (= 100 µs between samples). Lower if you see GPU slowdown;
+  higher for finer-grained SM tracking.
+
+## Using ncu for per-SM breakdown (optional, very slow)
+
+`nsys --gpu-metrics-devices` gives aggregate SM activity but not a
+per-SM utilization breakdown. For true per-SM numbers (each SM's
+utilization separately) you need `ncu`, which replays kernels and
+runs 10–100× slower. To collect it, run `zeyu/profile_run.sh` on a
+single node with the same model — the kernel set is the same as in
+disagg mode, so the per-kernel SM numbers transfer over.
+
+```bash
+bash zeyu/profile_run.sh --model /home/zeyu/models/Qwen3-VL-8B-Instruct
+```
+
+(requires NVIDIA GPU performance counters enabled on the host; see
+`docs/NCU_PERMISSIONS.md` in your cluster.)
 
 ## Troubleshooting
 

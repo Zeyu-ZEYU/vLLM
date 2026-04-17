@@ -8,10 +8,13 @@
 # node (tar'd from decode node at the end) and produces a merged
 # summary JSON.
 #
-# By default, nsys profiling is ON with GPU metrics sampling enabled on
-# both sides. This collects: per-iteration GPU utilization, kernel-launch
-# gap, per-phase (VE/prefill/decode) GPU/kernel/memory stats, aggregate
-# SM active %, and active-SM count. Use --no-nsys to disable.
+# By default, nsys profiling is ON on both sides. This collects:
+# per-iteration GPU utilization, kernel-launch gap, per-phase (VE /
+# prefill / decode) GPU / kernel / memory stats. Use --no-nsys to
+# disable. Pass --sm-metrics to also collect aggregate "SM active %"
+# and "num active SMs" via nsys --gpu-metrics-devices (requires
+# unrestricted GPU performance counters on the host; see
+# https://developer.nvidia.com/ERR_NVGPUCTRPERM ).
 #
 # Usage (run on the prefill node, Node 0):
 #
@@ -47,7 +50,8 @@ CONTAINER="fe_rnic"
 CONDA_ENV="mono_kernel"
 OUTPUT_ROOT=""
 ENABLE_NSYS=true
-NSYS_GPU_METRICS_FREQ=10000   # 10 kHz = 100 us between samples
+ENABLE_SM_METRICS=false        # Requires GPU perf-counter privilege
+NSYS_GPU_METRICS_FREQ=10000    # 10 kHz = 100 us between samples
 # Candidate paths for nsys (checked in order, first found wins).
 NSYS_PATH_CANDIDATES=(
     "nsys"
@@ -78,6 +82,8 @@ while [[ $# -gt 0 ]]; do
         --output-root) OUTPUT_ROOT="$2"; shift 2;;
         --nsys) ENABLE_NSYS=true; shift 1;;
         --no-nsys) ENABLE_NSYS=false; shift 1;;
+        --sm-metrics) ENABLE_SM_METRICS=true; shift 1;;
+        --no-sm-metrics) ENABLE_SM_METRICS=false; shift 1;;
         --nsys-freq) NSYS_GPU_METRICS_FREQ="$2"; shift 2;;
         -h|--help)
             sed -n '1,60p' "$0"
@@ -141,7 +147,7 @@ echo "  Decode  (remote): $PEER_HOST                  GPU=$DECODE_GPU"
 echo "  Model           : $MODEL"
 echo "  Prompts         : $NUM_PROMPTS  max_tokens=$MAX_TOKENS"
 echo "  KV port         : $KV_PORT  ctrl_port=$CTRL_PORT"
-echo "  Profiling       : nsys=$ENABLE_NSYS (gpu_metrics_freq=$NSYS_GPU_METRICS_FREQ)"
+echo "  Profiling       : nsys=$ENABLE_NSYS  sm_metrics=$ENABLE_SM_METRICS  (gpu_metrics_freq=$NSYS_GPU_METRICS_FREQ)"
 echo "  Output dir      : $OUT_DIR"
 echo "============================================================"
 
@@ -157,14 +163,17 @@ fi
 
 # Build the python command (possibly wrapped with nsys).
 if $ENABLE_NSYS; then
+    SM_METRICS_FLAG=""
+    if $ENABLE_SM_METRICS; then
+        SM_METRICS_FLAG="--gpu-metrics-devices=all --gpu-metrics-frequency=$NSYS_GPU_METRICS_FREQ"
+    fi
     REMOTE_PY_CMD_WRAP="\
         $NSYS_RESOLVE_SNIPPET; \
         \"\$NSYS\" profile \
             --trace=cuda,nvtx \
             --cuda-graph-trace=node \
             --trace-fork-before-exec=true \
-            --gpu-metrics-devices=cuda-visible \
-            --gpu-metrics-frequency=$NSYS_GPU_METRICS_FREQ \
+            $SM_METRICS_FLAG \
             --output='$REMOTE_NSYS_REPORT' \
             --force-overwrite=true \
             "
@@ -237,13 +246,16 @@ LOCAL_NSYS_REPORT="$OUT_DIR/prefill/nsys_report"
 echo "[launcher] Starting prefill on $(hostname -s) GPU $PREFILL_GPU (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES) ..."
 if $ENABLE_NSYS; then
     export VLLM_NVTX_SCOPES_FOR_PROFILING=1
+    SM_FLAGS=()
+    if $ENABLE_SM_METRICS; then
+        SM_FLAGS=(--gpu-metrics-devices=all --gpu-metrics-frequency="$NSYS_GPU_METRICS_FREQ")
+    fi
     # shellcheck disable=SC2086
     "$LOCAL_NSYS" profile \
         --trace=cuda,nvtx \
         --cuda-graph-trace=node \
         --trace-fork-before-exec=true \
-        --gpu-metrics-devices=cuda-visible \
-        --gpu-metrics-frequency="$NSYS_GPU_METRICS_FREQ" \
+        "${SM_FLAGS[@]}" \
         --output="$LOCAL_NSYS_REPORT" \
         --force-overwrite=true \
         python "$LOCAL_REPO/zeyu/run_qwen35_vision_offline.py" \
