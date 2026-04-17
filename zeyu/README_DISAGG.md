@@ -1,149 +1,246 @@
-# Disaggregated Prefill-Decode (PD) Mode
+# Disaggregated Prefill-Decode (PD) Mode — Cross-Node
 
-This document describes how to run Qwen3.5-9B with **prefill-decode disaggregation**: vision encoder + text prefill on GPU 0, text decode on GPU 1.
+This document describes how to run **Qwen3-VL-8B-Instruct** in
+prefill-decode disaggregated mode across **two nodes**:
+
+- **Node 0 GPU**: vision encoder + text prefill (`kv_producer`)
+- **Node 1 GPU**: text decode (`kv_consumer`)
+
+KV cache is transferred between the two GPUs over NCCL, going out
+over the management NIC (default `eth0`, TCP). The launcher is meant
+to be run from Node 0; it SSHes into Node 1 to start the decode
+process, runs the prefill locally, copies the remote metrics back,
+and produces a consolidated summary.
+
+## Why not Qwen3.5-9B?
+
+Qwen3.5-9B has a **hybrid** attention architecture (layers alternate
+between `linear_attention` and `full_attention`). vLLM's
+`P2pNcclConnector` — and all standard KV transfer connectors —
+only support uniform full-attention models. Running
+`--kv-transfer-config` with Qwen3.5-9B crashes at engine init:
+
+    ValueError: Hybrid KV cache manager is disabled but failed to
+    convert the KV cache specs to one unified type.
+
+Qwen3-VL-8B-Instruct is the closest equivalent (pure full-attention,
+8B dense, latest Qwen3 VL series, multimodal) that works with
+P2pNcclConnector.
 
 ## How It Works
 
-The script launches two separate vLLM instances via `multiprocessing.Process`:
-
-| GPU | Role | What runs |
-|-----|------|-----------|
-| GPU 0 | `kv_producer` | Vision encoder + text prefill (generates 1 token) |
-| GPU 1 | `kv_consumer` | Text decode (receives KV cache, generates remaining tokens) |
-
-KV cache is transferred between GPUs using vLLM's built-in `P2pNcclConnector` (NCCL peer-to-peer).
-
 ```
-GPU 0 (prefill)                     GPU 1 (decode)
-+---------------------------+       +---------------------------+
-| Load model                |       | Load model                |
-| Vision encode (images)    |       | Wait for prefill signal   |
-| Text prefill (1st token)  |       |                           |
-| Transfer KV cache --------|------>| Receive KV cache          |
-| Signal done               |       | Decode (remaining tokens) |
-| Wait (keep NCCL alive)    |       | Report results            |
-+---------------------------+       +---------------------------+
+Node 0 (prefill role)                     Node 1 (decode role)
+───────────────────────                   ─────────────────────
+ 1. Launcher binds ZMQ ctrl                1. Launcher starts decode
+    socket on ctrl-port.                      via SSH; decode connects
+ 2. Prefill loads LLM with                    to Node 0 ctrl socket.
+    kv_role=kv_producer on                 2. Decode loads LLM with
+    eth0 IP:kv_port.                          kv_role=kv_consumer on
+ 3. Prefill sends its ZMQ                     eth0 IP:(kv_port+100).
+    address over ctrl.                     3. Decode sends its ZMQ
+ 4. Prefill generates                         address over ctrl.
+    request_ids that encode                4. Decode receives request
+    BOTH endpoints' ZMQ                       ids from prefill; both
+    addresses in the special                  sides use the SAME ids
+    format expected by                        so KV tensor keys match.
+    P2pNcclConnector.                      5. Decode waits for prefill
+ 5. Prefill runs                              to signal "done".
+    generate(max_tokens=1).                6. Decode runs
+    Encoder + prefill +                       generate(max_tokens=N).
+    first token are computed.                 Consumer side skips prefill
+    KV is pushed to decode                    work because producer's KV
+    via NCCL over eth0.                       has already arrived.
+ 6. Prefill sends "done"                   7. Decode produces tokens and
+    signal over ctrl.                         writes latency.json.
+ 7. Prefill waits for                      8. Decode sends "exit" signal;
+    decode's "exit" signal,                   tears down NCCL.
+    then exits.
+ 8. Launcher tars decode
+    outputs back, then runs
+    merge_disagg.py to build
+    disagg_summary.json.
 ```
 
 ## Prerequisites
 
-- **2 GPUs** visible to the process (same node)
-- vLLM installed with the instrumentation changes (editable install)
-- Model accessible locally or via HuggingFace
+Same on **both** nodes:
+
+- Linux with CUDA + an H20/H100/A100 class GPU (≥24 GB free)
+- The repo cloned at the same absolute path (default
+  `/home/zeyu/vllm/mono_kernel`)
+- Conda env (default `mono_kernel`) with vLLM installed editable
+  from this repo
+- `msgpack` installed (`pip install msgpack`) — required by
+  `P2pNcclConnector`
+- Qwen3-VL-8B-Instruct weights at the same absolute path on both
+  nodes (default `/home/zeyu/models/Qwen3-VL-8B-Instruct`)
+- Network: both nodes reachable to each other over the NIC named by
+  `--iface` (default `eth0`). Use the management NIC IP; the launcher
+  auto-detects it.
+- Passwordless SSH from **Node 0** to **Node 1** (either direct or
+  via the docker container, depending on your setup)
+- `nvidia-smi`, `tar`, `ssh` available inside the container
+  (rsync is NOT required)
 
 ## Usage
 
-### Basic Run
+Run on Node 0 (the prefill node):
 
 ```bash
-python zeyu/run_qwen35_vision_offline.py \
-    --model /path/to/Qwen3.5-9B \
-    --disagg
+bash zeyu/disagg_run.sh \
+    --peer-host lj1.zeyu.tw \
+    --prefill-gpu 4 \
+    --decode-gpu 4 \
+    --num-prompts 20 \
+    --max-tokens 64
 ```
 
-### With JSONL Input
+### Common flags
 
-```bash
-python zeyu/run_qwen35_vision_offline.py \
-    --model /path/to/Qwen3.5-9B \
-    --disagg \
-    --input zeyu/inputs/reqs/sample.jsonl
-```
+| Flag | Default | Description |
+|---|---|---|
+| `--peer-host HOST` | *(required)* | Hostname/IP of the decode node |
+| `--peer-ssh-user USER` | `zeyu` | SSH user for the peer |
+| `--model PATH` | `/home/zeyu/models/Qwen3-VL-8B-Instruct` | Model path on BOTH nodes |
+| `--num-prompts N` | 4 | Number of built-in example prompts to cycle through |
+| `--max-tokens N` | 64 | Max tokens to generate per request |
+| `--max-model-len N` | 4096 | Maximum context length |
+| `--gpu-memory-utilization F` | 0.85 | Fraction of GPU memory for KV cache |
+| `--iface IFACE` | `eth0` | Network interface for NCCL/GLOO |
+| `--kv-port N` | 25555 | Prefill KV port; decode uses N+100 |
+| `--ctrl-port N` | 25500 | Control-channel ZMQ port on prefill node |
+| `--prefill-gpu IDX` | 0 | Physical GPU index on Node 0 |
+| `--decode-gpu IDX` | 0 | Physical GPU index on Node 1 |
+| `--input PATH` | *(none)* | JSONL input file (overrides `--num-prompts`) |
+| `--remote-repo PATH` | `/home/zeyu/vllm/mono_kernel` | Repo path on peer |
+| `--container NAME` | `fe_rnic` | Docker container name on peer |
+| `--conda-env NAME` | `mono_kernel` | Conda env name on peer |
 
-### With nsys Profiling
-
-```bash
-bash zeyu/profile_run.sh --nsys-only --model /path/to/Qwen3.5-9B --disagg
-```
-
-Then post-process:
-
-```bash
-python zeyu/analyze_profile.py zeyu/outputs/profile_<timestamp>/
-```
-
-`analyze_profile.py` automatically detects disagg mode when it finds `prefill/` and `decode/` subdirectories.
-
-## Output Structure
-
-### Latency Results
-
-`zeyu/outputs/latency_<timestamp>.json` contains the merged results with `"mode": "disagg"`. Vision encoder and prefill metrics come from GPU 0; decode metrics come from GPU 1.
-
-### Iteration Logs (when `VLLM_LOG_ITERATIONS=1`)
-
-Each GPU writes to its own subdirectory to avoid overwriting:
+## Output structure
 
 ```
-zeyu/outputs/profile_<timestamp>/
-+-- prefill/
-|   +-- iterations.jsonl      # GPU 0 iterations (encoder + prefill steps)
-|   +-- requests.jsonl        # GPU 0 request-to-iteration mapping
-+-- decode/
-|   +-- iterations.jsonl      # GPU 1 iterations (decode steps)
-|   +-- requests.jsonl        # GPU 1 request-to-iteration mapping
-+-- nsys_report.nsys-rep      # nsys traces both GPUs
-+-- nsys_kernels_*.csv
-+-- nsys_nvtx_*.csv
+zeyu/outputs/disagg_<YYYYMMDD_HHMMSS>/
+├── prefill/
+│   ├── iterations.jsonl          # per-iteration log (from IterationLogger)
+│   ├── requests.jsonl            # request→iteration mapping
+│   └── latency.json              # per-request: VE, prefill, timestamps
+├── decode/
+│   ├── iterations.jsonl          # copied back from Node 1
+│   ├── requests.jsonl
+│   └── latency.json              # per-request: decode, TPOT, KV transfer, TTFT
+├── disagg_summary.json           # consolidated per-request + summary
+├── prefill.log                   # stdout from prefill side
+└── decode.log                    # stdout from decode side
 ```
 
-### Consolidated Output (after `analyze_profile.py`)
+## Metrics available
 
-```
-+-- consolidated_iterations.jsonl   # All iterations from both GPUs,
-|                                   # sorted by wall-clock timestamp,
-|                                   # each tagged with "gpu_role"
-+-- consolidated_requests.jsonl     # Per-request data merged from both GPUs
-```
+All metrics listed below are in `disagg_summary.json`. Per-iteration
+metrics are additionally in `prefill/iterations.jsonl` and
+`decode/iterations.jsonl`.
 
-Each iteration record includes a `gpu_role` field (`"prefill"` or `"decode"`) so you can filter by GPU.
+### Per request (in `disagg_summary.json["requests"]`)
 
-## Metrics Available
+| Field | Description | Source |
+|---|---|---|
+| `vision_encoder_time_ms` | Time in `embed_multimodal()` (first-use images only) | Node 0 |
+| `prefill_time_ms` | `first_token_ts − scheduled_ts` during prefill | Node 0 |
+| `kv_transfer_time_ms` | Wall-clock delta between prefill `time.time()` at wall_end and decode `time.time()` at signal arrival (approximate, depends on NTP sync) | Launcher |
+| `decode_time_ms` | `last_token_ts − first_token_ts` during decode | Node 1 |
+| `num_generation_tokens` | Number of output tokens produced | Node 1 |
+| `tpot_ms` | Average time per output token = decode_time / (N − 1) | Node 1 |
+| `jct_ms` | Job completion time ≈ VE + prefill + KV transfer + decode | Computed |
 
-All the same metrics as single-GPU mode are collected per iteration:
+### Per iteration (in `<role>/iterations.jsonl`)
 
-| Metric | Source | Available in disagg? |
-|--------|--------|---------------------|
-| `step_latency_ms` | Inter-iteration timestamp diff | Yes (per GPU) |
-| `step_rps` | Requests / latency | Yes (per GPU) |
-| `gpu_util_pct` | nsys kernel timeline | Yes (per GPU) |
-| `vision_encoder_gpu_util_pct` | nsys vision_encoder NVTX range | Yes (GPU 0 only) |
-| `text_forward_gpu_util_pct` | nsys forward NVTX range | Yes (per GPU) |
-| `kernel_launch_gap_ns` | Step-level GPU idle time between kernels (ns) | Yes (per GPU) |
-| `kernel_launch_gap_pct` | Step-level GPU idle fraction (100% - gpu_util%) | Yes (per GPU) |
-| `vision_encoder_kernel_launch_gap_ns` | Vision encoder GPU idle gap (ns) | Yes (GPU 0 only) |
-| `vision_encoder_kernel_launch_gap_pct` | Vision encoder GPU idle fraction | Yes (GPU 0 only) |
-| `text_forward_kernel_launch_gap_ns` | Text forward GPU idle gap (ns) | Yes (per GPU) |
-| `text_forward_kernel_launch_gap_pct` | Text forward GPU idle fraction | Yes (per GPU) |
-| `gpu_mem_allocated_MiB` | torch.cuda.memory_allocated | Yes (per GPU) |
-| `prefill_req_ids` / `decode_req_ids` | Scheduler phase classification | Yes (per GPU) |
+Already documented in `zeyu/README.md`. Includes GPU utilization
+percentage, active kernel gap, per-SM throughput (when ncu enabled),
+GPU memory allocated, per-request phase classification, and
+per-step latency/RPS.
 
-In the consolidated request file, metrics from both GPUs are merged per request:
-- `encoder_iters` and `prefill_iters` come from the prefill GPU
-- `decode_iters` come from the decode GPU
+### Summary (in `disagg_summary.json["summary"]`)
 
-## Comparison with Single-GPU Mode
+| Field | Description |
+|---|---|
+| `avg_vision_encoder_time_ms` | Mean across requests that had a VE call (cache-hit requests excluded) |
+| `avg_prefill_time_ms` | Mean prefill time |
+| `avg_decode_time_ms` | Mean decode time |
+| `avg_tpot_ms` | Mean TPOT |
+| `avg_kv_transfer_time_ms` | Mean KV coordination transfer time |
+| `avg_jct_ms` | Mean JCT |
+| `total_decode_tokens` | Sum of all generated tokens |
+| `prefill_wall_time_s` | Node 0's `llm.generate()` wall clock |
+| `decode_wall_time_s` | Node 1's `llm.generate()` wall clock |
+| `rps_end_to_end` | N / (prefill_wall + decode_wall) |
+| `rps_decode_only` | N / decode_wall |
 
-| Aspect | Single GPU | Disagg (PD) |
-|--------|-----------|-------------|
-| GPUs needed | 1 | 2 |
-| `--disagg` flag | No | Yes |
-| Prefill and decode | Same GPU, interleaved | Separate GPUs |
-| KV cache transfer | None | P2pNcclConnector (NCCL) |
-| `enforce_eager` | Not required | Forced on (CUDA graphs not supported with KV transfer) |
-| Iteration logs | Single `iterations.jsonl` | `prefill/iterations.jsonl` + `decode/iterations.jsonl` |
+## Using ncu for per-SM metrics (optional)
 
-## Limitations
-
-- Requires both GPUs on the **same node** (NCCL P2P requires direct GPU communication).
-- `enforce_eager=True` is forced — CUDA graph capture is not compatible with KV transfer.
-- The prefill process stays alive (sleeping) until decode finishes, because NCCL requires both endpoints to remain active.
-- Delays (`--delay`) are not supported in disagg mode (all requests are submitted at once to the prefill instance).
+`disagg_run.sh` does NOT invoke `ncu` by default. To enable per-SM
+metrics, run `zeyu/profile_run.sh` with the same model on a SINGLE
+node first to collect ncu data; the measurements generalize to the
+per-role GPU utilization since the kernels invoked per phase are the
+same as in single-GPU mode. For cross-node ncu, you'd need to run
+`ncu` on each node's inference command — that is out of scope for
+this launcher.
 
 ## Troubleshooting
 
-**"NCCL error"**: Ensure both GPUs can communicate. Check `nvidia-smi topo -m` for P2P connectivity.
+**`ValueError: Hybrid KV cache manager is disabled ...`**
+You're trying to use a hybrid model (e.g. Qwen3.5). Switch to
+Qwen3-VL-8B-Instruct or Qwen2.5-VL.
 
-**Model doesn't fit on one GPU**: Reduce `--gpu-memory-utilization` (default 0.9). In disagg mode, each GPU loads the full model independently.
+**`ValueError: Free memory on device cuda:0 ... less than desired`**
+The selected GPU is already occupied. Pick a different GPU with
+`--prefill-gpu` / `--decode-gpu` or lower `--gpu-memory-utilization`.
 
-**Decode output is empty**: The prefill process must generate exactly 1 token per request. If prefill fails, the decode process has no KV cache to consume. Check the prefill process logs.
+**`ModuleNotFoundError: No module named 'msgpack'`**
+Run `pip install msgpack` inside the conda env on both nodes.
+
+**`Address already in use`** on the ctrl port
+A previous run left a socket in TIME_WAIT. Pick a different
+`--ctrl-port` (any high port) or wait ~60s.
+
+**`NCCL error` / hangs at engine init on the decode side**
+Check that both nodes can reach each other on the NIC given by
+`--iface` (`ping 192.168.0.42` from Node 1 should work). Confirm
+`NCCL_SOCKET_IFNAME` gets set (the script exports `eth0` by
+default). For dense cluster setups with back-end NICs, you can
+override `--iface` to match your topology.
+
+**`decode.log`: `Request id ... does not contain hostname and port`**
+This indicates the producer/consumer got an ID that doesn't match
+the P2pNcclConnector regex. Ensure both sides are running the same
+version of `run_qwen35_vision_offline.py` and that
+`VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1` is set (the script sets
+it automatically).
+
+**`rsync FAILED` in the launcher (older logs only)**
+The launcher now uses `tar`-over-SSH; rsync is no longer required.
+
+## Notes on correctness
+
+Qwen3-VL-8B-Instruct is a pure full-attention transformer, so the KV
+cache transferred from the producer is usable by the consumer
+without any linear-attention recurrent-state issues. If you observe
+garbage output on the decode side, the likely causes are:
+
+1. NCCL connectivity problem — the consumer times out or silently
+   drops KV, then re-runs prefill itself (falling back to text).
+2. Image preprocessing mismatch — the consumer processed its own
+   copy of the image before realizing the KV was already there.
+   For multimodal models, the consumer still passes the images
+   through (they feed input_ids), but P2pNcclConnector short-
+   circuits the actual attention compute.
+
+For a sanity check, run a non-disaggregated single-GPU reference:
+
+```bash
+python zeyu/run_qwen35_vision_offline.py \
+    --model /home/zeyu/models/Qwen3-VL-8B-Instruct \
+    --num-prompts 4 \
+    --max-tokens 64
+```
+
+and compare generated outputs.
