@@ -135,9 +135,9 @@ if $ENABLE_NSYS; then
     fi
 fi
 
-# Shell snippet (shared by local and remote) that resolves the path
-# to nsys when running on a node. Embedded into remote command.
-NSYS_RESOLVE_SNIPPET='NSYS=""; for c in nsys /usr/local/cuda/bin/nsys /opt/nvidia/nsight-systems/bin/nsys /opt/nvidia/nsight-compute/2025.2.1/host/target-linux-x64/nsys; do if command -v "$c" >/dev/null 2>&1 || [[ -x "$c" ]]; then NSYS="$c"; break; fi; done'
+### nsys path resolution: detect ahead of time on each node so we can
+### embed a concrete absolute path into the remote command (avoids
+### quoting hell with nested bash -lc invocations).
 
 echo "============================================================"
 echo "  Cross-node disaggregation launcher"
@@ -162,14 +162,13 @@ if [[ -n "$INPUT" ]]; then
 fi
 
 # Build the python command (possibly wrapped with nsys).
-if $ENABLE_NSYS; then
+if $ENABLE_NSYS && [[ -n "$REMOTE_NSYS" ]]; then
     SM_METRICS_FLAG=""
     if $ENABLE_SM_METRICS; then
         SM_METRICS_FLAG="--gpu-metrics-devices=all --gpu-metrics-frequency=$NSYS_GPU_METRICS_FREQ"
     fi
     REMOTE_PY_CMD_WRAP="\
-        $NSYS_RESOLVE_SNIPPET; \
-        \"\$NSYS\" profile \
+        '$REMOTE_NSYS' profile \
             --trace=cuda,nvtx \
             --cuda-graph-trace=node \
             --trace-fork-before-exec=true \
@@ -178,9 +177,9 @@ if $ENABLE_NSYS; then
             --force-overwrite=true \
             "
     REMOTE_NVTX_EXPORT=" && \
-    \"\$NSYS\" stats -r cuda_gpu_trace --format csv --output '$REMOTE_OUT_DIR/decode/nsys_kernels' '$REMOTE_NSYS_REPORT.nsys-rep' 2>/dev/null || true; \
-    \"\$NSYS\" stats -r nvtx_pushpop_trace --format csv --output '$REMOTE_OUT_DIR/decode/nsys_nvtx_pushpop' '$REMOTE_NSYS_REPORT.nsys-rep' 2>/dev/null || true; \
-    \"\$NSYS\" stats -r gpu_metrics --format csv --output '$REMOTE_OUT_DIR/decode/nsys_gpu_metrics' '$REMOTE_NSYS_REPORT.nsys-rep' 2>/dev/null || true"
+    '$REMOTE_NSYS' stats -r cuda_gpu_trace --format csv --output '$REMOTE_OUT_DIR/decode/nsys_kernels' '$REMOTE_NSYS_REPORT.nsys-rep' 2>/dev/null || true; \
+    '$REMOTE_NSYS' stats -r nvtx_pushpop_trace --format csv --output '$REMOTE_OUT_DIR/decode/nsys_nvtx_pushpop' '$REMOTE_NSYS_REPORT.nsys-rep' 2>/dev/null || true; \
+    '$REMOTE_NSYS' stats -r gpu_metrics --format csv --output '$REMOTE_OUT_DIR/decode/nsys_gpu_metrics' '$REMOTE_NSYS_REPORT.nsys-rep' 2>/dev/null || true"
     REMOTE_NVTX_ENV="export VLLM_NVTX_SCOPES_FOR_PROFILING=1 && "
 else
     REMOTE_PY_CMD_WRAP=""
@@ -217,6 +216,19 @@ sleep 1 && \
 pgrep -f 'role decode' | tail -1 > '$REMOTE_DECODE_PID_FILE'"
 
 SSH_PREFIX=(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${PEER_SSH_USER}@${PEER_HOST}")
+
+### Detect remote nsys path (inside container) via a probe SSH.
+REMOTE_NSYS=""
+if $ENABLE_NSYS; then
+    REMOTE_NSYS="$(
+        "${SSH_PREFIX[@]}" "docker exec -u $PEER_SSH_USER $CONTAINER bash -lc 'for c in nsys /usr/local/cuda/bin/nsys /opt/nvidia/nsight-systems/bin/nsys /opt/nvidia/nsight-compute/2025.2.1/host/target-linux-x64/nsys; do if command -v \"\$c\" >/dev/null 2>&1 || [[ -x \"\$c\" ]]; then echo \"\$c\"; exit 0; fi; done'" 2>/dev/null | tr -d '[:space:]'
+    )"
+    if [[ -z "$REMOTE_NSYS" ]]; then
+        echo "[launcher] WARN: nsys not found on $PEER_HOST; disabling decode-side profiling."
+    else
+        echo "[launcher] Remote nsys: $REMOTE_NSYS"
+    fi
+fi
 
 echo "[launcher] Starting decode on $PEER_HOST ..."
 "${SSH_PREFIX[@]}" "docker exec -u $PEER_SSH_USER $CONTAINER bash -lc \"$REMOTE_CMD\"" \
