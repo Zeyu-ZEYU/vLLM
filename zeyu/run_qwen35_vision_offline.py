@@ -933,23 +933,32 @@ def _generate_with_request_ids(
     request_ids: list[str],
 ):
     """Submit requests with caller-provided request IDs and return
-    outputs in the same order as request_ids."""
-    from vllm.outputs import RequestOutput
+    outputs in the same order as request_ids.
 
+    We drive the engine manually (instead of calling ``llm._run_engine``)
+    because the default helper assumes integer request_ids and sorts by
+    ``int(x.request_id)`` at the end; our IDs carry address metadata and
+    are not integers.
+    """
     assert len(vllm_inputs) == len(request_ids), (
         f"Got {len(vllm_inputs)} inputs and {len(request_ids)} IDs"
     )
     for inp, rid in zip(vllm_inputs, request_ids):
         llm.llm_engine.add_request(rid, inp, sampling_params)
 
-    # Drive the engine until all requests finish.
-    outputs: list[RequestOutput] = llm._run_engine(
-        RequestOutput, use_tqdm=True
-    )
-    # _run_engine returns outputs sorted by request_id (string sort), so
-    # re-sort by our injected order.
-    by_id = {o.request_id: o for o in outputs}
-    return [by_id[r] for r in request_ids if r in by_id]
+    outputs_by_id: dict = {}
+    engine = llm.llm_engine
+    while engine.has_unfinished_requests():
+        step_outputs = engine.step()
+        # engine.step() may return:
+        #   - list[RequestOutput] (finished-or-streaming outputs)
+        #   - Or for V1 inprocessing: iterable of per-request outputs
+        for out in step_outputs:
+            if getattr(out, "finished", False):
+                # Key by external request id so our custom IDs work.
+                outputs_by_id[out.request_id] = out
+
+    return [outputs_by_id[r] for r in request_ids if r in outputs_by_id]
 
 
 def _signal_done(args, role: str, payload: dict):
