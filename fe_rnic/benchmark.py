@@ -92,6 +92,14 @@ class BenchmarkResult:
     avg_output_tokens: float
     avg_input_tokens: float
 
+    # Means (in ms) — handy for sanity checking small runs.
+    avg_ttft_ms: float = 0.0
+    avg_jct_ms: float = 0.0
+    avg_itl_ms: float = 0.0
+    avg_prefill_ms: float = 0.0
+    avg_kv_total_ms: float = 0.0
+    avg_kv_exposed_ms: float = 0.0
+
     # Raw per-request data
     requests: list[dict] = field(default_factory=list)
 
@@ -277,6 +285,59 @@ def attach_server_metrics(
 # Main benchmark
 # ---------------------------------------------------------------------------
 
+async def _send_warmup(
+    session: aiohttp.ClientSession, url: str, model: str,
+    input_len: int, max_tokens: int, count: int,
+) -> None:
+    """Fire ``count`` warmup requests and await completion.
+
+    Results are discarded. Used to get past cold-start autotuning and
+    first-request compilation so the measured run sees steady-state
+    timing.
+    """
+    if count <= 0:
+        return
+    print(f"Warmup: {count} requests (input~{input_len}, out={max_tokens}) ...")
+    tasks = [
+        asyncio.create_task(
+            send_request(
+                session, url,
+                generate_synthetic_prompt(input_len),
+                max_tokens, model, -(i + 1),
+            )
+        )
+        for i in range(count)
+    ]
+    warm_results = await asyncio.gather(*tasks)
+    ok = sum(1 for r in warm_results if r.success)
+    print(f"  Warmup done: {ok}/{count} succeeded")
+
+
+def _truncate_metrics_sources(sources: list[str]) -> None:
+    """Best-effort truncate of every metrics JSONL source.
+
+    Called after warmup so that the main run's metrics don't mix with
+    warmup entries.
+    """
+    for src in sources:
+        try:
+            if src.startswith("local:"):
+                path = src[len("local:"):]
+                if os.path.exists(path):
+                    open(path, "w").close()
+            elif src.startswith("ssh:"):
+                rest = src[len("ssh:"):]
+                host, _, path = rest.partition(":")
+                cmd = [
+                    "ssh", "-o", "BatchMode=yes",
+                    "-o", "StrictHostKeyChecking=no",
+                    host, f": > {path}",
+                ]
+                subprocess.run(cmd, capture_output=True, timeout=15)
+        except Exception as e:
+            print(f"  [warn] truncate {src} failed: {e}")
+
+
 async def run_benchmark(args) -> BenchmarkResult:
     """Run the benchmark and return results."""
 
@@ -321,8 +382,22 @@ async def run_benchmark(args) -> BenchmarkResult:
     if args.qps:
         print(f"  Poisson arrival: QPS={args.qps}")
 
-    connector = aiohttp.TCPConnector(limit=args.concurrency)
+    connector = aiohttp.TCPConnector(limit=max(args.concurrency, args.warmup))
     async with aiohttp.ClientSession(connector=connector) as session:
+        if args.warmup > 0:
+            warm_input_len = args.input_len if args.synthetic else 512
+            warm_max_tokens = args.max_tokens
+            await _send_warmup(
+                session, args.url, args.model,
+                warm_input_len, warm_max_tokens, args.warmup,
+            )
+            if args.metrics_sources:
+                srcs = [s.strip() for s in args.metrics_sources.split(",")
+                        if s.strip()]
+                _truncate_metrics_sources(srcs)
+            # Let any tail callbacks finish before measuring.
+            await asyncio.sleep(0.5)
+
         tasks = []
         t_bench_start = time.perf_counter()
 
@@ -377,6 +452,13 @@ async def run_benchmark(args) -> BenchmarkResult:
     for r in completed:
         all_itls.extend([x * 1000 for x in r.itl])  # ms
 
+    prefill_vals = [r.prefill_time_ms for r in completed]
+    kv_total_vals = [r.kv_total_time_ms for r in completed]
+    kv_exposed_vals = [r.kv_exposed_time_ms for r in completed]
+
+    def _mean(xs):
+        return float(np.mean(xs)) if xs else 0.0
+
     result = BenchmarkResult(
         num_requests=args.num_requests,
         num_completed=len(completed),
@@ -388,12 +470,19 @@ async def run_benchmark(args) -> BenchmarkResult:
         itl=_pcts(all_itls),
         e2el=_pcts(e2els),
 
-        prefill_time=_pcts([r.prefill_time_ms for r in completed]),
-        kv_total_time=_pcts([r.kv_total_time_ms for r in completed]),
-        kv_exposed_time=_pcts([r.kv_exposed_time_ms for r in completed]),
+        prefill_time=_pcts(prefill_vals),
+        kv_total_time=_pcts(kv_total_vals),
+        kv_exposed_time=_pcts(kv_exposed_vals),
 
         avg_output_tokens=float(np.mean([r.output_tokens for r in completed])),
         avg_input_tokens=float(np.mean([r.prompt_len for r in completed])),
+
+        avg_ttft_ms=_mean(ttfts),
+        avg_jct_ms=_mean(e2els),
+        avg_itl_ms=_mean(all_itls),
+        avg_prefill_ms=_mean(prefill_vals),
+        avg_kv_total_ms=_mean(kv_total_vals),
+        avg_kv_exposed_ms=_mean(kv_exposed_vals),
 
         requests=[asdict(r) for r in results],
     )
@@ -427,6 +516,15 @@ def print_results(result: BenchmarkResult):
         print(f"  KV exposed (ms):  {_fmt(result.kv_exposed_time)}")
     else:
         print("  (Server-side KV metrics: see prefill log [METRICS])")
+    print()
+    print("  Averages (ms):")
+    print(f"    TTFT        {result.avg_ttft_ms:8.2f}")
+    print(f"    JCT (E2EL)  {result.avg_jct_ms:8.2f}")
+    print(f"    ITL         {result.avg_itl_ms:8.2f}")
+    if has_server:
+        print(f"    Prefill     {result.avg_prefill_ms:8.2f}")
+        print(f"    KV total    {result.avg_kv_total_ms:8.2f}")
+        print(f"    KV exposed  {result.avg_kv_exposed_ms:8.2f}")
     print("=" * 60)
 
 
@@ -466,6 +564,10 @@ def main():
                         help="Max concurrent requests")
     parser.add_argument("--qps", type=float, default=0,
                         help="Target QPS (Poisson arrival). 0 = send all at once")
+    parser.add_argument("--warmup", type=int, default=0,
+                        help="Fire N warmup requests first (not counted in "
+                             "results). Metrics JSONL is truncated after "
+                             "warmup so only main-run entries are aggregated.")
 
     # Synthetic data
     parser.add_argument("--synthetic", action="store_true",
