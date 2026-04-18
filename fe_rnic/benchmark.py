@@ -99,6 +99,14 @@ class BenchmarkResult:
     avg_prefill_ms: float = 0.0
     avg_kv_total_ms: float = 0.0
     avg_kv_exposed_ms: float = 0.0
+    # Decode-side: the first ITL is special — it includes decode startup
+    # (proxy→decode HTTP, Mooncake Get of KV, first decode forward,
+    # sampler). `decode_steady_ms` is sum of ITLs excluding the first,
+    # i.e. pure steady-state decode after startup. `decode_total_ms` is
+    # sum of all ITLs = time from first token to last token.
+    avg_first_itl_ms: float = 0.0
+    avg_decode_total_ms: float = 0.0
+    avg_decode_steady_ms: float = 0.0
 
     # Raw per-request data
     requests: list[dict] = field(default_factory=list)
@@ -456,6 +464,13 @@ async def run_benchmark(args) -> BenchmarkResult:
     kv_total_vals = [r.kv_total_time_ms for r in completed]
     kv_exposed_vals = [r.kv_exposed_time_ms for r in completed]
 
+    # Decode-side breakdown per request (ms)
+    first_itl_vals = [r.itl[0] * 1000 for r in completed if r.itl]
+    decode_total_vals = [sum(r.itl) * 1000 for r in completed if r.itl]
+    decode_steady_vals = [
+        sum(r.itl[1:]) * 1000 for r in completed if len(r.itl) > 1
+    ]
+
     def _mean(xs):
         return float(np.mean(xs)) if xs else 0.0
 
@@ -483,6 +498,9 @@ async def run_benchmark(args) -> BenchmarkResult:
         avg_prefill_ms=_mean(prefill_vals),
         avg_kv_total_ms=_mean(kv_total_vals),
         avg_kv_exposed_ms=_mean(kv_exposed_vals),
+        avg_first_itl_ms=_mean(first_itl_vals),
+        avg_decode_total_ms=_mean(decode_total_vals),
+        avg_decode_steady_ms=_mean(decode_steady_vals),
 
         requests=[asdict(r) for r in results],
     )
@@ -518,13 +536,19 @@ def print_results(result: BenchmarkResult):
         print("  (Server-side KV metrics: see prefill log [METRICS])")
     print()
     print("  Averages (ms):")
-    print(f"    TTFT        {result.avg_ttft_ms:8.2f}")
-    print(f"    JCT (E2EL)  {result.avg_jct_ms:8.2f}")
-    print(f"    ITL         {result.avg_itl_ms:8.2f}")
+    print(f"    TTFT             {result.avg_ttft_ms:8.2f}")
+    print(f"    JCT (E2EL)       {result.avg_jct_ms:8.2f}")
+    print(f"    ITL (mean)       {result.avg_itl_ms:8.2f}")
+    print(f"    first ITL        {result.avg_first_itl_ms:8.2f}  "
+          "(incl. decode startup)")
+    print(f"    decode total     {result.avg_decode_total_ms:8.2f}  "
+          "(sum of all ITLs = first→last token)")
+    print(f"    decode steady    {result.avg_decode_steady_ms:8.2f}  "
+          "(sum of non-first ITLs)")
     if has_server:
-        print(f"    Prefill     {result.avg_prefill_ms:8.2f}")
-        print(f"    KV total    {result.avg_kv_total_ms:8.2f}")
-        print(f"    KV exposed  {result.avg_kv_exposed_ms:8.2f}")
+        print(f"    Prefill          {result.avg_prefill_ms:8.2f}")
+        print(f"    KV total         {result.avg_kv_total_ms:8.2f}")
+        print(f"    KV exposed       {result.avg_kv_exposed_ms:8.2f}")
     print("=" * 60)
 
 
