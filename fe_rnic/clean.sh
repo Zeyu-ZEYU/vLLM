@@ -75,8 +75,10 @@ cleanup_node() {
     # 清理临时 mooncake config
     rm -f /tmp/mooncake-prefiller-config.yaml /tmp/mooncake-decoder-config.yaml 2>/dev/null || true
 
-    # 清理上一轮 benchmark 的 server metrics JSONL (prefill worker 写的)
+    # 清理上一轮 benchmark 的 server metrics JSONL
     rm -f /home/zeyu/lmcache_metrics.jsonl 2>/dev/null || true
+    rm -f /home/zeyu/lmcache_metrics_producer.jsonl 2>/dev/null || true
+    rm -f /home/zeyu/lmcache_metrics_consumer.jsonl 2>/dev/null || true
 
     if [[ $killed -eq 0 ]]; then
         echo "  没有发现残留进程"

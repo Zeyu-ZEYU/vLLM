@@ -43,13 +43,54 @@ class RequestResult:
     itl: list[float] = field(default_factory=list)  # inter-token latencies
     jct: float = 0.0     # job completion time (seconds)
     server_id: str = ""   # completion id returned by proxy (cmpl-...)
-    # Server-side metrics (from prefill worker JSONL, ms)
-    prefill_time_ms: float = 0.0
-    kv_total_time_ms: float = 0.0
-    kv_exposed_time_ms: float = 0.0
+    # Server-side wall-clock timestamps (epoch seconds). Producer side
+    # fills t_prefill_*, t_kv_start, t_kv_mnck_in_end; consumer side
+    # fills t_kv_mnck_out_start, t_kv_end. All six are absolute so we
+    # can join across prefill and decode nodes.
+    t_prefill_start: float = 0.0
+    t_prefill_end: float = 0.0
+    t_kv_start: float = 0.0
+    t_kv_mnck_in_end: float = 0.0
+    t_kv_mnck_out_start: float = 0.0
+    t_kv_end: float = 0.0
     kv_mode: str = ""     # "layerwise" or "non_layerwise"
     success: bool = True
     error: str = ""
+
+    # Derived intervals (ms); computed after joining producer+consumer
+    # JSONLs to the client result.
+    @property
+    def prefill_ms(self) -> float:
+        return max(0.0, (self.t_prefill_end - self.t_prefill_start) * 1000)
+
+    @property
+    def kv_save_ms(self) -> float:
+        """Prefill side: t_kv_start → t_kv_mnck_in_end.
+        Includes GPU→CPU offload + Mooncake Put (local segment or RDMA
+        WRITE to remote).
+        """
+        return max(0.0, (self.t_kv_mnck_in_end - self.t_kv_start) * 1000)
+
+    @property
+    def kv_gap_ms(self) -> float:
+        """Between prefill's Put-CQE and decode's start-load-kv.
+        Contains prefill response serialization + proxy dispatch +
+        decode scheduler + decode forward entry.
+        """
+        return max(0.0, (self.t_kv_mnck_out_start - self.t_kv_mnck_in_end) * 1000)
+
+    @property
+    def kv_load_ms(self) -> float:
+        """Decode side: t_kv_mnck_out_start → t_kv_end.
+        Includes Mooncake Get (RDMA READ cross-node or local) +
+        CPU→GPU memcpy. Measured up to cuda-sync after last load.
+        """
+        return max(0.0, (self.t_kv_end - self.t_kv_mnck_out_start) * 1000)
+
+    @property
+    def kv_total_ms(self) -> float:
+        """End-to-end KV: t_kv_start on prefill → t_kv_end on decode."""
+        return max(0.0, (self.t_kv_end - self.t_kv_start) * 1000)
 
 
 PCTL_KEYS = ("p25", "p50", "p75", "p90", "p95", "p99")
@@ -83,10 +124,12 @@ class BenchmarkResult:
     # E2EL — End-to-End Latency / JCT (ms)
     e2el: dict  # {p25, p50, p75, p90, p95, p99}
 
-    # Server-side metrics (ms)
-    prefill_time: dict   # {p25..p99} prefill compute only
-    kv_total_time: dict  # {p25..p99} first layer start → last layer end
-    kv_exposed_time: dict  # {p25..p99} prefill end → last layer end
+    # Server-side breakdown (ms), percentiles
+    prefill_time: dict   # {p25..p99}
+    kv_save_time: dict   # {p25..p99} t_kv_start → t_kv_mnck_in_end (prefill)
+    kv_gap_time: dict    # {p25..p99} t_kv_mnck_in_end → t_kv_mnck_out_start
+    kv_load_time: dict   # {p25..p99} t_kv_mnck_out_start → t_kv_end (decode)
+    kv_total_time: dict  # {p25..p99} t_kv_start → t_kv_end end-to-end
 
     # Decode
     avg_output_tokens: float
@@ -97,13 +140,14 @@ class BenchmarkResult:
     avg_jct_ms: float = 0.0
     avg_itl_ms: float = 0.0
     avg_prefill_ms: float = 0.0
+    avg_kv_save_ms: float = 0.0
+    avg_kv_gap_ms: float = 0.0
+    avg_kv_load_ms: float = 0.0
     avg_kv_total_ms: float = 0.0
-    avg_kv_exposed_ms: float = 0.0
     # Decode-side: the first ITL is special — it includes decode startup
     # (proxy→decode HTTP, Mooncake Get of KV, first decode forward,
-    # sampler). `decode_steady_ms` is sum of ITLs excluding the first,
-    # i.e. pure steady-state decode after startup. `decode_total_ms` is
-    # sum of all ITLs = time from first token to last token.
+    # sampler). `decode_steady_ms` is sum of ITLs excluding the first.
+    # `decode_total_ms` is sum of all ITLs = first→last token.
     avg_first_itl_ms: float = 0.0
     avg_decode_total_ms: float = 0.0
     avg_decode_steady_ms: float = 0.0
@@ -233,7 +277,13 @@ def _fetch_metrics_source(source: str) -> str:
 
 
 def collect_server_metrics(sources: list[str]) -> dict[str, dict]:
-    """Fetch + parse JSONL from all sources. Key = adapter req_id."""
+    """Fetch + parse JSONL from all sources; merge by req_id.
+
+    Producer and consumer JSONLs carry disjoint field sets (producer:
+    t_prefill_*, t_kv_start, t_kv_mnck_in_end; consumer:
+    t_kv_mnck_out_start, t_kv_end). Merging by ``dict.update`` keeps
+    both sides' fields on the same req_id entry.
+    """
     entries: dict[str, dict] = {}
     for src in sources:
         content = _fetch_metrics_source(src)
@@ -248,45 +298,54 @@ def collect_server_metrics(sources: list[str]) -> dict[str, dict]:
             rid = rec.get("req_id")
             if not rid:
                 continue
-            # Last write wins if req_id repeats (chunked prefill).
-            if rid in entries and entries[rid].get("ts", 0) > rec.get("ts", 0):
-                continue
-            entries[rid] = rec
+            existing = entries.setdefault(rid, {"req_id": rid})
+            existing.update(rec)
     return entries
 
 
 def attach_server_metrics(
     results: list[RequestResult], metrics: dict[str, dict],
-) -> int:
-    """Populate each result with matched server metrics.
+) -> tuple[int, int]:
+    """Populate each result with server-side timestamps.
 
-    Matching strategy: adapter's req_id looks like "cmpl-<hex>-<dp_rank>-<uuid>",
-    while the client sees server_id = "cmpl-<hex>" (or the full form). Match by
-    prefix in either direction.
+    Matching strategy: adapter req_id looks like
+    "cmpl-<hex>-<dp_rank>-<uuid>"; client sees server_id "cmpl-<hex>"
+    (or the full form). Match by prefix in either direction.
 
-    Returns the count of matched results.
+    Returns ``(matched_producer, matched_consumer)``.
     """
-    matched = 0
+    matched_prod = 0
+    matched_cons = 0
     for r in results:
         if not r.success or not r.server_id:
             continue
         hit = None
-        # Try exact match first
         if r.server_id in metrics:
             hit = metrics[r.server_id]
         else:
-            # Prefix match: adapter req_id starts with client server_id
             for rid, rec in metrics.items():
                 if rid.startswith(r.server_id) or r.server_id.startswith(rid):
                     hit = rec
                     break
-        if hit:
-            r.prefill_time_ms = float(hit.get("prefill_ms", 0))
-            r.kv_total_time_ms = float(hit.get("kv_total_ms", 0))
-            r.kv_exposed_time_ms = float(hit.get("kv_exposed_ms", 0))
-            r.kv_mode = hit.get("mode", "")
-            matched += 1
-    return matched
+        if hit is None:
+            continue
+        has_producer = "t_prefill_start" in hit
+        has_consumer = "t_kv_end" in hit
+        if has_producer:
+            r.t_prefill_start = float(hit["t_prefill_start"])
+            r.t_prefill_end = float(hit["t_prefill_end"])
+            r.t_kv_start = float(hit["t_kv_start"])
+            r.t_kv_mnck_in_end = float(hit["t_kv_mnck_in_end"])
+            if "mode" in hit:
+                r.kv_mode = hit["mode"]
+            matched_prod += 1
+        if has_consumer:
+            r.t_kv_mnck_out_start = float(hit["t_kv_mnck_out_start"])
+            r.t_kv_end = float(hit["t_kv_end"])
+            if "mode" in hit and not r.kv_mode:
+                r.kv_mode = hit["mode"]
+            matched_cons += 1
+    return matched_prod, matched_cons
 
 
 # ---------------------------------------------------------------------------
@@ -433,9 +492,10 @@ async def run_benchmark(args) -> BenchmarkResult:
         sources = [s.strip() for s in args.metrics_sources.split(",")
                    if s.strip()]
         metrics_map = collect_server_metrics(sources)
-        matched = attach_server_metrics(results, metrics_map)
-        print(f"  Server metrics: {matched}/{len(results)} matched "
-              f"from {len(metrics_map)} JSONL entries")
+        m_prod, m_cons = attach_server_metrics(results, metrics_map)
+        print(f"  Server metrics: producer={m_prod}/{len(results)} "
+              f"consumer={m_cons}/{len(results)} "
+              f"(from {len(metrics_map)} merged entries)")
 
     # Aggregate metrics
     completed = [r for r in results if r.success]
@@ -449,8 +509,8 @@ async def run_benchmark(args) -> BenchmarkResult:
             num_completed=0, num_failed=len(failed),
             total_time=total_time, rps=0,
             ttft=empty, itl=empty, e2el=empty,
-            prefill_time=empty, kv_total_time=empty,
-            kv_exposed_time=empty,
+            prefill_time=empty, kv_save_time=empty, kv_gap_time=empty,
+            kv_load_time=empty, kv_total_time=empty,
             avg_output_tokens=0, avg_input_tokens=0,
         )
 
@@ -460,11 +520,19 @@ async def run_benchmark(args) -> BenchmarkResult:
     for r in completed:
         all_itls.extend([x * 1000 for x in r.itl])  # ms
 
-    prefill_vals = [r.prefill_time_ms for r in completed]
-    kv_total_vals = [r.kv_total_time_ms for r in completed]
-    kv_exposed_vals = [r.kv_exposed_time_ms for r in completed]
+    # Only include requests where BOTH producer and consumer records
+    # arrived — otherwise derived intervals are meaningless.
+    def _has_full(r: RequestResult) -> bool:
+        return r.t_prefill_start > 0 and r.t_kv_end > 0
 
-    # Decode-side breakdown per request (ms)
+    ok = [r for r in completed if _has_full(r)]
+    prefill_vals = [r.prefill_ms for r in ok]
+    kv_save_vals = [r.kv_save_ms for r in ok]
+    kv_gap_vals = [r.kv_gap_ms for r in ok]
+    kv_load_vals = [r.kv_load_ms for r in ok]
+    kv_total_vals = [r.kv_total_ms for r in ok]
+
+    # Decode-side ITL breakdown per request (ms)
     first_itl_vals = [r.itl[0] * 1000 for r in completed if r.itl]
     decode_total_vals = [sum(r.itl) * 1000 for r in completed if r.itl]
     decode_steady_vals = [
@@ -486,8 +554,10 @@ async def run_benchmark(args) -> BenchmarkResult:
         e2el=_pcts(e2els),
 
         prefill_time=_pcts(prefill_vals),
+        kv_save_time=_pcts(kv_save_vals),
+        kv_gap_time=_pcts(kv_gap_vals),
+        kv_load_time=_pcts(kv_load_vals),
         kv_total_time=_pcts(kv_total_vals),
-        kv_exposed_time=_pcts(kv_exposed_vals),
 
         avg_output_tokens=float(np.mean([r.output_tokens for r in completed])),
         avg_input_tokens=float(np.mean([r.prompt_len for r in completed])),
@@ -496,8 +566,10 @@ async def run_benchmark(args) -> BenchmarkResult:
         avg_jct_ms=_mean(e2els),
         avg_itl_ms=_mean(all_itls),
         avg_prefill_ms=_mean(prefill_vals),
+        avg_kv_save_ms=_mean(kv_save_vals),
+        avg_kv_gap_ms=_mean(kv_gap_vals),
+        avg_kv_load_ms=_mean(kv_load_vals),
         avg_kv_total_ms=_mean(kv_total_vals),
-        avg_kv_exposed_ms=_mean(kv_exposed_vals),
         avg_first_itl_ms=_mean(first_itl_vals),
         avg_decode_total_ms=_mean(decode_total_vals),
         avg_decode_steady_ms=_mean(decode_steady_vals),
@@ -526,29 +598,38 @@ def print_results(result: BenchmarkResult):
     print(f"  TTFT (ms):        {_fmt(result.ttft)}")
     print(f"  ITL  (ms):        {_fmt(result.itl)}")
     print(f"  E2EL (ms):        {_fmt(result.e2el)}")
-    # Server-side metrics (from prefill worker logs)
     has_server = any(v > 0 for v in result.kv_total_time.values())
     if has_server:
-        print(f"  Prefill (ms):     {_fmt(result.prefill_time)}")
+        print(f"  Prefill  (ms):    {_fmt(result.prefill_time)}")
+        print(f"  KV save  (ms):    {_fmt(result.kv_save_time)}")
+        print(f"  KV gap   (ms):    {_fmt(result.kv_gap_time)}")
+        print(f"  KV load  (ms):    {_fmt(result.kv_load_time)}")
         print(f"  KV total (ms):    {_fmt(result.kv_total_time)}")
-        print(f"  KV exposed (ms):  {_fmt(result.kv_exposed_time)}")
     else:
-        print("  (Server-side KV metrics: see prefill log [METRICS])")
+        print("  (Server-side KV metrics: no joined producer+consumer "
+              "records — check metrics_sources)")
     print()
     print("  Averages (ms):")
-    print(f"    TTFT             {result.avg_ttft_ms:8.2f}")
-    print(f"    JCT (E2EL)       {result.avg_jct_ms:8.2f}")
-    print(f"    ITL (mean)       {result.avg_itl_ms:8.2f}")
-    print(f"    first ITL        {result.avg_first_itl_ms:8.2f}  "
+    print(f"    TTFT              {result.avg_ttft_ms:8.2f}")
+    print(f"    JCT (E2EL)        {result.avg_jct_ms:8.2f}")
+    print(f"    ITL (mean)        {result.avg_itl_ms:8.2f}")
+    print(f"    first ITL         {result.avg_first_itl_ms:8.2f}  "
           "(incl. decode startup)")
-    print(f"    decode total     {result.avg_decode_total_ms:8.2f}  "
-          "(sum of all ITLs = first→last token)")
-    print(f"    decode steady    {result.avg_decode_steady_ms:8.2f}  "
+    print(f"    decode total      {result.avg_decode_total_ms:8.2f}  "
+          "(first → last token)")
+    print(f"    decode steady     {result.avg_decode_steady_ms:8.2f}  "
           "(sum of non-first ITLs)")
     if has_server:
-        print(f"    Prefill          {result.avg_prefill_ms:8.2f}")
-        print(f"    KV total         {result.avg_kv_total_ms:8.2f}")
-        print(f"    KV exposed       {result.avg_kv_exposed_ms:8.2f}")
+        print(f"    Prefill           {result.avg_prefill_ms:8.2f}  "
+              "(t_prefill_end − t_prefill_start, cuda-synced)")
+        print(f"    KV save           {result.avg_kv_save_ms:8.2f}  "
+              "(prefill: t_kv_start → t_kv_mnck_in_end)")
+        print(f"    KV gap            {result.avg_kv_gap_ms:8.2f}  "
+              "(t_kv_mnck_in_end → t_kv_mnck_out_start)")
+        print(f"    KV load           {result.avg_kv_load_ms:8.2f}  "
+              "(decode: t_kv_mnck_out_start → t_kv_end, cuda-synced)")
+        print(f"    KV total          {result.avg_kv_total_ms:8.2f}  "
+              "(t_kv_start → t_kv_end, end-to-end)")
     print("=" * 60)
 
 
@@ -610,12 +691,20 @@ def main():
                         help="Tag for result filename")
 
     # Server-side metrics: comma-separated list of JSONL sources.
-    # Each source is "local:/path" or "ssh:user@host:/path". Content is
-    # merged by adapter req_id and matched to client results by prefix.
+    # Each source is "local:/path" or "ssh:user@host:/path". Producer
+    # JSONL is written by prefill workers; consumer JSONL by decode
+    # workers. Both are merged by adapter req_id and matched to the
+    # client's server_id by prefix.
     parser.add_argument(
         "--metrics-sources", type=str,
-        default="local:/home/zeyu/lmcache_metrics.jsonl,"
-                "ssh:zeyu@lj1.zeyu.tw:/home/zeyu/lmcache_metrics.jsonl",
+        default=(
+            # producer (prefill) — this node + node-1
+            "local:/home/zeyu/lmcache_metrics_producer.jsonl,"
+            "ssh:zeyu@lj1.zeyu.tw:/home/zeyu/lmcache_metrics_producer.jsonl,"
+            # consumer (decode) — node-2 + node-3
+            "ssh:zeyu@lj2.zeyu.tw:/home/zeyu/lmcache_metrics_consumer.jsonl,"
+            "ssh:zeyu@lj3.zeyu.tw:/home/zeyu/lmcache_metrics_consumer.jsonl"
+        ),
         help="Comma-separated list of JSONL metric sources "
              "(local:/path or ssh:user@host:/path). Empty to disable.",
     )
