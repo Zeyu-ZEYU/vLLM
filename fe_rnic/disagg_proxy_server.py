@@ -120,13 +120,18 @@ async def lifespan(app: FastAPI):
         if dec_rdma_hosts:
             rdma_host = dec_rdma_hosts[i % len(dec_rdma_hosts)]
 
+        # Use keyword arguments to avoid positional-order bugs:
+        # ClientInfo field order is (client, host, rdma_host, init_port,
+        # alloc_port); passing positional by mistake put init_ports into
+        # rdma_host which then propagated as a bogus preferred_segment
+        # to Mooncake — silently breaking KV Put on prefill.
         app.state.decode_clients.append(
             ClientInfo(
-                decode_client,
-                host,
-                init_ports,
-                alloc_ports,
-                rdma_host,
+                client=decode_client,
+                host=host,
+                rdma_host=rdma_host,
+                init_port=init_ports,
+                alloc_port=alloc_ports,
             )
         )
 
@@ -136,11 +141,12 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: Close clients
-    for client in app.state.prefill_clients:
-        await client.aclose()
-    for client in app.state.decode_clients:
-        await client.aclose()
+    # Shutdown: Close clients — ClientInfo wraps httpx.AsyncClient,
+    # so we must close the inner .client attribute, not the wrapper.
+    for info in app.state.prefill_clients:
+        await info.client.aclose()
+    for info in app.state.decode_clients:
+        await info.client.aclose()
 
     global run_proxy
     run_proxy = False
