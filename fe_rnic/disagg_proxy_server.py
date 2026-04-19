@@ -478,6 +478,19 @@ async def handle_completions(request: Request):
                     if k in pf_params:
                         server_metrics[k] = pf_params[k]
 
+            # t_dec_req_sent: capture the wall-clock instant the proxy
+            # is about to dispatch the decode HTTP POST. Stamped just
+            # before yielding head_chunk (which is itself immediately
+            # followed by the stream_service_response call that writes
+            # the decode request to the wire) — the delta between this
+            # stamp and the actual HTTP send is sub-ms.
+            #
+            # Piggy-backed through head_chunk.server_metrics so the
+            # client (benchmark.py) gets it with chunk 1 and can
+            # compute d_1st_tbt = t_2nd_token_recv - t_dec_req_sent.
+            t_dec_req_sent = time.time()
+            server_metrics["t_dec_req_sent"] = t_dec_req_sent
+
             head_chunk = {
                 "id": prefill_output["id"],
                 "object": "text_completion",

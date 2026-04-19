@@ -36,134 +36,196 @@ import numpy as np
 
 @dataclass
 class RequestResult:
+    """Per-request timings, organized around the user's metric spec.
+
+    Naming conventions:
+      - ``t_*``  = epoch-seconds wall-clock timestamps (single instant)
+      - ``d_*``  = millisecond durations derived from two ``t_*`` values
+
+    Clock skew across the 4 nodes is NTP-bounded to <1ms (verified via
+    chrony), so cross-node subtraction (e.g. client's t_2nd_token_recv
+    minus decode-server's t_kv_end) is valid at the low-ms precision
+    we care about.
+    """
+
     req_id: int
     prompt_len: int
     output_tokens: int = 0
-    ttft: float = 0.0    # seconds
+    ttft: float = 0.0    # seconds (legacy; equals d_ttft_ms/1000)
     itl: list[float] = field(default_factory=list)  # inter-token latencies
-    jct: float = 0.0     # job completion time (seconds)
+    jct: float = 0.0     # job completion time (seconds; = d_jct_ms/1000)
     server_id: str = ""   # completion id returned by proxy (cmpl-...)
-    # Server-side wall-clock timestamps (epoch seconds). Producer side
-    # fills t_prefill_*, t_kv_start, t_kv_mnck_in_end; consumer side
-    # fills t_kv_mnck_out_start, t_kv_end. All six are absolute so we
-    # can join across prefill and decode nodes.
-    t_prefill_start: float = 0.0
-    t_prefill_end: float = 0.0
-    t_kv_start: float = 0.0
-    t_kv_mnck_in_end: float = 0.0
-    t_kv_mnck_out_start: float = 0.0
-    t_kv_end: float = 0.0
-    # Client-side wall-clock timestamps (epoch seconds). Captured when
-    # each streamed chunk arrives at the benchmark. In PD-disagg the
-    # first streamed chunk carries prefill's sampled token (TTFT); the
-    # second chunk onwards is decode's steady output — so
-    # ``t_decode_first`` ≈ when decode's first iteration finishes and
-    # its output reaches the client, and ``t_decode_end`` ≈ when decode
-    # emits its last token. Clock-synced via NTP (<1ms skew across
-    # nodes) so they can be subtracted from server-side timestamps like
-    # ``t_kv_end`` to derive decode-phase durations.
-    t_decode_first: float = 0.0
-    t_decode_end: float = 0.0
+
+    # ── Prefill / KV timestamps (server-side) ───────────────────────
+    # Filled by LMCache adapter via producer JSONL on prefill node and
+    # consumer JSONL on decode node, then joined by req_id.
+    t_prefill_start: float = 0.0     # before first CUDA kernel of model forward
+    t_prefill_end: float = 0.0       # after forward, cuda.synchronize()-ed
+    t_kv_start: float = 0.0          # prefill dispatches KV save (CPU event)
+    t_kv_mnck_in_end: float = 0.0    # all KV chunks landed in Mooncake segment
+    t_kv_mnck_out_start: float = 0.0 # decode begins fetching from Mooncake
+    t_kv_end: float = 0.0            # all KV copied to decode GPU; load_stream.synchronize()-ed
+
+    # ── Client-side timestamps (benchmark.py, NTP-synced) ───────────
+    t_req_sent: float = 0.0          # benchmark about to HTTP-POST the request
+    t_1st_token_recv: float = 0.0    # chunk 1 arrived (prefill's sampled token)
+    t_2nd_token_recv: float = 0.0    # chunk 2 arrived (decode's first produced token)
+    t_decode_end: float = 0.0        # last chunk arrived at client
+
+    # ── Proxy-side timestamp (piggy-backed via head_chunk server_metrics) ─
+    t_dec_req_sent: float = 0.0      # proxy dispatched decode HTTP POST
+
     kv_mode: str = ""     # "layerwise" or "non_layerwise"
     success: bool = True
     error: str = ""
 
-    # Derived intervals (ms); computed after joining producer+consumer
-    # JSONLs to the client result.
-    @property
-    def prefill_ms(self) -> float:
-        return max(0.0, (self.t_prefill_end - self.t_prefill_start) * 1000)
-
-    @property
-    def kv_save_ms(self) -> float:
-        """Prefill side: t_kv_start → t_kv_mnck_in_end.
-        Includes GPU→CPU offload + Mooncake Put (local segment or RDMA
-        WRITE to remote).
-        """
-        return max(0.0, (self.t_kv_mnck_in_end - self.t_kv_start) * 1000)
-
-    @property
-    def kv_gap_ms(self) -> float:
-        """Between prefill's Put-CQE and decode's start-load-kv.
-        Contains prefill response serialization + proxy dispatch +
-        decode scheduler + decode forward entry.
-        """
-        return max(0.0, (self.t_kv_mnck_out_start - self.t_kv_mnck_in_end) * 1000)
-
-    @property
-    def kv_load_ms(self) -> float:
-        """Decode side: t_kv_mnck_out_start → t_kv_end.
-        Includes Mooncake Get (RDMA READ cross-node or local) +
-        CPU→GPU memcpy. Measured up to cuda-sync after last load.
-        """
-        return max(0.0, (self.t_kv_end - self.t_kv_mnck_out_start) * 1000)
-
-    @property
-    def kv_total_ms(self) -> float:
-        """End-to-end KV: t_kv_start on prefill → t_kv_end on decode."""
-        return max(0.0, (self.t_kv_end - self.t_kv_start) * 1000)
+    # ═══════════════════════════════════════════════════════════════
+    #  Derived durations (ms). All named ``d_<metric>_ms``.
+    # ═══════════════════════════════════════════════════════════════
 
     @property
     def num_decode_tokens(self) -> int:
-        """Number of tokens produced by the DECODE side.
+        """Tokens produced by the decode side.
 
         PD-disagg flow: proxy forces prefill's ``max_tokens=1`` (so it
-        samples and returns exactly one token — the first token that
-        the client sees via ``choices[0].text``). Decode is then asked
-        for ``original_max_tokens - 1`` tokens. The streamed chunk
-        sequence is therefore (prefill-token, decode-token1, decode-
-        token2, ...), which means the client sees
+        samples and returns exactly one token — the first token the
+        client sees via ``choices[0].text``). Decode is then asked for
+        ``original_max_tokens - 1`` tokens. So
         ``output_tokens = 1 + num_decode_tokens``.
         """
         return max(0, self.output_tokens - 1)
 
+    # ── Prefill / KV durations ──────────────────────────────────────
+
     @property
-    def d_tbt_first_ms(self) -> float:
-        """First TBT: t_kv_end → t_decode_first.
+    def d_prefill_ms(self) -> float:
+        """Prefill compute: t_prefill_end − t_prefill_start."""
+        return max(0.0, (self.t_prefill_end - self.t_prefill_start) * 1000)
 
-        From the moment decode has finished loading all layers of KV
-        (t_kv_end) to the moment its first produced token reaches the
-        client (t_decode_first). Named d_tbt_first because it's the
-        "TBT" (time between tokens) for the very first decode token:
-        anchored at t_kv_end on the decode node rather than the
-        previous token at the client, to isolate decode-side behavior
-        from the prefill→KV→decode transition.
-
-        In NO-OVERLAP this equals the first decode forward pass
-        duration (decode cannot start until all KV loaded). Should
-        then be ≈ steady-state d_tbt if decode has no first-iter
-        overhead.
-
-        In LAYERWISE OVERLAP, t_kv_end fires AFTER decode's compute
-        stream has already been running (load_stream feeds compute
-        layer-by-layer), so d_tbt_first captures only the tail of
-        the first forward pass — typically << d_tbt.
+    @property
+    def d_kv_mnck_in_ms(self) -> float:
+        """KV into Mooncake: t_kv_mnck_in_end − t_kv_start.
+        GPU→CPU offload + Mooncake Put (local segment or RDMA WRITE to
+        the decode segment's `preferred_segment`).
         """
-        if self.t_decode_first <= 0 or self.t_kv_end <= 0:
-            return 0.0
-        return max(0.0, (self.t_decode_first - self.t_kv_end) * 1000)
+        return max(0.0, (self.t_kv_mnck_in_end - self.t_kv_start) * 1000)
 
     @property
-    def d_tbt_ms(self) -> float:
-        """Average decode time-between-tokens: spans t_kv_end →
-        t_decode_end over all ``num_decode_tokens`` tokens produced by
-        decode. This is the best estimate of decode's steady-state
-        forward-pass cadence; compare against client-side
-        ``mean(itl[1:])`` (which excludes the transition ITL).
+    def d_kv_mnck_ms(self) -> float:
+        """Dwell in Mooncake segment: t_kv_mnck_out_start − t_kv_mnck_in_end.
+        Includes prefill→proxy response + proxy→decode HTTP dispatch +
+        decode scheduler pickup + first Get call entry.
         """
-        if self.t_decode_end <= 0 or self.t_kv_end <= 0:
-            return 0.0
-        n = self.num_decode_tokens
-        if n <= 0:
-            return 0.0
-        return max(0.0, (self.t_decode_end - self.t_kv_end) * 1000 / n)
+        return max(0.0, (self.t_kv_mnck_out_start - self.t_kv_mnck_in_end) * 1000)
 
     @property
-    def d_decode_total_ms(self) -> float:
-        """Total decode-phase span (t_kv_end → t_decode_end)."""
+    def d_kv_mnck_out_ms(self) -> float:
+        """KV out of Mooncake: t_kv_end − t_kv_mnck_out_start.
+        Mooncake Get (RDMA READ cross-node) + CPU→GPU H2D memcpy.
+        Measured up to ``load_stream.synchronize()``.
+        """
+        return max(0.0, (self.t_kv_end - self.t_kv_mnck_out_start) * 1000)
+
+    @property
+    def d_total_kv_ms(self) -> float:
+        """End-to-end KV: d_kv_mnck_in + d_kv_mnck + d_kv_mnck_out
+        (== t_kv_end − t_kv_start).
+        """
+        return max(0.0, (self.t_kv_end - self.t_kv_start) * 1000)
+
+    @property
+    def d_total_kv_no_mnck_ms(self) -> float:
+        """KV transfer only: d_kv_mnck_in + d_kv_mnck_out (no dwell)."""
+        return max(0.0, self.d_kv_mnck_in_ms + self.d_kv_mnck_out_ms)
+
+    @property
+    def d_exposed_kv_ms(self) -> float:
+        """KV time exposed on critical path: t_kv_end − t_prefill_end.
+        In no-overlap this equals d_total_kv (t_kv_start == t_prefill_end).
+        In overlap it's less, because KV save starts during prefill.
+        """
+        return max(0.0, (self.t_kv_end - self.t_prefill_end) * 1000)
+
+    @property
+    def d_exposed_kv_no_mnck_ms(self) -> float:
+        """Exposed KV minus dwell: only the actual transfer latency
+        that sits on the critical path.
+        """
+        return max(0.0, self.d_exposed_kv_ms - self.d_kv_mnck_ms)
+
+    # ── Client-visible latency ──────────────────────────────────────
+
+    @property
+    def d_ttft_ms(self) -> float:
+        """Time to first token: t_1st_token_recv − t_req_sent."""
+        if self.t_1st_token_recv <= 0 or self.t_req_sent <= 0:
+            return 0.0
+        return max(0.0, (self.t_1st_token_recv - self.t_req_sent) * 1000)
+
+    @property
+    def d_jct_ms(self) -> float:
+        """Job completion: t_decode_end − t_req_sent."""
+        if self.t_decode_end <= 0 or self.t_req_sent <= 0:
+            return 0.0
+        return max(0.0, (self.t_decode_end - self.t_req_sent) * 1000)
+
+    @property
+    def d_jct_no_prefill_q_ms(self) -> float:
+        """JCT without prefill queueing: t_decode_end − t_prefill_start."""
+        if self.t_decode_end <= 0 or self.t_prefill_start <= 0:
+            return 0.0
+        return max(0.0, (self.t_decode_end - self.t_prefill_start) * 1000)
+
+    # ── Decode-phase TBT metrics ────────────────────────────────────
+
+    @property
+    def d_1st_tbt_ms(self) -> float:
+        """First TBT with proxy anchor: t_2nd_token_recv − t_dec_req_sent.
+        Covers: decode HTTP in-flight + decode scheduler + KV transfer
+        + first decode forward pass + decode→proxy→client response.
+        Structurally symmetric with d_ttft (req-sent → token-recv).
+        """
+        if self.t_2nd_token_recv <= 0 or self.t_dec_req_sent <= 0:
+            return 0.0
+        return max(0.0, (self.t_2nd_token_recv - self.t_dec_req_sent) * 1000)
+
+    @property
+    def d_1st_tbt_no_kv_ms(self) -> float:
+        """First TBT without KV transfer: t_2nd_token_recv − t_kv_end.
+
+        Anchored at decode's "KV fully on GPU" moment rather than at
+        the proxy's decode-request dispatch, so it isolates the
+        duration of decode's first forward pass + response-back
+        network. Should be ≈ d_tbt in no-overlap (first iter ≈ steady)
+        but << d_tbt in layerwise overlap (t_kv_end fires after
+        compute has been running layer-by-layer, capturing only the
+        tail).
+        """
+        if self.t_2nd_token_recv <= 0 or self.t_kv_end <= 0:
+            return 0.0
+        return max(0.0, (self.t_2nd_token_recv - self.t_kv_end) * 1000)
+
+    @property
+    def d_decode_ms(self) -> float:
+        """Decode phase: t_decode_end − t_kv_end.
+        t_decode_start == t_kv_end by definition (decode can't start
+        before KV is on GPU). So this is the decode-only span, no KV
+        transfer time included.
+        """
         if self.t_decode_end <= 0 or self.t_kv_end <= 0:
             return 0.0
         return max(0.0, (self.t_decode_end - self.t_kv_end) * 1000)
+
+    @property
+    def d_tbt_ms(self) -> float:
+        """Average TBT across decode tokens: d_decode / num_decode_tokens.
+        The (N-1) segments are: (t_kv_end → t_2nd_token_recv) and the
+        (N-2) inter-decode-token gaps. Averaged over all N-1.
+        """
+        n = self.num_decode_tokens
+        if n <= 0:
+            return 0.0
+        return self.d_decode_ms / n
 
 
 PCTL_KEYS = ("p25", "p50", "p75", "p90", "p95", "p99")
@@ -191,60 +253,46 @@ class BenchmarkResult:
     # TTFT — Time To First Token (ms)
     ttft: dict  # {p25, p50, p75, p90, p95, p99}
 
-    # ITL — Inter-Token Latency / TBT (ms)
-    itl: dict   # {p25, p50, p75, p90, p95, p99}
+    # vLLM-convention reference metrics (client-side percentiles)
+    #  - ttft should match d_ttft
+    #  - itl  should approximate d_tbt (includes KV transfer on itl[0])
+    #  - e2el should match d_jct
+    ttft: dict = field(default_factory=dict)
+    itl: dict = field(default_factory=dict)
+    e2el: dict = field(default_factory=dict)
 
-    # E2EL — End-to-End Latency / JCT (ms)
-    e2el: dict  # {p25, p50, p75, p90, p95, p99}
+    # Input / output token counts
+    avg_output_tokens: float = 0.0
+    avg_input_tokens: float = 0.0
 
-    # Server-side breakdown (ms), percentiles
-    prefill_time: dict   # {p25..p99}
-    kv_save_time: dict   # {p25..p99} t_kv_start → t_kv_mnck_in_end (prefill)
-    kv_gap_time: dict    # {p25..p99} t_kv_mnck_in_end → t_kv_mnck_out_start
-    kv_load_time: dict   # {p25..p99} t_kv_mnck_out_start → t_kv_end (decode)
-    kv_total_time: dict  # {p25..p99} t_kv_start → t_kv_end end-to-end
-
-    # Decode
-    avg_output_tokens: float
-    avg_input_tokens: float
-
-    # Means (in ms) — handy for sanity checking small runs.
-    avg_ttft_ms: float = 0.0
-    avg_jct_ms: float = 0.0
-    avg_itl_ms: float = 0.0
-    avg_prefill_ms: float = 0.0
-    avg_kv_save_ms: float = 0.0
-    avg_kv_gap_ms: float = 0.0
-    avg_kv_load_ms: float = 0.0
-    avg_kv_total_ms: float = 0.0
-    # Decode-side: the first ITL is special — it includes decode startup
-    # (proxy→decode HTTP, Mooncake Get of KV, first decode forward,
-    # sampler). `decode_steady_ms` is sum of ITLs excluding the first.
-    # `decode_total_ms` is sum of all ITLs = first→last token.
-    avg_first_itl_ms: float = 0.0
-    avg_decode_total_ms: float = 0.0
-    avg_decode_steady_ms: float = 0.0
-    # Decode-phase derived from (client-side t_decode_{first,end}) vs
-    # (server-side t_kv_end). These cross-node deltas rely on the
-    # NTP-synced clocks; earlier chrony checks showed <1ms skew.
+    # ── Mean of each duration metric (ms) ──────────────────────────
     #
-    #   d_tbt_first    = t_decode_first − t_kv_end
-    #       → first decode-token TBT, anchored at t_kv_end rather
-    #         than the previous (prefill-sampled) token. Should be
-    #         ≈ d_tbt in no-overlap if decode has no first-iter
-    #         overhead. In overlap it's << d_tbt (t_kv_end fires
-    #         after compute has already begun layer-by-layer).
+    # Naming: ``avg_<metric>_ms`` where ``<metric>`` is the exact
+    # name from the user spec (d_prefill, d_ttft, d_kv_mnck_in, ...).
+    # Percentiles are omitted for now — single-request runs dominate
+    # the test matrix, so mean is the only meaningful statistic.
     #
-    #   d_tbt          = (t_decode_end − t_kv_end) / num_decode_tokens
-    #       → average time-between-tokens during decode. Compare with
-    #         client-side ``itl_steady_ms`` (mean of itl[1:], i.e.
-    #         excluding the transition ITL which covers KV transfer).
-    #
-    #   itl_steady_ms  = mean(itl[1:]) in ms, client-side only.
-    avg_d_tbt_first_ms: float = 0.0
+    # Prefill / KV
+    avg_d_prefill_ms: float = 0.0
+    avg_d_kv_mnck_in_ms: float = 0.0
+    avg_d_kv_mnck_ms: float = 0.0
+    avg_d_kv_mnck_out_ms: float = 0.0
+    avg_d_total_kv_ms: float = 0.0
+    avg_d_total_kv_no_mnck_ms: float = 0.0
+    avg_d_exposed_kv_ms: float = 0.0
+    avg_d_exposed_kv_no_mnck_ms: float = 0.0
+    # Client-visible
+    avg_d_ttft_ms: float = 0.0
+    avg_d_jct_ms: float = 0.0
+    avg_d_jct_no_prefill_q_ms: float = 0.0
+    # TBT family
+    avg_d_1st_tbt_ms: float = 0.0
+    avg_d_1st_tbt_no_kv_ms: float = 0.0
+    avg_d_decode_ms: float = 0.0
     avg_d_tbt_ms: float = 0.0
-    avg_d_decode_total_ms: float = 0.0
-    avg_itl_steady_ms: float = 0.0
+    # Reference (client-side, vLLM convention)
+    avg_itl_ms: float = 0.0
+    avg_itl_steady_ms: float = 0.0   # mean(itl[1:]) — cross-check for d_tbt
 
     # Raw per-request data
     requests: list[dict] = field(default_factory=list)
@@ -300,6 +348,11 @@ async def send_request(
         # delta without another time.time() call per chunk.
         t_start = time.perf_counter()
         t_start_epoch = time.time()
+        # t_req_sent: the "user client sent the request" moment. We
+        # stamp just BEFORE session.post() returns the response header,
+        # which is the closest we can get in aiohttp to "wire send
+        # begins" without hooking the transport.
+        result.t_req_sent = t_start_epoch
         async with session.post(
             f"{url}/v1/completions",
             json=payload,
@@ -317,13 +370,17 @@ async def send_request(
                 now_perf = time.perf_counter()
                 token_times.append(now_perf)
                 token_epochs.append(t_start_epoch + (now_perf - t_start))
-                # Capture server completion id from first chunk
+                # Capture completion id + proxy-side t_dec_req_sent
+                # from chunk 1's server_metrics payload.
                 if first_chunk:
                     first_chunk = False
                     try:
                         chunk_data = json.loads(data_str)
                         result.server_id = chunk_data.get("id", "")
-                    except (json.JSONDecodeError, KeyError):
+                        sm = chunk_data.get("server_metrics") or {}
+                        if "t_dec_req_sent" in sm:
+                            result.t_dec_req_sent = float(sm["t_dec_req_sent"])
+                    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                         pass
 
         t_end = time.perf_counter()
@@ -342,11 +399,12 @@ async def send_request(
         ]
         # Decode-phase boundaries (epoch seconds, NTP-synced to
         # server-side t_kv_end etc.). The first streamed chunk is
-        # prefill's sampled token (via ret_first_tok); decode starts
-        # at the SECOND streamed chunk.
+        # prefill's sampled token (via ret_first_tok); decode's first
+        # produced token is chunk 2.
+        result.t_1st_token_recv = token_epochs[0]
         result.t_decode_end = token_epochs[-1]
         if len(token_epochs) >= 2:
-            result.t_decode_first = token_epochs[1]
+            result.t_2nd_token_recv = token_epochs[1]
 
     except Exception as e:
         result.success = False
@@ -743,63 +801,42 @@ async def run_benchmark(args) -> BenchmarkResult:
 
     if not completed:
         print("ERROR: All requests failed!")
-        empty = {k: 0.0 for k in PCTL_KEYS}
         return BenchmarkResult(
             num_requests=args.num_requests,
             num_completed=0, num_failed=len(failed),
             total_time=total_time, rps=0,
-            ttft=empty, itl=empty, e2el=empty,
-            prefill_time=empty, kv_save_time=empty, kv_gap_time=empty,
-            kv_load_time=empty, kv_total_time=empty,
-            avg_output_tokens=0, avg_input_tokens=0,
         )
 
-    ttfts = [r.ttft * 1000 for r in completed]  # ms
-    e2els = [r.jct * 1000 for r in completed]    # ms
-    all_itls = []
+    # vLLM-convention references (client-only, no server metrics needed)
+    ttfts_ms = [r.ttft * 1000 for r in completed]
+    e2els_ms = [r.jct * 1000 for r in completed]
+    all_itls_ms = []
     for r in completed:
-        all_itls.extend([x * 1000 for x in r.itl])  # ms
-
-    # Only include requests where BOTH producer and consumer records
-    # arrived — otherwise derived intervals are meaningless.
-    def _has_full(r: RequestResult) -> bool:
-        return r.t_prefill_start > 0 and r.t_kv_end > 0
-
-    ok = [r for r in completed if _has_full(r)]
-    prefill_vals = [r.prefill_ms for r in ok]
-    kv_save_vals = [r.kv_save_ms for r in ok]
-    kv_gap_vals = [r.kv_gap_ms for r in ok]
-    kv_load_vals = [r.kv_load_ms for r in ok]
-    kv_total_vals = [r.kv_total_ms for r in ok]
-
-    # Decode-side ITL breakdown per request (ms)
-    first_itl_vals = [r.itl[0] * 1000 for r in completed if r.itl]
-    decode_total_vals = [sum(r.itl) * 1000 for r in completed if r.itl]
-    decode_steady_vals = [
-        sum(r.itl[1:]) * 1000 for r in completed if len(r.itl) > 1
-    ]
-    # Client-side steady-state mean ITL (skip the first ITL which
-    # spans the prefill→decode transition and KV transfer).
+        all_itls_ms.extend([x * 1000 for x in r.itl])
     itl_steady_means = [
         sum(r.itl[1:]) * 1000 / len(r.itl[1:])
         for r in completed if len(r.itl) > 1
     ]
-    # Decode-phase cross-node deltas. Only computed on requests that
-    # captured both t_kv_end (consumer JSONL) and t_decode_* (client).
-    d_tbt_first_vals = [
-        r.d_tbt_first_ms for r in ok
-        if r.t_decode_first > 0 and r.d_tbt_first_ms > 0
-    ]
-    d_tbt_vals = [
-        r.d_tbt_ms for r in ok
-        if r.t_decode_end > 0 and r.d_tbt_ms > 0
-    ]
-    d_decode_total_vals = [
-        r.d_decode_total_ms for r in ok
-        if r.t_decode_end > 0 and r.d_decode_total_ms > 0
-    ]
 
-    def _mean(xs):
+    # Only include requests where BOTH producer JSONL, consumer JSONL
+    # and proxy t_dec_req_sent arrived — otherwise d_* are meaningless.
+    def _has_full(r: RequestResult) -> bool:
+        return (r.t_prefill_start > 0 and r.t_kv_end > 0
+                and r.t_req_sent > 0)
+
+    ok = [r for r in completed if _has_full(r)]
+
+    def _collect(attr: str, pred=None) -> list:
+        """Collect a per-request duration only when the timestamps
+        feeding it exist (property returns 0 otherwise)."""
+        vals = []
+        for r in ok:
+            v = getattr(r, attr)
+            if v > 0:
+                vals.append(v)
+        return vals
+
+    def _mean(xs) -> float:
         return float(np.mean(xs)) if xs else 0.0
 
     result = BenchmarkResult(
@@ -809,40 +846,37 @@ async def run_benchmark(args) -> BenchmarkResult:
         total_time=total_time,
         rps=len(completed) / total_time if total_time > 0 else 0,
 
-        ttft=_pcts(ttfts),
-        itl=_pcts(all_itls),
-        e2el=_pcts(e2els),
-
-        prefill_time=_pcts(prefill_vals),
-        kv_save_time=_pcts(kv_save_vals),
-        kv_gap_time=_pcts(kv_gap_vals),
-        kv_load_time=_pcts(kv_load_vals),
-        kv_total_time=_pcts(kv_total_vals),
+        ttft=_pcts(ttfts_ms),
+        itl=_pcts(all_itls_ms),
+        e2el=_pcts(e2els_ms),
 
         avg_output_tokens=float(np.mean([r.output_tokens for r in completed])),
         avg_input_tokens=float(np.mean([r.prompt_len for r in completed])),
 
-        avg_ttft_ms=_mean(ttfts),
-        avg_jct_ms=_mean(e2els),
-        avg_itl_ms=_mean(all_itls),
-        avg_prefill_ms=_mean(prefill_vals),
-        avg_kv_save_ms=_mean(kv_save_vals),
-        avg_kv_gap_ms=_mean(kv_gap_vals),
-        avg_kv_load_ms=_mean(kv_load_vals),
-        avg_kv_total_ms=_mean(kv_total_vals),
-        avg_first_itl_ms=_mean(first_itl_vals),
-        avg_decode_total_ms=_mean(decode_total_vals),
-        avg_decode_steady_ms=_mean(decode_steady_vals),
-        avg_d_tbt_first_ms=_mean(d_tbt_first_vals),
-        avg_d_tbt_ms=_mean(d_tbt_vals),
-        avg_d_decode_total_ms=_mean(d_decode_total_vals),
+        # Prefill / KV
+        avg_d_prefill_ms=_mean(_collect("d_prefill_ms")),
+        avg_d_kv_mnck_in_ms=_mean(_collect("d_kv_mnck_in_ms")),
+        avg_d_kv_mnck_ms=_mean(_collect("d_kv_mnck_ms")),
+        avg_d_kv_mnck_out_ms=_mean(_collect("d_kv_mnck_out_ms")),
+        avg_d_total_kv_ms=_mean(_collect("d_total_kv_ms")),
+        avg_d_total_kv_no_mnck_ms=_mean(_collect("d_total_kv_no_mnck_ms")),
+        avg_d_exposed_kv_ms=_mean(_collect("d_exposed_kv_ms")),
+        avg_d_exposed_kv_no_mnck_ms=_mean(_collect("d_exposed_kv_no_mnck_ms")),
+        # Client-visible
+        avg_d_ttft_ms=_mean(_collect("d_ttft_ms")),
+        avg_d_jct_ms=_mean(_collect("d_jct_ms")),
+        avg_d_jct_no_prefill_q_ms=_mean(_collect("d_jct_no_prefill_q_ms")),
+        # TBT family
+        avg_d_1st_tbt_ms=_mean(_collect("d_1st_tbt_ms")),
+        avg_d_1st_tbt_no_kv_ms=_mean(_collect("d_1st_tbt_no_kv_ms")),
+        avg_d_decode_ms=_mean(_collect("d_decode_ms")),
+        avg_d_tbt_ms=_mean(_collect("d_tbt_ms")),
+        # Reference
+        avg_itl_ms=_mean(all_itls_ms),
         avg_itl_steady_ms=_mean(itl_steady_means),
 
         requests=[asdict(r) for r in results],
-        joined_rows=[
-            r for r in completed
-            if r.t_prefill_start > 0 and r.t_kv_end > 0
-        ],
+        joined_rows=ok,
     )
 
     return result
@@ -861,96 +895,98 @@ def print_results(result: BenchmarkResult):
     print(f"  Avg output:   {result.avg_output_tokens:.0f} tokens")
     print()
     def _fmt(d: dict) -> str:
-        return "  ".join(f"{k.upper()}={d[k]:.1f}" for k in PCTL_KEYS)
+        if not d:
+            return "  ".join(f"{k.upper()}=0.0" for k in PCTL_KEYS)
+        return "  ".join(f"{k.upper()}={d.get(k, 0.0):.1f}" for k in PCTL_KEYS)
 
-    print(f"  TTFT (ms):        {_fmt(result.ttft)}")
-    print(f"  ITL  (ms):        {_fmt(result.itl)}")
-    print(f"  E2EL (ms):        {_fmt(result.e2el)}")
-    has_server = any(v > 0 for v in result.kv_total_time.values())
-    if has_server:
-        print(f"  Prefill  (ms):    {_fmt(result.prefill_time)}")
-        print(f"  KV save  (ms):    {_fmt(result.kv_save_time)}")
-        print(f"  KV gap   (ms):    {_fmt(result.kv_gap_time)}")
-        print(f"  KV load  (ms):    {_fmt(result.kv_load_time)}")
-        print(f"  KV total (ms):    {_fmt(result.kv_total_time)}")
-    else:
+    # vLLM-convention references (client-only, always available)
+    print(f"  TTFT  (ms):       {_fmt(result.ttft)}")
+    print(f"  ITL   (ms):       {_fmt(result.itl)}")
+    print(f"  E2EL  (ms):       {_fmt(result.e2el)}")
+
+    has_server = result.avg_d_total_kv_ms > 0
+    if not has_server:
         print("  (Server-side KV metrics: no joined producer+consumer "
               "records — check metrics_sources)")
     print()
-    print("  Averages (ms):")
-    print(f"    TTFT              {result.avg_ttft_ms:8.2f}  "
-          "(client → first streamed chunk; chunk 1 = prefill's "
-          "sampled token via ret_first_tok)")
-    print(f"    JCT (E2EL)        {result.avg_jct_ms:8.2f}")
-    print(f"    ITL (mean)        {result.avg_itl_ms:8.2f}  "
-          "(client-side, ALL inter-chunk gaps incl. ITL[0] which "
-          "spans prefill→KV→decode transition)")
-    print(f"    ITL steady mean   {result.avg_itl_steady_ms:8.2f}  "
-          "(client-side, mean(itl[1:]) — decode steady state)")
-    print(f"    first ITL         {result.avg_first_itl_ms:8.2f}  "
-          "(incl. decode startup + KV transfer)")
-    print(f"    decode total      {result.avg_decode_total_ms:8.2f}  "
-          "(first → last token)")
-    print(f"    decode steady     {result.avg_decode_steady_ms:8.2f}  "
-          "(sum of non-first ITLs)")
+    print("  Averages (ms) — per user spec (t_*/d_* naming):")
+    # ── Prefill / KV ────────────────────────────────────────────────
+    print(f"    d_prefill              {result.avg_d_prefill_ms:9.2f}  "
+          "(t_prefill_end − t_prefill_start, cuda-synced)")
+    print(f"    d_kv_mnck_in           {result.avg_d_kv_mnck_in_ms:9.2f}  "
+          "(t_kv_start → t_kv_mnck_in_end: GPU→CPU + Mooncake Put)")
+    print(f"    d_kv_mnck              {result.avg_d_kv_mnck_ms:9.2f}  "
+          "(t_kv_mnck_in_end → t_kv_mnck_out_start: dwell in Mooncake)")
+    print(f"    d_kv_mnck_out          {result.avg_d_kv_mnck_out_ms:9.2f}  "
+          "(t_kv_mnck_out_start → t_kv_end: Mooncake Get + CPU→GPU)")
+    print(f"    d_total_kv             {result.avg_d_total_kv_ms:9.2f}  "
+          "(t_kv_start → t_kv_end: in + dwell + out)")
+    print(f"    d_total_kv_no_mnck     {result.avg_d_total_kv_no_mnck_ms:9.2f}  "
+          "(in + out only, excludes dwell)")
+    print(f"    d_exposed_kv           {result.avg_d_exposed_kv_ms:9.2f}  "
+          "(t_kv_end − t_prefill_end; = d_total_kv in no-overlap)")
+    print(f"    d_exposed_kv_no_mnck   "
+          f"{result.avg_d_exposed_kv_no_mnck_ms:9.2f}  "
+          "(d_exposed_kv − d_kv_mnck)")
+    # ── Client-visible ──────────────────────────────────────────────
+    print(f"    d_ttft                 {result.avg_d_ttft_ms:9.2f}  "
+          "(t_1st_token_recv − t_req_sent)")
+    print(f"    d_jct                  {result.avg_d_jct_ms:9.2f}  "
+          "(t_decode_end − t_req_sent)")
+    print(f"    d_jct_no_prefill_q     "
+          f"{result.avg_d_jct_no_prefill_q_ms:9.2f}  "
+          "(t_decode_end − t_prefill_start)")
+    # ── TBT family ──────────────────────────────────────────────────
+    print(f"    d_1st_tbt              {result.avg_d_1st_tbt_ms:9.2f}  "
+          "(t_2nd_token_recv − t_dec_req_sent: proxy-anchored)")
+    print(f"    d_1st_tbt_no_kv        {result.avg_d_1st_tbt_no_kv_ms:9.2f}  "
+          "(t_2nd_token_recv − t_kv_end: ≈ d_tbt in no-overlap)")
+    print(f"    d_decode               {result.avg_d_decode_ms:9.2f}  "
+          "(t_decode_end − t_kv_end: decode-only, no KV transfer)")
+    print(f"    d_tbt                  {result.avg_d_tbt_ms:9.2f}  "
+          "(d_decode / num_decode_tokens)")
+    # ── Reference (client-side vLLM) ────────────────────────────────
+    print(f"    ITL mean (all)         {result.avg_itl_ms:9.2f}  "
+          "(client-side, includes ITL[0])")
+    print(f"    ITL mean (steady)      {result.avg_itl_steady_ms:9.2f}  "
+          "(mean(itl[1:]); cross-check for d_tbt)")
+
     if has_server:
-        print(f"    Prefill           {result.avg_prefill_ms:8.2f}  "
-              "(t_prefill_end − t_prefill_start, cuda-synced)")
-        print(f"    d_mnck_in         {result.avg_kv_save_ms:8.2f}  "
-              "(prefill GPU→CPU→RDMA-write done: "
-              "t_kv_start → t_mnck_in_end)")
-        print(f"    d_mnck            {result.avg_kv_gap_ms:8.2f}  "
-              "(dwell in Mooncake segment: "
-              "t_mnck_in_end → t_mnck_out_start)")
-        print(f"    d_mnck_out        {result.avg_kv_load_ms:8.2f}  "
-              "(decode Mooncake→CPU→GPU done: "
-              "t_mnck_out_start → t_kv_end, cuda-synced)")
-        print(f"    KV total          {result.avg_kv_total_ms:8.2f}  "
-              "(t_kv_start → t_kv_end, end-to-end)")
-        print(f"    d_tbt_first       {result.avg_d_tbt_first_ms:8.2f}  "
-              "(t_kv_end → t_decode_first: first decode-token TBT, "
-              "anchored at decode's KV-ready rather than prefill's "
-              "sampled token at client)")
-        print(f"    d_tbt             {result.avg_d_tbt_ms:8.2f}  "
-              "(avg decode TBT: (t_decode_end − t_kv_end) / "
-              "num_decode_tokens)")
-        print(f"    d_decode_total    {result.avg_d_decode_total_ms:8.2f}  "
-              "(t_kv_end → t_decode_end: decode phase total)")
         # Per-request raw timestamps for analysis. Only shown when the
         # joined metric set is small (<= 10 requests) so the output
         # stays readable. Millisecond-resolution deltas from a common
-        # baseline (t_prefill_start of the first completed request).
+        # baseline (t_req_sent of the first completed request).
         joined = [r for r in result.joined_rows] if hasattr(result, "joined_rows") else []
         if joined and len(joined) <= 10:
-            t0 = joined[0].t_prefill_start
+            t0 = joined[0].t_req_sent or joined[0].t_prefill_start
             print()
-            print("  Per-request timeline (ms from first t_prefill_start):")
-            hdr = ("    {:>4}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  "
-                   "{:>9}  {:>9}  {:>9}")
+            print("  Per-request timeline (ms from t_req_sent of req 0):")
+            hdr = ("    {:>3}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  "
+                   "{:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}")
             print(hdr.format(
-                "#", "t_pre_s", "t_pre_e", "t_kv_s", "t_in_end",
-                "t_out_st", "t_kv_e", "t_dec_1", "t_dec_e",
+                "#", "t_req_s", "t_pre_s", "t_pre_e", "t_kv_s",
+                "t_in_end", "t_out_st", "t_kv_e", "t_1st_r",
+                "t_dec_s", "t_2nd_r", "t_dec_e",
             ))
-            row = ("    {:>4}  {:9.2f}  {:9.2f}  {:9.2f}  {:9.2f}  "
-                   "{:9.2f}  {:9.2f}  {:>9}  {:>9}")
+            row = ("    {:>3}  {:8.1f}  {:8.1f}  {:8.1f}  {:8.1f}  "
+                   "{:8.1f}  {:8.1f}  {:8.1f}  {:>8}  {:>8}  {:>8}  "
+                   "{:>8}")
+            def _fmt_t(t):
+                return f"{(t - t0) * 1000:8.1f}" if t > 0 else "       -"
             for idx, r in enumerate(joined):
-                dec_1 = (
-                    f"{(r.t_decode_first - t0) * 1000:9.2f}"
-                    if r.t_decode_first > 0 else "       -"
-                )
-                dec_e = (
-                    f"{(r.t_decode_end - t0) * 1000:9.2f}"
-                    if r.t_decode_end > 0 else "       -"
-                )
                 print(row.format(
                     idx,
+                    (r.t_req_sent - t0) * 1000 if r.t_req_sent > 0 else 0.0,
                     (r.t_prefill_start - t0) * 1000,
                     (r.t_prefill_end - t0) * 1000,
                     (r.t_kv_start - t0) * 1000,
                     (r.t_kv_mnck_in_end - t0) * 1000,
                     (r.t_kv_mnck_out_start - t0) * 1000,
                     (r.t_kv_end - t0) * 1000,
-                    dec_1, dec_e,
+                    _fmt_t(r.t_1st_token_recv),
+                    _fmt_t(r.t_dec_req_sent),
+                    _fmt_t(r.t_2nd_token_recv),
+                    _fmt_t(r.t_decode_end),
                 ))
     print("=" * 60)
 
