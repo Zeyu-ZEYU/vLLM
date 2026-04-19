@@ -55,6 +55,21 @@ cleanup_node() {
         killed=$((killed + $(echo "$zombie_pids" | wc -w)))
     fi
 
+    # 最后兜底: 根据 nvidia-smi 找任何还占 GPU 显存的进程，强杀。
+    # 这是兜底的兜底 —— 有时上面 pgrep/ps 模式匹配不到 Ray 派生的
+    # python 子进程（进程名只是 "python3.13" 没有独特标志），但它们
+    # 依然持着 CUDA ctx。这种 orphan 不杀，下次 `vllm serve` 申请显存
+    # 会被现有占用挤爆甚至直接失败。
+    if command -v nvidia-smi &>/dev/null; then
+        local gpu_pids
+        gpu_pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d '[:space:]' | tr -s ',' '\n' | grep -E '^[0-9]+$' || true)
+        if [[ -n "$gpu_pids" ]]; then
+            echo "  杀掉 [GPU memory holders from nvidia-smi]: $(echo $gpu_pids | wc -w) 个"
+            echo "$gpu_pids" | xargs -r kill -9 2>/dev/null || true
+            killed=$((killed + $(echo "$gpu_pids" | wc -w)))
+        fi
+    fi
+
     # 清理 Ray
     if command -v ray &>/dev/null; then
         echo "  停止 Ray..."
