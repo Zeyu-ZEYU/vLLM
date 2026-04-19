@@ -276,13 +276,36 @@ def _fetch_metrics_source(source: str) -> str:
     return ""
 
 
+def _normalize_metric_req_id(rid: str) -> str:
+    """Normalize to vLLM's two-segment completion id form
+    ``cmpl-<hex>``. vLLM's internal Request.req_id is actually
+    ``cmpl-<hex>-<rank>-<uuid>`` (four dash-separated parts; e.g.
+    ``cmpl-b2dae2d7d6089fe7-0-beea237f``). The client's first streaming
+    chunk ``id`` is the two-part prefix. Consumer JSONL (after the
+    proxy correlation_id fix) writes the two-part form directly;
+    producer JSONL writes the full four-part form. Collapsing both to
+    two parts lets ``collect_server_metrics`` merge them under a single
+    key.
+    """
+    if rid is None or not rid.startswith("cmpl-"):
+        return rid
+    parts = rid.split("-")
+    if len(parts) >= 2:
+        return "-".join(parts[:2])
+    return rid
+
+
 def collect_server_metrics(sources: list[str]) -> dict[str, dict]:
-    """Fetch + parse JSONL from all sources; merge by req_id.
+    """Fetch + parse JSONL from all sources; merge by normalized req_id.
 
     Producer and consumer JSONLs carry disjoint field sets (producer:
     t_prefill_*, t_kv_start, t_kv_mnck_in_end; consumer:
     t_kv_mnck_out_start, t_kv_end). Merging by ``dict.update`` keeps
     both sides' fields on the same req_id entry.
+
+    The normalization step ensures that old producer JSONLs (with the
+    long 'cmpl-<hex>-dp<N>-<uuid>' form) still join with new consumer
+    JSONLs (short 'cmpl-<hex>' form from proxy correlation_id).
     """
     entries: dict[str, dict] = {}
     for src in sources:
@@ -295,11 +318,15 @@ def collect_server_metrics(sources: list[str]) -> dict[str, dict]:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            rid = rec.get("req_id")
-            if not rid:
+            raw_rid = rec.get("req_id")
+            if not raw_rid:
                 continue
+            rid = _normalize_metric_req_id(raw_rid)
             existing = entries.setdefault(rid, {"req_id": rid})
             existing.update(rec)
+            # Overwrite the stored req_id with the normalized form
+            # (rec.update above may have re-written it from the file).
+            existing["req_id"] = rid
     return entries
 
 
