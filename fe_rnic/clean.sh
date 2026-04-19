@@ -76,6 +76,14 @@ cleanup_node() {
         ray stop --force 2>/dev/null || true
     fi
 
+    # 清理 /tmp/ray GCS 持久状态
+    # `ray stop` 只停进程，不删 session_* 目录。残留的 session 会让下次
+    # ray start --head 认为上次的 placement group / actor 还活着，从而
+    # 在 vLLM 启动时报 "Created 24 DP placement groups, expected 16"
+    # (前一次没清干净的 DP workers 留下的 placement group count 累加到了
+    # 这次的)。所以一定要 rm -rf /tmp/ray。
+    rm -rf /tmp/ray 2>/dev/null || true
+
     # 清理临时文件
     rm -f /tmp/engine_* 2>/dev/null || true
 
