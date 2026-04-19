@@ -221,6 +221,7 @@ decode)
         --max-num-batched-tokens 10000 \
         --max-num-seqs 256 \
         --gpu-memory-utilization 0.9 \
+        --no-enable-prefix-caching \
         --kv-transfer-config "$DEC_KV_CONFIG"
     ;;
 
