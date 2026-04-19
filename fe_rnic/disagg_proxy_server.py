@@ -425,6 +425,15 @@ async def handle_completions(request: Request):
         req_data["max_tokens"] = org_max_tokens - 1
         req_data["prompt"].append(prefill_output["kv_transfer_params"]["first_tok"])
         req_data.pop("kv_transfer_params")
+        # Inject the PREFILL completion id as a correlation_id for the
+        # decode request. This is the same id the client sees in its
+        # first streaming chunk and the same id that shows up as the
+        # prefix of the producer-side JSONL's req_id. By having decode's
+        # adapter tag its consumer-side JSONL with this id too, the
+        # benchmark can join producer+consumer by a single key.
+        req_data["kv_transfer_params"] = {
+            "correlation_id": prefill_output["id"],
+        }
         req_data["stream"] = True
         if stream_options is not None:
             req_data["stream_options"] = stream_options
@@ -550,6 +559,12 @@ async def handle_chat_completions(request: Request):
         req_data["prompt"].append(prefill_output["kv_transfer_params"]["first_tok"])
 
         req_data.pop("kv_transfer_params")
+        # Inject correlation_id = prefill's completion id so decode's
+        # adapter can write consumer JSONL with the same key as the
+        # client's first-chunk id (matches producer JSONL via prefix).
+        req_data["kv_transfer_params"] = {
+            "correlation_id": prefill_output["id"],
+        }
         req_data["stream"] = True
         if stream_options is not None:
             req_data["stream_options"] = stream_options
