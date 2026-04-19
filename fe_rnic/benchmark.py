@@ -155,6 +155,11 @@ class BenchmarkResult:
     # Raw per-request data
     requests: list[dict] = field(default_factory=list)
 
+    # Per-request rows (RequestResult) joined with server-side metrics.
+    # Populated for small runs so print_results can show raw t_*/d_*
+    # timestamps for manual inspection.
+    joined_rows: list = field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # Request sender
@@ -163,12 +168,17 @@ class BenchmarkResult:
 async def send_request(
     session: aiohttp.ClientSession,
     url: str,
-    prompt: str,
+    prompt,
     max_tokens: int,
     model: str,
     req_id: int,
 ) -> RequestResult:
-    """Send a streaming completions request and collect timing."""
+    """Send a streaming completions request and collect timing.
+
+    `prompt` may be a string or a list of token IDs. When a list is
+    supplied, the proxy skips its /tokenize step and we know exactly
+    how many tokens go in.
+    """
     payload = {
         "prompt": prompt,
         "max_tokens": max_tokens,
@@ -176,7 +186,11 @@ async def send_request(
         "stream": True,
     }
 
-    result = RequestResult(req_id=req_id, prompt_len=len(prompt.split()))
+    if isinstance(prompt, list):
+        prompt_len = len(prompt)
+    else:
+        prompt_len = len(prompt.split())
+    result = RequestResult(req_id=req_id, prompt_len=prompt_len)
     token_times: list[float] = []
 
     try:
@@ -232,16 +246,79 @@ async def send_request(
 # ---------------------------------------------------------------------------
 
 def generate_synthetic_prompt(input_len: int) -> str:
-    """Generate a synthetic prompt of approximately input_len tokens."""
-    # Use repeating words to approximate token count (1 word ≈ 1-1.5 tokens)
-    words = [
-        "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
-        "and", "cat", "sat", "on", "mat", "in", "big", "red", "house",
-    ]
-    # Approximate: 1 word ≈ 1.3 tokens, so generate more words
-    num_words = int(input_len * 0.85)
-    prompt_words = [random.choice(words) for _ in range(num_words)]
-    return " ".join(prompt_words)
+    """Generate a *deterministic* synthetic prompt whose length is
+    approximately input_len tokens. Used only when the caller cannot
+    pre-tokenize. Callers that need exact token count should use
+    ``generate_exact_token_prompt`` (falls back to hitting the server's
+    /tokenize endpoint once).
+    """
+    # Deterministic: same seed word repeated, no random.choice.
+    num_words = max(1, int(input_len * 0.85))
+    return " ".join(["hello"] * num_words)
+
+
+def generate_exact_token_prompt(
+    url: str, input_len: int, model: str,
+    tokenize_cache: dict | None = None,
+) -> list[int]:
+    """Return a list of exactly ``input_len`` token IDs by calling the
+    server's /tokenize endpoint once and slicing the result.
+
+    We build a long deterministic seed string (no randomness), tokenize
+    it, and return the first ``input_len`` token IDs. If the seed
+    tokenizes to fewer tokens than requested, we double the seed and
+    retry. The list is cached per (input_len) in ``tokenize_cache`` so
+    repeated calls don't hit the server.
+
+    The returned list goes straight into the /v1/completions request
+    body as ``prompt`` — the proxy detects a list prompt and skips its
+    own /tokenize round trip, so the exact count arrives at prefill.
+    """
+    if tokenize_cache is not None and input_len in tokenize_cache:
+        return tokenize_cache[input_len]
+
+    import urllib.request
+
+    seed_word = "hello"
+    # Start with ~1 word per token; grow seed until we have >= input_len.
+    # Prepend a length-specific salt so different input_len values do NOT
+    # share a common token prefix — otherwise decode's local prefix
+    # cache (enable_prefix_caching=True by default) hits on the shared
+    # prefix and short-circuits the Mooncake retrieve we are trying to
+    # measure, leaving consumer JSONL empty for the longer sequences.
+    words_factor = 2
+    while True:
+        num_words = max(input_len * words_factor, 16)
+        salt = f"length_{input_len}_marker "
+        seed = salt + " ".join([seed_word] * num_words)
+        req = urllib.request.Request(
+            f"{url}/tokenize",
+            data=json.dumps({
+                "prompt": seed,
+                "model": model,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode())
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to call /tokenize at {url}: {e}"
+            )
+        tokens = body.get("tokens") or body.get("input_ids") or []
+        if len(tokens) >= input_len:
+            exact = tokens[:input_len]
+            if tokenize_cache is not None:
+                tokenize_cache[input_len] = exact
+            return exact
+        # Seed too short, expand and retry.
+        words_factor *= 2
+        if words_factor > 1024:
+            raise RuntimeError(
+                f"Could not produce {input_len} tokens from seed expansion "
+                f"(max factor {words_factor})"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -382,21 +459,25 @@ def attach_server_metrics(
 async def _send_warmup(
     session: aiohttp.ClientSession, url: str, model: str,
     input_len: int, max_tokens: int, count: int,
+    prompt=None,
 ) -> None:
     """Fire ``count`` warmup requests and await completion.
 
     Results are discarded. Used to get past cold-start autotuning and
     first-request compilation so the measured run sees steady-state
-    timing.
+    timing. ``prompt`` can be a pre-tokenized list (exact input_len)
+    or None (falls back to deterministic string of approx length).
     """
     if count <= 0:
         return
     print(f"Warmup: {count} requests (input~{input_len}, out={max_tokens}) ...")
+    if prompt is None:
+        prompt = generate_synthetic_prompt(input_len)
     tasks = [
         asyncio.create_task(
             send_request(
                 session, url,
-                generate_synthetic_prompt(input_len),
+                prompt,
                 max_tokens, model, -(i + 1),
             )
         )
@@ -447,8 +528,19 @@ async def run_benchmark(args) -> BenchmarkResult:
                 max_tokens_list.append(req.get("max_tokens", args.max_tokens))
         args.num_requests = len(prompts)
     elif args.synthetic:
-        for _ in range(args.num_requests):
-            prompts.append(generate_synthetic_prompt(args.input_len))
+        if args.exact_tokens:
+            # Same token list for every request — fully deterministic
+            # and exact input_len. Cached per input_len.
+            cache: dict = {}
+            tok_list = generate_exact_token_prompt(
+                args.url, args.input_len, args.model,
+                tokenize_cache=cache,
+            )
+            print(f"  Synthetic input (exact): {len(tok_list)} tokens")
+            prompts = [tok_list for _ in range(args.num_requests)]
+        else:
+            for _ in range(args.num_requests):
+                prompts.append(generate_synthetic_prompt(args.input_len))
     elif args.prompt:
         prompts = [args.prompt] * args.num_requests
     else:
@@ -481,9 +573,16 @@ async def run_benchmark(args) -> BenchmarkResult:
         if args.warmup > 0:
             warm_input_len = args.input_len if args.synthetic else 512
             warm_max_tokens = args.max_tokens
+            # Reuse the same exact token list for warmup so proxy
+            # skips /tokenize there too, and the warmup hits the same
+            # exact prefill path as the measured run.
+            warm_prompt = prompts[0] if (
+                args.synthetic and args.exact_tokens and prompts
+            ) else None
             await _send_warmup(
                 session, args.url, args.model,
                 warm_input_len, warm_max_tokens, args.warmup,
+                prompt=warm_prompt,
             )
             if args.metrics_sources:
                 srcs = [s.strip() for s in args.metrics_sources.split(",")
@@ -602,6 +701,10 @@ async def run_benchmark(args) -> BenchmarkResult:
         avg_decode_steady_ms=_mean(decode_steady_vals),
 
         requests=[asdict(r) for r in results],
+        joined_rows=[
+            r for r in completed
+            if r.t_prefill_start > 0 and r.t_kv_end > 0
+        ],
     )
 
     return result
@@ -649,14 +752,41 @@ def print_results(result: BenchmarkResult):
     if has_server:
         print(f"    Prefill           {result.avg_prefill_ms:8.2f}  "
               "(t_prefill_end − t_prefill_start, cuda-synced)")
-        print(f"    KV save           {result.avg_kv_save_ms:8.2f}  "
-              "(prefill: t_kv_start → t_kv_mnck_in_end)")
-        print(f"    KV gap            {result.avg_kv_gap_ms:8.2f}  "
-              "(t_kv_mnck_in_end → t_kv_mnck_out_start)")
-        print(f"    KV load           {result.avg_kv_load_ms:8.2f}  "
-              "(decode: t_kv_mnck_out_start → t_kv_end, cuda-synced)")
+        print(f"    d_mnck_in         {result.avg_kv_save_ms:8.2f}  "
+              "(prefill GPU→CPU→RDMA-write done: "
+              "t_kv_start → t_mnck_in_end)")
+        print(f"    d_mnck            {result.avg_kv_gap_ms:8.2f}  "
+              "(dwell in Mooncake segment: "
+              "t_mnck_in_end → t_mnck_out_start)")
+        print(f"    d_mnck_out        {result.avg_kv_load_ms:8.2f}  "
+              "(decode Mooncake→CPU→GPU done: "
+              "t_mnck_out_start → t_kv_end, cuda-synced)")
         print(f"    KV total          {result.avg_kv_total_ms:8.2f}  "
               "(t_kv_start → t_kv_end, end-to-end)")
+        # Per-request raw timestamps for analysis. Only shown when the
+        # joined metric set is small (<= 10 requests) so the output
+        # stays readable. Millisecond-resolution deltas from a common
+        # baseline (t_prefill_start of the first completed request).
+        joined = [r for r in result.joined_rows] if hasattr(result, "joined_rows") else []
+        if joined and len(joined) <= 10:
+            t0 = joined[0].t_prefill_start
+            print()
+            print("  Per-request timeline (ms from first t_prefill_start):")
+            hdr = "    {:>4}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}"
+            print(hdr.format(
+                "#", "t_pre_s", "t_pre_e", "t_kv_s", "t_in_end", "t_out_st", "t_kv_e"
+            ))
+            row = "    {:>4}  {:9.2f}  {:9.2f}  {:9.2f}  {:9.2f}  {:9.2f}  {:9.2f}"
+            for idx, r in enumerate(joined):
+                print(row.format(
+                    idx,
+                    (r.t_prefill_start - t0) * 1000,
+                    (r.t_prefill_end - t0) * 1000,
+                    (r.t_kv_start - t0) * 1000,
+                    (r.t_kv_mnck_in_end - t0) * 1000,
+                    (r.t_kv_mnck_out_start - t0) * 1000,
+                    (r.t_kv_end - t0) * 1000,
+                ))
     print("=" * 60)
 
 
@@ -705,7 +835,14 @@ def main():
     parser.add_argument("--synthetic", action="store_true",
                         help="Use synthetic prompts")
     parser.add_argument("--input-len", type=int, default=1024,
-                        help="Approximate input length in tokens (with --synthetic)")
+                        help="Input length in tokens (with --synthetic). "
+                             "With --exact-tokens the value is exact.")
+    parser.add_argument("--exact-tokens", action="store_true",
+                        help="Pre-tokenize via server /tokenize and pass "
+                             "a token list to /v1/completions so the "
+                             "prompt is exactly --input-len tokens (no "
+                             "random, no approximation). Requires the "
+                             "proxy to skip /tokenize for list prompts.")
     parser.add_argument("--prompt", type=str, default=None,
                         help="Fixed prompt to use for all requests")
     parser.add_argument("--dataset", type=str, default=None,

@@ -12,7 +12,7 @@ import os
 import time
 
 # Third Party
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 import httpx
 import msgspec
@@ -372,6 +372,28 @@ def pick_up_clients(request: Request) -> tuple[ClientInfo, ClientInfo, ClientInf
     return round_robin_pick_clients()
 
 
+@app.post("/tokenize")
+async def handle_tokenize(request: Request):
+    """Forward /tokenize to the prefiller.
+
+    The benchmark uses this when --exact-tokens is set: it tokenizes a
+    seed string via the proxy, slices the result to exactly input_len,
+    then sends the token list back on /v1/completions (where we skip
+    the proxy's own /tokenize round trip).
+    """
+    try:
+        body = await request.json()
+        tokenization_client, _, _ = pick_up_clients(request)
+        resp = await send_request_to_service(
+            tokenization_client.client, "/tokenize", body
+        )
+        return resp.json()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/v1/completions")
 async def handle_completions(request: Request):
     global counter, stats_calculator
@@ -385,13 +407,20 @@ async def handle_completions(request: Request):
         # Pick tokenization, prefill and decode client
         tokenization_client, prefill_client, decode_client = pick_up_clients(request)
 
-        tokenize_output = await send_request_to_service(
-            tokenization_client.client, "/tokenize", {"prompt": req_data["prompt"]}
-        )
-        tokenize_output = tokenize_output.json()
+        # If the client already sent a list of token IDs (benchmark's
+        # --exact-tokens path), skip the server-side /tokenize round
+        # trip and use the list as-is. This lets the caller control
+        # prefill's exact token count deterministically.
+        if isinstance(req_data.get("prompt"), list):
+            pass
+        else:
+            tokenize_output = await send_request_to_service(
+                tokenization_client.client, "/tokenize", {"prompt": req_data["prompt"]}
+            )
+            tokenize_output = tokenize_output.json()
+            req_data["prompt"] = tokenize_output["tokens"]
 
         org_max_tokens = req_data["max_tokens"]
-        req_data["prompt"] = tokenize_output["tokens"]
         req_data["max_tokens"] = 1
 
         disagg_spec = {
