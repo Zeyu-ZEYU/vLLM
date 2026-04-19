@@ -53,6 +53,17 @@ class RequestResult:
     t_kv_mnck_in_end: float = 0.0
     t_kv_mnck_out_start: float = 0.0
     t_kv_end: float = 0.0
+    # Client-side wall-clock timestamps (epoch seconds). Captured when
+    # each streamed chunk arrives at the benchmark. In PD-disagg the
+    # first streamed chunk carries prefill's sampled token (TTFT); the
+    # second chunk onwards is decode's steady output — so
+    # ``t_decode_first`` ≈ when decode's first iteration finishes and
+    # its output reaches the client, and ``t_decode_end`` ≈ when decode
+    # emits its last token. Clock-synced via NTP (<1ms skew across
+    # nodes) so they can be subtracted from server-side timestamps like
+    # ``t_kv_end`` to derive decode-phase durations.
+    t_decode_first: float = 0.0
+    t_decode_end: float = 0.0
     kv_mode: str = ""     # "layerwise" or "non_layerwise"
     success: bool = True
     error: str = ""
@@ -91,6 +102,68 @@ class RequestResult:
     def kv_total_ms(self) -> float:
         """End-to-end KV: t_kv_start on prefill → t_kv_end on decode."""
         return max(0.0, (self.t_kv_end - self.t_kv_start) * 1000)
+
+    @property
+    def num_decode_tokens(self) -> int:
+        """Number of tokens produced by the DECODE side.
+
+        PD-disagg flow: proxy forces prefill's ``max_tokens=1`` (so it
+        samples and returns exactly one token — the first token that
+        the client sees via ``choices[0].text``). Decode is then asked
+        for ``original_max_tokens - 1`` tokens. The streamed chunk
+        sequence is therefore (prefill-token, decode-token1, decode-
+        token2, ...), which means the client sees
+        ``output_tokens = 1 + num_decode_tokens``.
+        """
+        return max(0, self.output_tokens - 1)
+
+    @property
+    def d_tbt_first_ms(self) -> float:
+        """First TBT: t_kv_end → t_decode_first.
+
+        From the moment decode has finished loading all layers of KV
+        (t_kv_end) to the moment its first produced token reaches the
+        client (t_decode_first). Named d_tbt_first because it's the
+        "TBT" (time between tokens) for the very first decode token:
+        anchored at t_kv_end on the decode node rather than the
+        previous token at the client, to isolate decode-side behavior
+        from the prefill→KV→decode transition.
+
+        In NO-OVERLAP this equals the first decode forward pass
+        duration (decode cannot start until all KV loaded). Should
+        then be ≈ steady-state d_tbt if decode has no first-iter
+        overhead.
+
+        In LAYERWISE OVERLAP, t_kv_end fires AFTER decode's compute
+        stream has already been running (load_stream feeds compute
+        layer-by-layer), so d_tbt_first captures only the tail of
+        the first forward pass — typically << d_tbt.
+        """
+        if self.t_decode_first <= 0 or self.t_kv_end <= 0:
+            return 0.0
+        return max(0.0, (self.t_decode_first - self.t_kv_end) * 1000)
+
+    @property
+    def d_tbt_ms(self) -> float:
+        """Average decode time-between-tokens: spans t_kv_end →
+        t_decode_end over all ``num_decode_tokens`` tokens produced by
+        decode. This is the best estimate of decode's steady-state
+        forward-pass cadence; compare against client-side
+        ``mean(itl[1:])`` (which excludes the transition ITL).
+        """
+        if self.t_decode_end <= 0 or self.t_kv_end <= 0:
+            return 0.0
+        n = self.num_decode_tokens
+        if n <= 0:
+            return 0.0
+        return max(0.0, (self.t_decode_end - self.t_kv_end) * 1000 / n)
+
+    @property
+    def d_decode_total_ms(self) -> float:
+        """Total decode-phase span (t_kv_end → t_decode_end)."""
+        if self.t_decode_end <= 0 or self.t_kv_end <= 0:
+            return 0.0
+        return max(0.0, (self.t_decode_end - self.t_kv_end) * 1000)
 
 
 PCTL_KEYS = ("p25", "p50", "p75", "p90", "p95", "p99")
@@ -151,6 +224,27 @@ class BenchmarkResult:
     avg_first_itl_ms: float = 0.0
     avg_decode_total_ms: float = 0.0
     avg_decode_steady_ms: float = 0.0
+    # Decode-phase derived from (client-side t_decode_{first,end}) vs
+    # (server-side t_kv_end). These cross-node deltas rely on the
+    # NTP-synced clocks; earlier chrony checks showed <1ms skew.
+    #
+    #   d_tbt_first    = t_decode_first − t_kv_end
+    #       → first decode-token TBT, anchored at t_kv_end rather
+    #         than the previous (prefill-sampled) token. Should be
+    #         ≈ d_tbt in no-overlap if decode has no first-iter
+    #         overhead. In overlap it's << d_tbt (t_kv_end fires
+    #         after compute has already begun layer-by-layer).
+    #
+    #   d_tbt          = (t_decode_end − t_kv_end) / num_decode_tokens
+    #       → average time-between-tokens during decode. Compare with
+    #         client-side ``itl_steady_ms`` (mean of itl[1:], i.e.
+    #         excluding the transition ITL which covers KV transfer).
+    #
+    #   itl_steady_ms  = mean(itl[1:]) in ms, client-side only.
+    avg_d_tbt_first_ms: float = 0.0
+    avg_d_tbt_ms: float = 0.0
+    avg_d_decode_total_ms: float = 0.0
+    avg_itl_steady_ms: float = 0.0
 
     # Raw per-request data
     requests: list[dict] = field(default_factory=list)
@@ -191,10 +285,21 @@ async def send_request(
     else:
         prompt_len = len(prompt.split())
     result = RequestResult(req_id=req_id, prompt_len=prompt_len)
+    # Parallel lists: ``token_times`` uses perf_counter (high-res
+    # monotonic, used for TTFT/ITL/JCT durations). ``token_epochs``
+    # uses wall-clock time.time() of the same instant, used to join
+    # with server-side epoch timestamps (t_kv_end etc.) on other
+    # nodes via NTP sync. Pair them so we don't call time.time()
+    # twice per chunk (would double the jitter).
     token_times: list[float] = []
+    token_epochs: list[float] = []
 
     try:
+        # Anchor: capture both clocks at the same instant so we can
+        # reconstruct each chunk's epoch time from its perf_counter
+        # delta without another time.time() call per chunk.
         t_start = time.perf_counter()
+        t_start_epoch = time.time()
         async with session.post(
             f"{url}/v1/completions",
             json=payload,
@@ -209,7 +314,9 @@ async def send_request(
                 data_str = line_str[6:]
                 if data_str == "[DONE]":
                     break
-                token_times.append(time.perf_counter())
+                now_perf = time.perf_counter()
+                token_times.append(now_perf)
+                token_epochs.append(t_start_epoch + (now_perf - t_start))
                 # Capture server completion id from first chunk
                 if first_chunk:
                     first_chunk = False
@@ -233,6 +340,13 @@ async def send_request(
             token_times[i] - token_times[i - 1]
             for i in range(1, len(token_times))
         ]
+        # Decode-phase boundaries (epoch seconds, NTP-synced to
+        # server-side t_kv_end etc.). The first streamed chunk is
+        # prefill's sampled token (via ret_first_tok); decode starts
+        # at the SECOND streamed chunk.
+        result.t_decode_end = token_epochs[-1]
+        if len(token_epochs) >= 2:
+            result.t_decode_first = token_epochs[1]
 
     except Exception as e:
         result.success = False
@@ -664,6 +778,26 @@ async def run_benchmark(args) -> BenchmarkResult:
     decode_steady_vals = [
         sum(r.itl[1:]) * 1000 for r in completed if len(r.itl) > 1
     ]
+    # Client-side steady-state mean ITL (skip the first ITL which
+    # spans the prefill→decode transition and KV transfer).
+    itl_steady_means = [
+        sum(r.itl[1:]) * 1000 / len(r.itl[1:])
+        for r in completed if len(r.itl) > 1
+    ]
+    # Decode-phase cross-node deltas. Only computed on requests that
+    # captured both t_kv_end (consumer JSONL) and t_decode_* (client).
+    d_tbt_first_vals = [
+        r.d_tbt_first_ms for r in ok
+        if r.t_decode_first > 0 and r.d_tbt_first_ms > 0
+    ]
+    d_tbt_vals = [
+        r.d_tbt_ms for r in ok
+        if r.t_decode_end > 0 and r.d_tbt_ms > 0
+    ]
+    d_decode_total_vals = [
+        r.d_decode_total_ms for r in ok
+        if r.t_decode_end > 0 and r.d_decode_total_ms > 0
+    ]
 
     def _mean(xs):
         return float(np.mean(xs)) if xs else 0.0
@@ -699,6 +833,10 @@ async def run_benchmark(args) -> BenchmarkResult:
         avg_first_itl_ms=_mean(first_itl_vals),
         avg_decode_total_ms=_mean(decode_total_vals),
         avg_decode_steady_ms=_mean(decode_steady_vals),
+        avg_d_tbt_first_ms=_mean(d_tbt_first_vals),
+        avg_d_tbt_ms=_mean(d_tbt_vals),
+        avg_d_decode_total_ms=_mean(d_decode_total_vals),
+        avg_itl_steady_ms=_mean(itl_steady_means),
 
         requests=[asdict(r) for r in results],
         joined_rows=[
@@ -740,11 +878,17 @@ def print_results(result: BenchmarkResult):
               "records — check metrics_sources)")
     print()
     print("  Averages (ms):")
-    print(f"    TTFT              {result.avg_ttft_ms:8.2f}")
+    print(f"    TTFT              {result.avg_ttft_ms:8.2f}  "
+          "(client → first streamed chunk; chunk 1 = prefill's "
+          "sampled token via ret_first_tok)")
     print(f"    JCT (E2EL)        {result.avg_jct_ms:8.2f}")
-    print(f"    ITL (mean)        {result.avg_itl_ms:8.2f}")
+    print(f"    ITL (mean)        {result.avg_itl_ms:8.2f}  "
+          "(client-side, ALL inter-chunk gaps incl. ITL[0] which "
+          "spans prefill→KV→decode transition)")
+    print(f"    ITL steady mean   {result.avg_itl_steady_ms:8.2f}  "
+          "(client-side, mean(itl[1:]) — decode steady state)")
     print(f"    first ITL         {result.avg_first_itl_ms:8.2f}  "
-          "(incl. decode startup)")
+          "(incl. decode startup + KV transfer)")
     print(f"    decode total      {result.avg_decode_total_ms:8.2f}  "
           "(first → last token)")
     print(f"    decode steady     {result.avg_decode_steady_ms:8.2f}  "
@@ -763,6 +907,15 @@ def print_results(result: BenchmarkResult):
               "t_mnck_out_start → t_kv_end, cuda-synced)")
         print(f"    KV total          {result.avg_kv_total_ms:8.2f}  "
               "(t_kv_start → t_kv_end, end-to-end)")
+        print(f"    d_tbt_first       {result.avg_d_tbt_first_ms:8.2f}  "
+              "(t_kv_end → t_decode_first: first decode-token TBT, "
+              "anchored at decode's KV-ready rather than prefill's "
+              "sampled token at client)")
+        print(f"    d_tbt             {result.avg_d_tbt_ms:8.2f}  "
+              "(avg decode TBT: (t_decode_end − t_kv_end) / "
+              "num_decode_tokens)")
+        print(f"    d_decode_total    {result.avg_d_decode_total_ms:8.2f}  "
+              "(t_kv_end → t_decode_end: decode phase total)")
         # Per-request raw timestamps for analysis. Only shown when the
         # joined metric set is small (<= 10 requests) so the output
         # stays readable. Millisecond-resolution deltas from a common
@@ -772,12 +925,23 @@ def print_results(result: BenchmarkResult):
             t0 = joined[0].t_prefill_start
             print()
             print("  Per-request timeline (ms from first t_prefill_start):")
-            hdr = "    {:>4}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}"
+            hdr = ("    {:>4}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  "
+                   "{:>9}  {:>9}  {:>9}")
             print(hdr.format(
-                "#", "t_pre_s", "t_pre_e", "t_kv_s", "t_in_end", "t_out_st", "t_kv_e"
+                "#", "t_pre_s", "t_pre_e", "t_kv_s", "t_in_end",
+                "t_out_st", "t_kv_e", "t_dec_1", "t_dec_e",
             ))
-            row = "    {:>4}  {:9.2f}  {:9.2f}  {:9.2f}  {:9.2f}  {:9.2f}  {:9.2f}"
+            row = ("    {:>4}  {:9.2f}  {:9.2f}  {:9.2f}  {:9.2f}  "
+                   "{:9.2f}  {:9.2f}  {:>9}  {:>9}")
             for idx, r in enumerate(joined):
+                dec_1 = (
+                    f"{(r.t_decode_first - t0) * 1000:9.2f}"
+                    if r.t_decode_first > 0 else "       -"
+                )
+                dec_e = (
+                    f"{(r.t_decode_end - t0) * 1000:9.2f}"
+                    if r.t_decode_end > 0 else "       -"
+                )
                 print(row.format(
                     idx,
                     (r.t_prefill_start - t0) * 1000,
@@ -786,6 +950,7 @@ def print_results(result: BenchmarkResult):
                     (r.t_kv_mnck_in_end - t0) * 1000,
                     (r.t_kv_mnck_out_start - t0) * 1000,
                     (r.t_kv_end - t0) * 1000,
+                    dec_1, dec_e,
                 ))
     print("=" * 60)
 
