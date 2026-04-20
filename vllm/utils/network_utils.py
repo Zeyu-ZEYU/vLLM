@@ -335,20 +335,6 @@ def make_zmq_socket(
         socket.setsockopt(zmq.IPV6, 1)
 
     if bind:
-        # Allow bind to a TIME_WAIT'd address (e.g. a previous vllm
-        # serve left ephemeral ports in TIME_WAIT and the next launch
-        # picks one of them). Without REUSEADDR the bind raises
-        # zmq.error.ZMQError: Address already in use and the api
-        # server dies, which cascades to the whole prefill wedging
-        # at N/16 Application-startup-complete. REUSEADDR is NOT a
-        # port-switching retry (which was reverted as a correctness
-        # bug in a8146362d) — the socket still binds to the exact
-        # path we were asked to bind to, no silent remap.
-        try:
-            socket.setsockopt(zmq.REUSEADDR, 1)
-        except zmq.ZMQError:
-            # Some socket types (e.g. inproc) don't support REUSEADDR.
-            pass
         socket.bind(path)
     else:
         socket.connect(path)
