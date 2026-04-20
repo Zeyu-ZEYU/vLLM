@@ -76,6 +76,22 @@ cleanup_node() {
         ray stop --force 2>/dev/null || true
     fi
 
+    # 兜底：`ray stop` 偶尔因为内部 IPC socket 破损不能真正杀掉
+    # raylet/gcs_server，它们会以老的 PID 一直挂着。新 `ray start --head`
+    # 起来以后又"看见"残留进程带进来的 ghost node 记录，ray status
+    # 里就会出现明明只启了一个节点却显示两三个 active 的 node ID。
+    # 这个 ghost node 会让 vLLM DP 的 placement group 调度器算错 GPU
+    # 总数（多半只落到 head node 8 卡），报
+    # "Not enough resources to allocate 16 placement groups,
+    #  only created 8 placement groups"。
+    # 直接 SIGKILL 掉 raylet / gcs_server / default_worker，彻底
+    # 断掉 IPC socket 的持有者，下次 ray start --head 才是真"从零开始"。
+    pkill -9 raylet 2>/dev/null || true
+    pkill -9 -f gcs_server 2>/dev/null || true
+    pkill -9 -f default_worker.py 2>/dev/null || true
+    pkill -9 -f dashboard/agent.py 2>/dev/null || true
+    pkill -9 -f runtime_env/agent/main.py 2>/dev/null || true
+
     # 清理 /tmp/ray GCS 持久状态
     # `ray stop` 只停进程，不删 session_* 目录。残留的 session 会让下次
     # ray start --head 认为上次的 placement group / actor 还活着，从而
