@@ -26,3 +26,10 @@ extra_config:
   local_buffer_size:    4294967296                  # 4 GB per GPU
   transfer_timeout: 10
   save_chunk_meta: False
+  # When KV head-NIC split is enabled, both the tail and head
+  # connectors register segments on the *same* master. Without a
+  # preferred_segment, master can cross-assign a tail put onto a
+  # head segment (registered on mlx5_0) and the tail engine's RDMA
+  # WRITE (mlx5_bond_*) would fail status=6 FAILED. Force local
+  # so the tail client always gets a tail-device segment.
+  mooncake_prefer_local_alloc: true

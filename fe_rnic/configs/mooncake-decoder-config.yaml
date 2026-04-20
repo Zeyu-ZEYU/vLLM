@@ -26,3 +26,5 @@ extra_config:
   local_buffer_size:    4294967296                  # 4 GB per GPU
   transfer_timeout: 10
   save_chunk_meta: False
+  # See prefiller config for rationale — needed when head split is on.
+  mooncake_prefer_local_alloc: true
