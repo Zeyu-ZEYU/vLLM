@@ -23,6 +23,14 @@ cleanup_node() {
         "EngineCore"
         "Worker_DP"
         "lmcache"
+        # ray::RayWorkerWrapper — the actual vLLM DP worker subprocesses
+        # spawned by Ray. They hold the GPU memory. After a crashed prefill
+        # kills the DPCoordinator, these workers get reparented to Ray's
+        # raylet but stay alive (Ray doesn't cascade-kill on leader death).
+        # Without this they survive `clean.sh` and we can't relaunch.
+        "ray::RayWorker"
+        "ray::IDLE"
+        "DPMoEEngineCoreActor"
     )
 
     local killed=0
@@ -91,6 +99,14 @@ cleanup_node() {
     pkill -9 -f default_worker.py 2>/dev/null || true
     pkill -9 -f dashboard/agent.py 2>/dev/null || true
     pkill -9 -f runtime_env/agent/main.py 2>/dev/null || true
+    # Ray autoscaler/_private/monitor.py sometimes outlives ray stop when
+    # a prior `kill -9 gcs_server` orphans it. It points at the dead GCS
+    # address (192.168.0.42:6379 etc.) forever, eating a tiny bit of CPU
+    # and more importantly polluting `ps` so we can't tell stale from live.
+    pkill -9 -f "autoscaler/_private/monitor.py" 2>/dev/null || true
+    # ray/_private/log_monitor.py also outlives `ray stop` when GCS was
+    # killed with -9. Same reasoning as autoscaler monitor above.
+    pkill -9 -f "_private/log_monitor.py" 2>/dev/null || true
 
     # 清理 /tmp/ray GCS 持久状态
     # `ray stop` 只停进程，不删 session_* 目录。残留的 session 会让下次
