@@ -72,6 +72,16 @@ if [[ -n "$output" ]]; then
 fi
 export LMCACHE_USE_EXPERIMENTAL=True
 
+# Mooncake tunable: per-RDMA-op slice size (default 64 KB). Bumping to
+# 1 MB reduces op count by 16× on large KV transfers, which (a) cuts
+# per-op fixed overhead (master RPC queueing, CQE polling, QP RTT) —
+# helpful especially for head (single mlx5_0) where we can't
+# parallelize across HCAs — and (b) lets Mooncake drive each HCA with
+# longer bursts closer to line rate. Tail (8 bonded NICs) benefits less
+# because it's already close to PCIe-bounded. Must be exported BEFORE
+# ray start so all Ray-spawned workers inherit it.
+export MC_SLICE_SIZE="${MC_SLICE_SIZE:-1048576}"
+
 # Head NIC splitting: generate head config if enabled
 ENABLE_HEAD_NIC_SPLIT="${ENABLE_HEAD_NIC_SPLIT:-false}"
 if [[ "$ENABLE_HEAD_NIC_SPLIT" == "true" ]]; then
