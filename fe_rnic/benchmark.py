@@ -763,6 +763,20 @@ async def run_benchmark(args) -> BenchmarkResult:
             # Let any tail callbacks finish before measuring.
             await asyncio.sleep(0.5)
 
+        # Actually gate concurrent in-flight requests. Before, --concurrency
+        # was only a TCP connection-pool hint; send_request tasks were all
+        # created at once and executed in parallel regardless. For
+        # measurements where the user wants strict sequential execution
+        # (concurrency=1, isolating each request's full lifecycle without
+        # queueing interactions) or a fixed max-in-flight window, gate here.
+        sem = asyncio.Semaphore(max(1, args.concurrency))
+
+        async def _gated_send(prompt, max_tok, req_id):
+            async with sem:
+                return await send_request(
+                    session, args.url, prompt, max_tok, args.model, req_id,
+                )
+
         tasks = []
         t_bench_start = time.perf_counter()
 
@@ -773,10 +787,7 @@ async def run_benchmark(args) -> BenchmarkResult:
                 await asyncio.sleep(wait)
 
             task = asyncio.create_task(
-                send_request(
-                    session, args.url, prompts[i],
-                    max_tokens_list[i], args.model, i,
-                )
+                _gated_send(prompts[i], max_tokens_list[i], i)
             )
             tasks.append(task)
 
