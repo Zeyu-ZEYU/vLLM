@@ -14,7 +14,13 @@ chunk_size: 256
 remote_url: "mooncakestore://{MASTER_IP}:50052/"
 remote_serde: "naive"
 local_cpu: False
-max_local_cpu_size: 100
+# 32 GB pinned CPU pool (was 100). Shrunk to keep total per-host
+# pinned memory under host RAM (2 TB) once the head-split path is
+# also enabled: 8 DP workers × (tail + head) × (pool + segment +
+# buffer) at 100 GB / 60 GB was OOM'ing on lj1. 32 GB pool per
+# backend × 2 backends × 8 workers = ~640 GB per host for pools
+# alone, leaves plenty of headroom.
+max_local_cpu_size: 32
 
 extra_config:
   local_hostname: "{LOCAL_RDMA_IP}"
@@ -22,7 +28,7 @@ extra_config:
   protocol: "rdma"
   device_name: "{IB_DEVICES}"                      # mlx5_bond_0,...,mlx5_bond_3
   master_server_address: "{MASTER_IP}:50052"
-  global_segment_size: 64424509440                 # 60 GB (Qwen3-235B KV cache 较大)
+  global_segment_size: 34359738368                 # 32 GB (was 60; see comment above)
   local_buffer_size:    4294967296                  # 4 GB per GPU
   transfer_timeout: 10
   save_chunk_meta: False

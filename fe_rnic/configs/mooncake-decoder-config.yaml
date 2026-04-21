@@ -14,7 +14,9 @@ chunk_size: 256
 remote_url: "mooncakestore://{MASTER_IP}:50052/"
 remote_serde: "naive"
 local_cpu: False
-max_local_cpu_size: 100
+# 32 GB — see prefiller config for rationale (RAM budget when head
+# split is enabled).
+max_local_cpu_size: 32
 
 extra_config:
   local_hostname: "{LOCAL_RDMA_IP}"
@@ -22,7 +24,7 @@ extra_config:
   protocol: "rdma"
   device_name: "{IB_DEVICES}"                      # mlx5_bond_0,...,mlx5_bond_3
   master_server_address: "{MASTER_IP}:50052"
-  global_segment_size: 64424509440                 # 60 GB
+  global_segment_size: 34359738368                 # 32 GB (was 60)
   local_buffer_size:    4294967296                  # 4 GB per GPU
   transfer_timeout: 10
   save_chunk_meta: False

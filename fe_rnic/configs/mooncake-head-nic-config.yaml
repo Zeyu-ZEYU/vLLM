@@ -17,7 +17,7 @@ chunk_size: 256
 remote_url: "mooncakestore://{MASTER_IP}:50053/"
 remote_serde: "naive"
 local_cpu: False
-max_local_cpu_size: 100
+max_local_cpu_size: 32
 
 extra_config:
   local_hostname: "{LOCAL_HEAD_IP}"
@@ -32,17 +32,17 @@ extra_config:
   # us attribute any head-vs-tail performance gap in the "route
   # all chunks to X" experiments to the physical RNIC topology
   # rather than config knobs.
-  global_segment_size: 64424509440                   # 60 GB (matches tail)
+  global_segment_size: 34359738368                   # 32 GB (matches tail)
   local_buffer_size:    4294967296                    # 4 GB (matches tail)
   transfer_timeout: 10
   save_chunk_meta: False
   # LocalCPUBackend pinned CPU pool for the head side. Without this,
-  # _build_head_remote_backend defaults to 4 GB — 25× smaller than the
-  # tail's max_local_cpu_size=100 — which would throttle the head path
-  # in any "route 100% to head" experiment. Set equal to the tail's
+  # _build_head_remote_backend defaults to 4 GB — much smaller than the
+  # tail's max_local_cpu_size — which would throttle the head path in
+  # any "route 100% to head" experiment. Set equal to the tail's
   # max_local_cpu_size so the two backends have symmetric staging
   # capacity.
-  head_local_cpu_size_gb: 100.0
+  head_local_cpu_size_gb: 32.0
   # Defense in depth — even with master isolation, prefer local so puts
   # stay on the issuing node's head segment whenever possible.
   mooncake_prefer_local_alloc: true
