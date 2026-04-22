@@ -59,8 +59,19 @@ class RequestResult:
     # ── Prefill / KV timestamps (server-side) ───────────────────────
     # Filled by LMCache adapter via producer JSONL on prefill node and
     # consumer JSONL on decode node, then joined by req_id.
-    t_prefill_start: float = 0.0     # before first CUDA kernel of model forward
-    t_prefill_end: float = 0.0       # after forward, cuda.synchronize()-ed
+    #
+    # start_load_kv / wait_for_save bound the model forward. Each hook
+    # has its own (start, end) pair so d_prefill_start_load_kv and
+    # d_prefill_wait_for_save can be reported separately.
+    t_prefill_start_load_kv_start: float = 0.0  # entry of start_load_kv
+    t_prefill_start_load_kv_end: float = 0.0    # exit of start_load_kv
+                                                #   (≡ t_prefill_start)
+    t_prefill_wait_for_save_start: float = 0.0  # entry of wait_for_save
+                                                #   (≡ t_prefill_end)
+    t_prefill_wait_for_save_end: float = 0.0    # exit of wait_for_save
+    # Aliases (populated from the above for backward compat).
+    t_prefill_start: float = 0.0     # = t_prefill_start_load_kv_end
+    t_prefill_end: float = 0.0       # = t_prefill_wait_for_save_start
     t_kv_start: float = 0.0          # prefill dispatches KV save (CPU event)
     t_kv_mnck_in_end: float = 0.0    # all KV chunks landed in Mooncake segment
     t_kv_mnck_out_start: float = 0.0 # decode begins fetching from Mooncake
@@ -98,9 +109,39 @@ class RequestResult:
     # ── Prefill / KV durations ──────────────────────────────────────
 
     @property
+    def d_prefill_start_load_kv_ms(self) -> float:
+        """Duration of the ``start_load_kv`` hook itself:
+        t_prefill_start_load_kv_end − t_prefill_start_load_kv_start.
+
+        Includes the cuda.synchronize() drain of the previous iteration's
+        trailing kernels + any per-request Python setup.
+        """
+        return max(0.0, (self.t_prefill_start_load_kv_end
+                         - self.t_prefill_start_load_kv_start) * 1000)
+
+    @property
     def d_prefill_ms(self) -> float:
-        """Prefill compute: t_prefill_end − t_prefill_start."""
+        """Prefill forward wall-clock (CPU view):
+        t_prefill_end − t_prefill_start
+        = t_prefill_wait_for_save_start − t_prefill_start_load_kv_end.
+
+        This is the wall-clock from the moment start_load_kv returned
+        (GPU freshly idle) to the moment wait_for_save was entered.
+        GPU kernels may still be in-flight on return; their drain cost
+        is captured by d_prefill_wait_for_save.
+        """
         return max(0.0, (self.t_prefill_end - self.t_prefill_start) * 1000)
+
+    @property
+    def d_prefill_wait_for_save_ms(self) -> float:
+        """Duration of the ``wait_for_save`` hook itself:
+        t_prefill_wait_for_save_end − t_prefill_wait_for_save_start.
+
+        Includes the cuda.synchronize() drain of trailing forward
+        kernels + lmcache_engine.store() + wait_put_done (RDMA CQE).
+        """
+        return max(0.0, (self.t_prefill_wait_for_save_end
+                         - self.t_prefill_wait_for_save_start) * 1000)
 
     @property
     def d_kv_mnck_in_ms(self) -> float:
@@ -273,7 +314,9 @@ class BenchmarkResult:
     # the test matrix, so mean is the only meaningful statistic.
     #
     # Prefill / KV
+    avg_d_prefill_start_load_kv_ms: float = 0.0
     avg_d_prefill_ms: float = 0.0
+    avg_d_prefill_wait_for_save_ms: float = 0.0
     avg_d_kv_mnck_in_ms: float = 0.0
     avg_d_kv_mnck_ms: float = 0.0
     avg_d_kv_mnck_out_ms: float = 0.0
@@ -608,8 +651,26 @@ def attach_server_metrics(
         has_producer = "t_prefill_start" in hit
         has_consumer = "t_kv_end" in hit
         if has_producer:
-            r.t_prefill_start = float(hit["t_prefill_start"])
-            r.t_prefill_end = float(hit["t_prefill_end"])
+            # Prefer the new start_load_kv / wait_for_save split fields,
+            # fall back to the legacy aliases for older JSONL files.
+            r.t_prefill_start_load_kv_start = float(
+                hit.get("t_prefill_start_load_kv_start", 0.0) or 0.0
+            )
+            r.t_prefill_start_load_kv_end = float(
+                hit.get("t_prefill_start_load_kv_end",
+                        hit.get("t_prefill_start", 0.0)) or 0.0
+            )
+            r.t_prefill_wait_for_save_start = float(
+                hit.get("t_prefill_wait_for_save_start",
+                        hit.get("t_prefill_end", 0.0)) or 0.0
+            )
+            r.t_prefill_wait_for_save_end = float(
+                hit.get("t_prefill_wait_for_save_end", 0.0) or 0.0
+            )
+            # Aliases kept so every downstream consumer of t_prefill_start
+            # / t_prefill_end keeps working.
+            r.t_prefill_start = r.t_prefill_start_load_kv_end
+            r.t_prefill_end   = r.t_prefill_wait_for_save_start
             r.t_kv_start = float(hit["t_kv_start"])
             r.t_kv_mnck_in_end = float(hit["t_kv_mnck_in_end"])
             if "mode" in hit:
@@ -865,7 +926,11 @@ async def run_benchmark(args) -> BenchmarkResult:
         avg_input_tokens=float(np.mean([r.prompt_len for r in completed])),
 
         # Prefill / KV
+        avg_d_prefill_start_load_kv_ms=_mean(
+            _collect("d_prefill_start_load_kv_ms")),
         avg_d_prefill_ms=_mean(_collect("d_prefill_ms")),
+        avg_d_prefill_wait_for_save_ms=_mean(
+            _collect("d_prefill_wait_for_save_ms")),
         avg_d_kv_mnck_in_ms=_mean(_collect("d_kv_mnck_in_ms")),
         avg_d_kv_mnck_ms=_mean(_collect("d_kv_mnck_ms")),
         avg_d_kv_mnck_out_ms=_mean(_collect("d_kv_mnck_out_ms")),
@@ -922,8 +987,12 @@ def print_results(result: BenchmarkResult):
     print()
     print("  Averages (ms) — per user spec (t_*/d_* naming):")
     # ── Prefill / KV ────────────────────────────────────────────────
+    print(f"    d_prefill_start_load_kv {result.avg_d_prefill_start_load_kv_ms:9.2f}  "
+          "(start_load_kv hook: previous-iter drain + setup)")
     print(f"    d_prefill              {result.avg_d_prefill_ms:9.2f}  "
-          "(t_prefill_end − t_prefill_start, cuda-synced)")
+          "(t_prefill_wait_for_save_start − t_prefill_start_load_kv_end)")
+    print(f"    d_prefill_wait_for_save {result.avg_d_prefill_wait_for_save_ms:9.2f}  "
+          "(wait_for_save hook: sync drain + store + RDMA Put CQE)")
     print(f"    d_kv_mnck_in           {result.avg_d_kv_mnck_in_ms:9.2f}  "
           "(t_kv_start → t_kv_mnck_in_end: GPU→CPU + Mooncake Put)")
     print(f"    d_kv_mnck              {result.avg_d_kv_mnck_ms:9.2f}  "
