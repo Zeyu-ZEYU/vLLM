@@ -667,10 +667,19 @@ def attach_server_metrics(
             r.t_prefill_wait_for_save_end = float(
                 hit.get("t_prefill_wait_for_save_end", 0.0) or 0.0
             )
-            # Aliases kept so every downstream consumer of t_prefill_start
-            # / t_prefill_end keeps working.
-            r.t_prefill_start = r.t_prefill_start_load_kv_end
-            r.t_prefill_end   = r.t_prefill_wait_for_save_start
+            # Per v4 metrics: t_prefill_start and t_prefill_end in JSONL
+            # are GPU-anchored wall-clocks (via cuda.Event + elapsed_time),
+            # NOT aliases of start_load_kv_end / wait_for_save_start. Read
+            # them straight from JSONL; fall back to CPU boundary aliases
+            # only when the producer didn't emit them (older schema).
+            r.t_prefill_start = float(
+                hit.get("t_prefill_start", r.t_prefill_start_load_kv_end)
+                or r.t_prefill_start_load_kv_end
+            )
+            r.t_prefill_end = float(
+                hit.get("t_prefill_end", r.t_prefill_wait_for_save_start)
+                or r.t_prefill_wait_for_save_start
+            )
             r.t_kv_start = float(hit["t_kv_start"])
             r.t_kv_mnck_in_end = float(hit["t_kv_mnck_in_end"])
             if "mode" in hit:
