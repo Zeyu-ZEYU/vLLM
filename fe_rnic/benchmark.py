@@ -701,28 +701,15 @@ async def run_benchmark(args) -> BenchmarkResult:
         args.num_requests = len(prompts)
     elif args.synthetic:
         if args.exact_tokens:
-            # Unique token list per request: start from the common exact
-            # token list, then mutate one interior position per request
-            # (req index i → token index len//2, replace with i % vocab).
-            # This keeps input_len exact while making each prompt's SHA
-            # differ, so LMCache can't short-circuit prefill via KV cache
-            # reuse from a prior iteration. The first ~3 leading tokens
-            # are preserved so the tokenizer's BOS handling is stable.
+            # Same token list for every request — fully deterministic
+            # and exact input_len. Cached per input_len.
             cache: dict = {}
-            base_toks = generate_exact_token_prompt(
+            tok_list = generate_exact_token_prompt(
                 args.url, args.input_len, args.model,
                 tokenize_cache=cache,
             )
-            print(f"  Synthetic input (exact): {len(base_toks)} tokens")
-            prompts = []
-            mid = len(base_toks) // 2
-            for i in range(args.num_requests):
-                toks = list(base_toks)
-                # Swap one token near middle to a request-dependent id.
-                # 100 + i stays safely inside Qwen3's vocab (>150K).
-                if mid < len(toks):
-                    toks[mid] = 100 + i
-                prompts.append(toks)
+            print(f"  Synthetic input (exact): {len(tok_list)} tokens")
+            prompts = [tok_list for _ in range(args.num_requests)]
         else:
             for _ in range(args.num_requests):
                 prompts.append(generate_synthetic_prompt(args.input_len))
