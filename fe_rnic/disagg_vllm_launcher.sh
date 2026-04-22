@@ -156,8 +156,8 @@ prefill)
         --seed 1024 \
         --dtype bfloat16 \
         --enforce-eager \
-        --max-model-len 16384 \
-        --max-num-batched-tokens 16384 \
+        --max-model-len 17000 \
+        --max-num-batched-tokens 17000 \
         --max-num-seqs 256 \
         --gpu-memory-utilization 0.9 \
         --no-enable-prefix-caching \
@@ -217,8 +217,8 @@ decode)
         --seed 1024 \
         --dtype bfloat16 \
         --enforce-eager \
-        --max-model-len 10000 \
-        --max-num-batched-tokens 10000 \
+        --max-model-len 17000 \
+        --max-num-batched-tokens 17000 \
         --max-num-seqs 256 \
         --gpu-memory-utilization 0.9 \
         --no-enable-prefix-caching \
