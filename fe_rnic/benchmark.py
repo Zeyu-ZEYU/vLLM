@@ -36,46 +36,58 @@ import numpy as np
 
 @dataclass
 class RequestResult:
-    """Per-request timings, organized around the user's metric spec.
+    """Per-request timings, organized strictly around ``tasks/对齐Metrics.md``.
 
     Naming conventions:
       - ``t_*``  = epoch-seconds wall-clock timestamps (single instant)
-      - ``d_*``  = millisecond durations derived from two ``t_*`` values
+      - ``e_*``  = values derived from cuda events (GPU-anchored)
+      - ``d_*``  = millisecond durations derived from ``t_*`` / ``e_*``
 
     Clock skew across the 4 nodes is NTP-bounded to <1ms (verified via
     chrony), so cross-node subtraction (e.g. client's t_2nd_token_recv
     minus decode-server's t_kv_end) is valid at the low-ms precision
     we care about.
+
+    Only the fields listed in the spec are kept; fields tied to
+    obsolete v2/v3 metrics (t_prefill_wait_for_save_end,
+    d_exposed_kv*, d_prefill_wait_for_save*) have been deleted.
     """
 
     req_id: int
     prompt_len: int
     output_tokens: int = 0
-    ttft: float = 0.0    # seconds (legacy; equals d_ttft_ms/1000)
     itl: list[float] = field(default_factory=list)  # inter-token latencies
-    jct: float = 0.0     # job completion time (seconds; = d_jct_ms/1000)
     server_id: str = ""   # completion id returned by proxy (cmpl-...)
 
-    # ── Prefill / KV timestamps (server-side) ───────────────────────
-    # Filled by LMCache adapter via producer JSONL on prefill node and
-    # consumer JSONL on decode node, then joined by req_id.
-    #
-    # start_load_kv / wait_for_save bound the model forward. Each hook
-    # has its own (start, end) pair so d_prefill_start_load_kv and
-    # d_prefill_wait_for_save can be reported separately.
-    t_prefill_start_load_kv_start: float = 0.0  # entry of start_load_kv
-    t_prefill_start_load_kv_end: float = 0.0    # exit of start_load_kv
-                                                #   (≡ t_prefill_start)
-    t_prefill_wait_for_save_start: float = 0.0  # entry of wait_for_save
-                                                #   (≡ t_prefill_end)
-    t_prefill_wait_for_save_end: float = 0.0    # exit of wait_for_save
-    # Aliases (populated from the above for backward compat).
-    t_prefill_start: float = 0.0     # = t_prefill_start_load_kv_end
-    t_prefill_end: float = 0.0       # = t_prefill_wait_for_save_start
-    t_kv_start: float = 0.0          # prefill dispatches KV save (CPU event)
-    t_kv_mnck_in_end: float = 0.0    # all KV chunks landed in Mooncake segment
-    t_kv_mnck_out_start: float = 0.0 # decode begins fetching from Mooncake
-    t_kv_end: float = 0.0            # all KV copied to decode GPU; load_stream.synchronize()-ed
+    # ── Prefill-side hook boundaries (CPU, server-side) ─────────────
+    # t_prefill_start_load_kv_start: start_load_kv entry AFTER cuda.sync
+    # t_prefill_start_load_kv_end:   start_load_kv exit (no sync)
+    # t_prefill_wait_for_save_start: wait_for_save entry AFTER cuda.sync
+    t_prefill_start_load_kv_start: float = 0.0
+    t_prefill_start_load_kv_end:   float = 0.0
+    t_prefill_wait_for_save_start: float = 0.0
+
+    # ── GPU-anchored wall-clocks (derived from cuda.Event) ──────────
+    # t_prefill_start: wall-clock of e_prefill_start firing
+    #                  (= GPU forward about to begin)
+    # t_prefill_end:   wall-clock of e_prefill_end firing
+    #                  (= GPU last forward kernel done)
+    t_prefill_start: float = 0.0
+    t_prefill_end:   float = 0.0
+    # Authoritative d_prefill_ms from direct
+    # e_prefill_start.elapsed_time(e_prefill_end). Written by the
+    # adapter; benchmark uses this value verbatim. 0.0 means absent.
+    d_prefill_gpu_ms: float = 0.0
+
+    # ── KV pipeline timestamps (server-side) ────────────────────────
+    # t_kv_start:         in non-overlap = t_prefill_wait_for_save_start
+    # t_kv_mnck_in_end:   all Puts' RDMA CQEs observed on prefill
+    # t_kv_mnck_out_start: decode entry of start_load_kv, AFTER cuda.sync
+    # t_kv_end:           all KV copied to decode GPU (retrieve() synced)
+    t_kv_start:          float = 0.0
+    t_kv_mnck_in_end:    float = 0.0
+    t_kv_mnck_out_start: float = 0.0
+    t_kv_end:            float = 0.0
 
     # ── Client-side timestamps (benchmark.py, NTP-synced) ───────────
     t_req_sent: float = 0.0          # benchmark about to HTTP-POST the request
@@ -92,6 +104,7 @@ class RequestResult:
 
     # ═══════════════════════════════════════════════════════════════
     #  Derived durations (ms). All named ``d_<metric>_ms``.
+    #  Formulas come straight from ``tasks/对齐Metrics.md``.
     # ═══════════════════════════════════════════════════════════════
 
     @property
@@ -110,109 +123,85 @@ class RequestResult:
 
     @property
     def d_prefill_start_load_kv_ms(self) -> float:
-        """Duration of the ``start_load_kv`` hook itself:
-        t_prefill_start_load_kv_end − t_prefill_start_load_kv_start.
-
-        Includes the cuda.synchronize() drain of the previous iteration's
-        trailing kernels + any per-request Python setup.
+        """``t_prefill_start_load_kv_end − t_prefill_start_load_kv_start``.
+        Includes the entry-time cuda.synchronize() drain of any pending
+        GPU work + retrieve() (+ its internal load_stream sync).
         """
         return max(0.0, (self.t_prefill_start_load_kv_end
                          - self.t_prefill_start_load_kv_start) * 1000)
 
     @property
     def d_prefill_ms(self) -> float:
-        """Prefill forward wall-clock (CPU view):
-        t_prefill_end − t_prefill_start
-        = t_prefill_wait_for_save_start − t_prefill_start_load_kv_end.
-
-        This is the wall-clock from the moment start_load_kv returned
-        (GPU freshly idle) to the moment wait_for_save was entered.
-        GPU kernels may still be in-flight on return; their drain cost
-        is captured by d_prefill_wait_for_save.
+        """``e_prefill_end − e_prefill_start`` elapsed time (GPU forward
+        duration). Authoritative value from the adapter's direct
+        ``cuda.Event.elapsed_time()`` call; this property falls back to
+        ``t_prefill_end − t_prefill_start`` only when the raw field is
+        missing (older JSONL schema).
         """
+        if self.d_prefill_gpu_ms > 0:
+            return self.d_prefill_gpu_ms
+        if self.t_prefill_start <= 0 or self.t_prefill_end <= 0:
+            return 0.0
         return max(0.0, (self.t_prefill_end - self.t_prefill_start) * 1000)
 
     @property
-    def d_prefill_wait_for_save_ms(self) -> float:
-        """Duration of the ``wait_for_save`` hook itself:
-        t_prefill_wait_for_save_end − t_prefill_wait_for_save_start.
-
-        Includes the cuda.synchronize() drain of trailing forward
-        kernels + lmcache_engine.store() + wait_put_done (RDMA CQE).
-        """
-        return max(0.0, (self.t_prefill_wait_for_save_end
-                         - self.t_prefill_wait_for_save_start) * 1000)
-
-    @property
     def d_kv_mnck_in_ms(self) -> float:
-        """KV into Mooncake: t_kv_mnck_in_end − t_kv_start.
-        GPU→CPU offload + Mooncake Put (local segment or RDMA WRITE to
-        the decode segment's `preferred_segment`).
+        """``t_kv_mnck_in_end − t_kv_start``.
+        GPU→CPU D2H + Mooncake Put (RDMA WRITE to a segment). In
+        no-overlap this runs inside wait_for_save.
         """
         return max(0.0, (self.t_kv_mnck_in_end - self.t_kv_start) * 1000)
 
     @property
     def d_kv_mnck_ms(self) -> float:
-        """Dwell in Mooncake segment: t_kv_mnck_out_start − t_kv_mnck_in_end.
-        Includes prefill→proxy response + proxy→decode HTTP dispatch +
-        decode scheduler pickup + first Get call entry.
+        """``t_kv_mnck_out_start − t_kv_mnck_in_end``.
+        Dwell in Mooncake segment: prefill → proxy → decode request
+        dispatch + decode scheduler pickup + first retrieve() entry.
         """
         return max(0.0, (self.t_kv_mnck_out_start - self.t_kv_mnck_in_end) * 1000)
 
     @property
     def d_kv_mnck_out_ms(self) -> float:
-        """KV out of Mooncake: t_kv_end − t_kv_mnck_out_start.
-        Mooncake Get (RDMA READ cross-node) + CPU→GPU H2D memcpy.
-        Measured up to ``load_stream.synchronize()``.
+        """``t_kv_end − t_kv_mnck_out_start``.
+        Mooncake Get (RDMA READ) + CPU→GPU H2D memcpy.
         """
         return max(0.0, (self.t_kv_end - self.t_kv_mnck_out_start) * 1000)
 
     @property
     def d_total_kv_ms(self) -> float:
-        """End-to-end KV: d_kv_mnck_in + d_kv_mnck + d_kv_mnck_out
-        (== t_kv_end − t_kv_start).
+        """``d_kv_mnck_in + d_kv_mnck + d_kv_mnck_out``
+        (= ``t_kv_end − t_kv_start``).
         """
         return max(0.0, (self.t_kv_end - self.t_kv_start) * 1000)
 
     @property
     def d_total_kv_no_mnck_ms(self) -> float:
-        """KV transfer only: d_kv_mnck_in + d_kv_mnck_out (no dwell)."""
+        """``d_kv_mnck_in + d_kv_mnck_out`` (transfer only, no dwell)."""
         return max(0.0, self.d_kv_mnck_in_ms + self.d_kv_mnck_out_ms)
-
-    @property
-    def d_exposed_kv_ms(self) -> float:
-        """KV time exposed on critical path: t_kv_end − t_prefill_end.
-        In no-overlap this equals d_total_kv (t_kv_start == t_prefill_end).
-        In overlap it's less, because KV save starts during prefill.
-        """
-        return max(0.0, (self.t_kv_end - self.t_prefill_end) * 1000)
-
-    @property
-    def d_exposed_kv_no_mnck_ms(self) -> float:
-        """Exposed KV minus dwell: only the actual transfer latency
-        that sits on the critical path.
-        """
-        return max(0.0, self.d_exposed_kv_ms - self.d_kv_mnck_ms)
 
     # ── Client-visible latency ──────────────────────────────────────
 
     @property
     def d_ttft_ms(self) -> float:
-        """Time to first token: t_1st_token_recv − t_req_sent."""
+        """``t_1st_token_recv − t_req_sent``."""
         if self.t_1st_token_recv <= 0 or self.t_req_sent <= 0:
             return 0.0
         return max(0.0, (self.t_1st_token_recv - self.t_req_sent) * 1000)
 
     @property
     def d_jct_ms(self) -> float:
-        """Job completion: t_decode_end − t_req_sent."""
+        """``t_decode_end − t_req_sent``."""
         if self.t_decode_end <= 0 or self.t_req_sent <= 0:
             return 0.0
         return max(0.0, (self.t_decode_end - self.t_req_sent) * 1000)
 
     @property
     def d_jct_no_prefill_q_ms(self) -> float:
-        """JCT without prefill queueing: t_decode_end − t_prefill_start."""
+        """``t_decode_end − t_prefill_start`` (excludes prefill queueing).
+        ``t_prefill_start`` is GPU-anchored (= when e_prefill_start
+        fired), so this strips away both proxy queue and prefill
+        scheduler wait.
+        """
         if self.t_decode_end <= 0 or self.t_prefill_start <= 0:
             return 0.0
         return max(0.0, (self.t_decode_end - self.t_prefill_start) * 1000)
@@ -221,10 +210,10 @@ class RequestResult:
 
     @property
     def d_1st_tbt_ms(self) -> float:
-        """First TBT with proxy anchor: t_2nd_token_recv − t_dec_req_sent.
-        Covers: decode HTTP in-flight + decode scheduler + KV transfer
-        + first decode forward pass + decode→proxy→client response.
-        Structurally symmetric with d_ttft (req-sent → token-recv).
+        """``t_2nd_token_recv − t_dec_req_sent`` (proxy-anchored first TBT).
+
+        Covers decode HTTP in-flight + KV pull + decode's first forward
+        pass + response-back network.
         """
         if self.t_2nd_token_recv <= 0 or self.t_dec_req_sent <= 0:
             return 0.0
@@ -232,15 +221,11 @@ class RequestResult:
 
     @property
     def d_1st_tbt_no_kv_ms(self) -> float:
-        """First TBT without KV transfer: t_2nd_token_recv − t_kv_end.
+        """``t_2nd_token_recv − t_kv_end``.
 
-        Anchored at decode's "KV fully on GPU" moment rather than at
-        the proxy's decode-request dispatch, so it isolates the
-        duration of decode's first forward pass + response-back
-        network. Should be ≈ d_tbt in no-overlap (first iter ≈ steady)
-        but << d_tbt in layerwise overlap (t_kv_end fires after
-        compute has been running layer-by-layer, capturing only the
-        tail).
+        Anchored at "KV fully on decode GPU" so the KV transfer is
+        excluded. Expected ≈ ``d_tbt`` in no-overlap (first iter ≈
+        steady); should be close to ``d_tbt`` overall.
         """
         if self.t_2nd_token_recv <= 0 or self.t_kv_end <= 0:
             return 0.0
@@ -248,10 +233,9 @@ class RequestResult:
 
     @property
     def d_decode_ms(self) -> float:
-        """Decode phase: t_decode_end − t_kv_end.
-        t_decode_start == t_kv_end by definition (decode can't start
-        before KV is on GPU). So this is the decode-only span, no KV
-        transfer time included.
+        """``t_decode_end − t_decode_start`` where ``t_decode_start ==
+        t_kv_end`` by definition (decode can't start before KV is on
+        GPU). So this is the decode-only span, no KV transfer time.
         """
         if self.t_decode_end <= 0 or self.t_kv_end <= 0:
             return 0.0
@@ -259,27 +243,47 @@ class RequestResult:
 
     @property
     def d_tbt_ms(self) -> float:
-        """Average TBT across decode tokens: d_decode / num_decode_tokens.
-        The (N-1) segments are: (t_kv_end → t_2nd_token_recv) and the
-        (N-2) inter-decode-token gaps. Averaged over all N-1.
-        """
+        """``d_decode / num_decode_tokens``."""
         n = self.num_decode_tokens
         if n <= 0:
             return 0.0
         return self.d_decode_ms / n
 
 
-PCTL_KEYS = ("p25", "p50", "p75", "p90", "p95", "p99")
-PCTL_VALS = (25, 50, 75, 90, 95, 99)
+# The full set of d_* metrics — per tasks/对齐Metrics.md. This order is
+# used for both the stats computation and the print_results layout.
+METRIC_NAMES = (
+    "d_prefill_start_load_kv",
+    "d_prefill",
+    "d_kv_mnck_in",
+    "d_kv_mnck",
+    "d_kv_mnck_out",
+    "d_total_kv",
+    "d_total_kv_no_mnck",
+    "d_ttft",
+    "d_jct",
+    "d_jct_no_prefill_q",
+    "d_1st_tbt",
+    "d_1st_tbt_no_kv",
+    "d_decode",
+    "d_tbt",
+)
 
 
-def _pcts(data: list[float]) -> dict:
-    """Compute P25/P50/P75/P90/P95/P99 for a list of values."""
+def _stats(data: list[float]) -> dict:
+    """Compute mean / median / min / max for a list of values.
+
+    Empty → all-zero. Matches the stat set requested by
+    ``tasks/No_Overlap机头机尾测试.md``.
+    """
     if not data:
-        return {k: 0.0 for k in PCTL_KEYS}
+        return {"mean": 0.0, "median": 0.0, "min": 0.0, "max": 0.0, "n": 0}
     return {
-        k: float(np.percentile(data, v))
-        for k, v in zip(PCTL_KEYS, PCTL_VALS)
+        "mean":   float(np.mean(data)),
+        "median": float(np.median(data)),
+        "min":    float(np.min(data)),
+        "max":    float(np.max(data)),
+        "n":      len(data),
     }
 
 
@@ -291,53 +295,27 @@ class BenchmarkResult:
     total_time: float            # seconds
     rps: float                   # requests per second
 
-    # TTFT — Time To First Token (ms)
-    ttft: dict  # {p25, p50, p75, p90, p95, p99}
-
     # vLLM-convention reference metrics (client-side percentiles)
     #  - ttft should match d_ttft
     #  - itl  should approximate d_tbt (includes KV transfer on itl[0])
     #  - e2el should match d_jct
     ttft: dict = field(default_factory=dict)
-    itl: dict = field(default_factory=dict)
+    itl:  dict = field(default_factory=dict)
     e2el: dict = field(default_factory=dict)
 
     # Input / output token counts
     avg_output_tokens: float = 0.0
-    avg_input_tokens: float = 0.0
+    avg_input_tokens:  float = 0.0
 
-    # ── Mean of each duration metric (ms) ──────────────────────────
-    #
-    # Naming: ``avg_<metric>_ms`` where ``<metric>`` is the exact
-    # name from the user spec (d_prefill, d_ttft, d_kv_mnck_in, ...).
-    # Percentiles are omitted for now — single-request runs dominate
-    # the test matrix, so mean is the only meaningful statistic.
-    #
-    # Prefill / KV
-    avg_d_prefill_start_load_kv_ms: float = 0.0
-    avg_d_prefill_ms: float = 0.0
-    avg_d_prefill_wait_for_save_ms: float = 0.0
-    avg_d_kv_mnck_in_ms: float = 0.0
-    avg_d_kv_mnck_ms: float = 0.0
-    avg_d_kv_mnck_out_ms: float = 0.0
-    avg_d_total_kv_ms: float = 0.0
-    avg_d_total_kv_no_mnck_ms: float = 0.0
-    avg_d_exposed_kv_ms: float = 0.0
-    avg_d_exposed_kv_no_mnck_ms: float = 0.0
-    # Client-visible
-    avg_d_ttft_ms: float = 0.0
-    avg_d_jct_ms: float = 0.0
-    avg_d_jct_no_prefill_q_ms: float = 0.0
-    # TBT family
-    avg_d_1st_tbt_ms: float = 0.0
-    avg_d_1st_tbt_no_kv_ms: float = 0.0
-    avg_d_decode_ms: float = 0.0
-    avg_d_tbt_ms: float = 0.0
+    # Per-d_* stats: {metric_name: {mean, median, min, max, n}} in ms.
+    # Keys are exactly those in METRIC_NAMES, without the "_ms" suffix.
+    stats: dict = field(default_factory=dict)
+
     # Reference (client-side, vLLM convention)
-    avg_itl_ms: float = 0.0
+    avg_itl_ms:        float = 0.0
     avg_itl_steady_ms: float = 0.0   # mean(itl[1:]) — cross-check for d_tbt
 
-    # Raw per-request data
+    # Raw per-request data (dict form, for JSON serialization)
     requests: list[dict] = field(default_factory=list)
 
     # Per-request rows (RequestResult) joined with server-side metrics.
@@ -433,8 +411,6 @@ async def send_request(
             result.error = "no tokens received"
             return result
 
-        result.ttft = token_times[0] - t_start
-        result.jct = t_end - t_start
         result.output_tokens = len(token_times)
         result.itl = [
             token_times[i] - token_times[i - 1]
@@ -472,39 +448,41 @@ def generate_synthetic_prompt(input_len: int) -> str:
     return " ".join(["hello"] * num_words)
 
 
-def generate_exact_token_prompt(
-    url: str, input_len: int, model: str,
-    tokenize_cache: dict | None = None,
-) -> list[int]:
-    """Return a list of exactly ``input_len`` token IDs by calling the
-    server's /tokenize endpoint once and slicing the result.
+def generate_unique_exact_prompts(
+    url: str, input_len: int, model: str, num_prompts: int,
+) -> list[list[int]]:
+    """Return ``num_prompts`` pre-tokenized prompts, each exactly
+    ``input_len`` tokens long, all with **distinct first tokens**.
 
-    We build a long deterministic seed string (no randomness), tokenize
-    it, and return the first ``input_len`` token IDs. If the seed
-    tokenizes to fewer tokens than requested, we double the seed and
-    retry. The list is cached per (input_len) in ``tokenize_cache`` so
-    repeated calls don't hit the server.
+    Required by ``tasks/No_Overlap机头机尾测试.md``: each benchmark
+    request must have a unique prefix so vLLM's prefix-caching (at
+    prefill) and LMCache's chunk-level lookup cannot short-circuit the
+    Mooncake transfer we're trying to measure. Simple strategy:
 
-    The returned list goes straight into the /v1/completions request
-    body as ``prompt`` — the proxy detects a list prompt and skips its
-    own /tokenize round trip, so the exact count arrives at prefill.
+      1. Ask the server's ``/tokenize`` endpoint once for a single long
+         seed that produces at least ``input_len + num_prompts`` tokens.
+      2. Return ``num_prompts`` overlapping windows of width
+         ``input_len``, each starting at a different offset
+         (``0, 1, 2, ...``). Because the windows start one token apart,
+         every prompt has a different first token.
+
+    The returned lists go straight into ``/v1/completions`` as
+    ``prompt`` — the proxy detects a list prompt and skips its own
+    ``/tokenize`` round trip, so prefill sees exactly ``input_len``
+    tokens per request.
     """
-    if tokenize_cache is not None and input_len in tokenize_cache:
-        return tokenize_cache[input_len]
-
     import urllib.request
 
+    assert num_prompts >= 1, "num_prompts must be positive"
+
+    target = input_len + num_prompts   # need at least this many tokens
     seed_word = "hello"
-    # Start with ~1 word per token; grow seed until we have >= input_len.
-    # Prepend a length-specific salt so different input_len values do NOT
-    # share a common token prefix — otherwise decode's local prefix
-    # cache (enable_prefix_caching=True by default) hits on the shared
-    # prefix and short-circuits the Mooncake retrieve we are trying to
-    # measure, leaving consumer JSONL empty for the longer sequences.
     words_factor = 2
     while True:
-        num_words = max(input_len * words_factor, 16)
-        salt = f"length_{input_len}_marker "
+        num_words = max(target * words_factor, 16)
+        # Per-(input_len, num_prompts) salt so each bench run's tokens
+        # are not a prefix-cache hit against prior runs.
+        salt = f"length_{input_len}_count_{num_prompts}_marker "
         seed = salt + " ".join([seed_word] * num_words)
         req = urllib.request.Request(
             f"{url}/tokenize",
@@ -522,16 +500,13 @@ def generate_exact_token_prompt(
                 f"Failed to call /tokenize at {url}: {e}"
             )
         tokens = body.get("tokens") or body.get("input_ids") or []
-        if len(tokens) >= input_len:
-            exact = tokens[:input_len]
-            if tokenize_cache is not None:
-                tokenize_cache[input_len] = exact
-            return exact
+        if len(tokens) >= target:
+            return [tokens[i : i + input_len] for i in range(num_prompts)]
         # Seed too short, expand and retry.
         words_factor *= 2
         if words_factor > 1024:
             raise RuntimeError(
-                f"Could not produce {input_len} tokens from seed expansion "
+                f"Could not produce {target} tokens from seed expansion "
                 f"(max factor {words_factor})"
             )
 
@@ -631,6 +606,14 @@ def attach_server_metrics(
     "cmpl-<hex>-<dp_rank>-<uuid>"; client sees server_id "cmpl-<hex>"
     (or the full form). Match by prefix in either direction.
 
+    Producer JSONL schema (written in wait_for_save):
+        t_prefill_start_load_kv_start, t_prefill_start_load_kv_end,
+        t_prefill_wait_for_save_start, t_kv_start, t_kv_mnck_in_end,
+        t_prefill_start, t_prefill_end   (GPU-anchored wall-clocks)
+        d_prefill_ms                      (direct event elapsed_time)
+    Consumer JSONL schema (written in start_load_kv, decode side):
+        t_kv_mnck_out_start, t_kv_end
+
     Returns ``(matched_producer, matched_consumer)``.
     """
     matched_prod = 0
@@ -651,27 +634,18 @@ def attach_server_metrics(
         has_producer = "t_prefill_start" in hit
         has_consumer = "t_kv_end" in hit
         if has_producer:
-            # Prefer the new start_load_kv / wait_for_save split fields,
-            # fall back to the legacy aliases for older JSONL files.
             r.t_prefill_start_load_kv_start = float(
                 hit.get("t_prefill_start_load_kv_start", 0.0) or 0.0
             )
             r.t_prefill_start_load_kv_end = float(
-                hit.get("t_prefill_start_load_kv_end",
-                        hit.get("t_prefill_start", 0.0)) or 0.0
+                hit.get("t_prefill_start_load_kv_end", 0.0) or 0.0
             )
             r.t_prefill_wait_for_save_start = float(
-                hit.get("t_prefill_wait_for_save_start",
-                        hit.get("t_prefill_end", 0.0)) or 0.0
+                hit.get("t_prefill_wait_for_save_start", 0.0) or 0.0
             )
-            r.t_prefill_wait_for_save_end = float(
-                hit.get("t_prefill_wait_for_save_end", 0.0) or 0.0
-            )
-            # Per v4 metrics: t_prefill_start and t_prefill_end in JSONL
-            # are GPU-anchored wall-clocks (via cuda.Event + elapsed_time),
-            # NOT aliases of start_load_kv_end / wait_for_save_start. Read
-            # them straight from JSONL; fall back to CPU boundary aliases
-            # only when the producer didn't emit them (older schema).
+            # t_prefill_start / t_prefill_end are GPU-anchored wall-clocks.
+            # If missing, fall back to the nearest CPU boundary so the
+            # record isn't dropped outright.
             r.t_prefill_start = float(
                 hit.get("t_prefill_start", r.t_prefill_start_load_kv_end)
                 or r.t_prefill_start_load_kv_end
@@ -680,8 +654,11 @@ def attach_server_metrics(
                 hit.get("t_prefill_end", r.t_prefill_wait_for_save_start)
                 or r.t_prefill_wait_for_save_start
             )
-            r.t_kv_start = float(hit["t_kv_start"])
-            r.t_kv_mnck_in_end = float(hit["t_kv_mnck_in_end"])
+            # Authoritative d_prefill_ms (direct event elapsed_time).
+            # 0 means "absent" — property falls back to the CPU derivation.
+            r.d_prefill_gpu_ms = float(hit.get("d_prefill_ms", 0.0) or 0.0)
+            r.t_kv_start       = float(hit.get("t_kv_start", 0.0) or 0.0)
+            r.t_kv_mnck_in_end = float(hit.get("t_kv_mnck_in_end", 0.0) or 0.0)
             if "mode" in hit:
                 r.kv_mode = hit["mode"]
             matched_prod += 1
@@ -701,25 +678,32 @@ def attach_server_metrics(
 async def _send_warmup(
     session: aiohttp.ClientSession, url: str, model: str,
     input_len: int, max_tokens: int, count: int,
-    prompt=None,
+    prompts: list | None = None,
 ) -> None:
     """Fire ``count`` warmup requests and await completion.
 
     Results are discarded. Used to get past cold-start autotuning and
     first-request compilation so the measured run sees steady-state
-    timing. ``prompt`` can be a pre-tokenized list (exact input_len)
-    or None (falls back to deterministic string of approx length).
+    timing.
+
+    ``prompts`` is a list of length ``count`` (one pre-tokenized prompt
+    per warmup request, each with a unique first token so the measured
+    run immediately following it cannot hit vLLM's prefix cache with
+    a leftover warmup block). If ``prompts`` is None we fall back to a
+    single deterministic string repeated ``count`` times — the legacy
+    behaviour, used only in non-synthetic modes.
     """
     if count <= 0:
         return
     print(f"Warmup: {count} requests (input~{input_len}, out={max_tokens}) ...")
-    if prompt is None:
-        prompt = generate_synthetic_prompt(input_len)
+    if prompts is None:
+        fallback = generate_synthetic_prompt(input_len)
+        prompts = [fallback for _ in range(count)]
     tasks = [
         asyncio.create_task(
             send_request(
                 session, url,
-                prompt,
+                prompts[i],
                 max_tokens, model, -(i + 1),
             )
         )
@@ -760,6 +744,7 @@ async def run_benchmark(args) -> BenchmarkResult:
 
     # Build prompts
     prompts = []
+    warmup_prompts: list = []
     max_tokens_list = []
     if args.dataset:
         import jsonlines  # noqa: F811
@@ -771,15 +756,22 @@ async def run_benchmark(args) -> BenchmarkResult:
         args.num_requests = len(prompts)
     elif args.synthetic:
         if args.exact_tokens:
-            # Same token list for every request — fully deterministic
-            # and exact input_len. Cached per input_len.
-            cache: dict = {}
-            tok_list = generate_exact_token_prompt(
-                args.url, args.input_len, args.model,
-                tokenize_cache=cache,
+            # Generate num_requests + warmup distinct prompts: each has
+            # exactly input_len tokens but a unique first token (sliding
+            # window over a base token sequence). This prevents vLLM's
+            # prefix cache (and LMCache's chunk-level lookup) from
+            # short-circuiting prefill — a correctness requirement for
+            # measuring Mooncake KV transfer. Warmup uses the first
+            # ``warmup`` prompts; the measured run uses the rest.
+            total_needed = args.num_requests + max(0, args.warmup)
+            all_prompts = generate_unique_exact_prompts(
+                args.url, args.input_len, args.model, total_needed,
             )
-            print(f"  Synthetic input (exact): {len(tok_list)} tokens")
-            prompts = [tok_list for _ in range(args.num_requests)]
+            print(f"  Synthetic input (exact, unique per req): "
+                  f"{args.input_len} tokens × {total_needed} prompts "
+                  f"({args.warmup} warmup + {args.num_requests} measured)")
+            warmup_prompts = all_prompts[: args.warmup]
+            prompts = all_prompts[args.warmup:]
         else:
             for _ in range(args.num_requests):
                 prompts.append(generate_synthetic_prompt(args.input_len))
@@ -815,16 +807,18 @@ async def run_benchmark(args) -> BenchmarkResult:
         if args.warmup > 0:
             warm_input_len = args.input_len if args.synthetic else 512
             warm_max_tokens = args.max_tokens
-            # Reuse the same exact token list for warmup so proxy
-            # skips /tokenize there too, and the warmup hits the same
-            # exact prefill path as the measured run.
-            warm_prompt = prompts[0] if (
-                args.synthetic and args.exact_tokens and prompts
+            # ``warmup_prompts`` was sliced off the front of
+            # generate_unique_exact_prompts() above — each warmup req
+            # has a unique first token, and none of them overlaps with
+            # the measurement prompts, so the measured run doesn't
+            # inherit prefix-cache hits from warmup.
+            warm_prompts = warmup_prompts if (
+                args.synthetic and args.exact_tokens and warmup_prompts
             ) else None
             await _send_warmup(
                 session, args.url, args.model,
                 warm_input_len, warm_max_tokens, args.warmup,
-                prompt=warm_prompt,
+                prompts=warm_prompts,
             )
             if args.metrics_sources:
                 srcs = [s.strip() for s in args.metrics_sources.split(",")
@@ -889,9 +883,13 @@ async def run_benchmark(args) -> BenchmarkResult:
         )
 
     # vLLM-convention references (client-only, no server metrics needed)
-    ttfts_ms = [r.ttft * 1000 for r in completed]
-    e2els_ms = [r.jct * 1000 for r in completed]
-    all_itls_ms = []
+    ttfts_ms = [max(0.0, (r.t_1st_token_recv - r.t_req_sent) * 1000)
+                for r in completed
+                if r.t_1st_token_recv > 0 and r.t_req_sent > 0]
+    e2els_ms = [max(0.0, (r.t_decode_end - r.t_req_sent) * 1000)
+                for r in completed
+                if r.t_decode_end > 0 and r.t_req_sent > 0]
+    all_itls_ms: list[float] = []
     for r in completed:
         all_itls_ms.extend([x * 1000 for x in r.itl])
     itl_steady_means = [
@@ -899,23 +897,35 @@ async def run_benchmark(args) -> BenchmarkResult:
         for r in completed if len(r.itl) > 1
     ]
 
-    # Only include requests where BOTH producer JSONL, consumer JSONL
-    # and proxy t_dec_req_sent arrived — otherwise d_* are meaningless.
+    # Only include requests where BOTH producer JSONL and consumer JSONL
+    # arrived (and client t_req_sent exists) — otherwise d_* are
+    # meaningless.
     def _has_full(r: RequestResult) -> bool:
         return (r.t_prefill_start > 0 and r.t_kv_end > 0
                 and r.t_req_sent > 0)
 
     ok = [r for r in completed if _has_full(r)]
 
-    def _collect(attr: str, pred=None) -> list:
-        """Collect a per-request duration only when the timestamps
-        feeding it exist (property returns 0 otherwise)."""
-        vals = []
-        for r in ok:
-            v = getattr(r, attr)
-            if v > 0:
-                vals.append(v)
-        return vals
+    # Per-d_* stats (mean / median / min / max / n). Values are pulled
+    # via the property on RequestResult; records with property returning
+    # 0 (timestamps absent) are dropped so the stat doesn't get zero-
+    # inflated.
+    stats_map: dict = {}
+    for name in METRIC_NAMES:
+        attr = f"{name}_ms"
+        vals = [getattr(r, attr) for r in ok if getattr(r, attr) > 0]
+        stats_map[name] = _stats(vals)
+
+    def _pcts(data: list[float]) -> dict:
+        if not data:
+            return {k: 0.0 for k in ("p25", "p50", "p75", "p90", "p95", "p99")}
+        return {
+            k: float(np.percentile(data, v))
+            for k, v in zip(
+                ("p25", "p50", "p75", "p90", "p95", "p99"),
+                (25, 50, 75, 90, 95, 99),
+            )
+        }
 
     def _mean(xs) -> float:
         return float(np.mean(xs)) if xs else 0.0
@@ -934,29 +944,8 @@ async def run_benchmark(args) -> BenchmarkResult:
         avg_output_tokens=float(np.mean([r.output_tokens for r in completed])),
         avg_input_tokens=float(np.mean([r.prompt_len for r in completed])),
 
-        # Prefill / KV
-        avg_d_prefill_start_load_kv_ms=_mean(
-            _collect("d_prefill_start_load_kv_ms")),
-        avg_d_prefill_ms=_mean(_collect("d_prefill_ms")),
-        avg_d_prefill_wait_for_save_ms=_mean(
-            _collect("d_prefill_wait_for_save_ms")),
-        avg_d_kv_mnck_in_ms=_mean(_collect("d_kv_mnck_in_ms")),
-        avg_d_kv_mnck_ms=_mean(_collect("d_kv_mnck_ms")),
-        avg_d_kv_mnck_out_ms=_mean(_collect("d_kv_mnck_out_ms")),
-        avg_d_total_kv_ms=_mean(_collect("d_total_kv_ms")),
-        avg_d_total_kv_no_mnck_ms=_mean(_collect("d_total_kv_no_mnck_ms")),
-        avg_d_exposed_kv_ms=_mean(_collect("d_exposed_kv_ms")),
-        avg_d_exposed_kv_no_mnck_ms=_mean(_collect("d_exposed_kv_no_mnck_ms")),
-        # Client-visible
-        avg_d_ttft_ms=_mean(_collect("d_ttft_ms")),
-        avg_d_jct_ms=_mean(_collect("d_jct_ms")),
-        avg_d_jct_no_prefill_q_ms=_mean(_collect("d_jct_no_prefill_q_ms")),
-        # TBT family
-        avg_d_1st_tbt_ms=_mean(_collect("d_1st_tbt_ms")),
-        avg_d_1st_tbt_no_kv_ms=_mean(_collect("d_1st_tbt_no_kv_ms")),
-        avg_d_decode_ms=_mean(_collect("d_decode_ms")),
-        avg_d_tbt_ms=_mean(_collect("d_tbt_ms")),
-        # Reference
+        stats=stats_map,
+
         avg_itl_ms=_mean(all_itls_ms),
         avg_itl_steady_ms=_mean(itl_steady_means),
 
@@ -969,6 +958,7 @@ async def run_benchmark(args) -> BenchmarkResult:
 
 def print_results(result: BenchmarkResult):
     """Pretty-print benchmark results."""
+    pctl_keys = ("p25", "p50", "p75", "p90", "p95", "p99")
     print("\n" + "=" * 60)
     print("BENCHMARK RESULTS")
     print("=" * 60)
@@ -981,63 +971,67 @@ def print_results(result: BenchmarkResult):
     print()
     def _fmt(d: dict) -> str:
         if not d:
-            return "  ".join(f"{k.upper()}=0.0" for k in PCTL_KEYS)
-        return "  ".join(f"{k.upper()}={d.get(k, 0.0):.1f}" for k in PCTL_KEYS)
+            return "  ".join(f"{k.upper()}=0.0" for k in pctl_keys)
+        return "  ".join(f"{k.upper()}={d.get(k, 0.0):.1f}" for k in pctl_keys)
 
     # vLLM-convention references (client-only, always available)
     print(f"  TTFT  (ms):       {_fmt(result.ttft)}")
     print(f"  ITL   (ms):       {_fmt(result.itl)}")
     print(f"  E2EL  (ms):       {_fmt(result.e2el)}")
 
-    has_server = result.avg_d_total_kv_ms > 0
+    has_server = (
+        result.stats.get("d_total_kv", {}).get("mean", 0.0) > 0
+    )
     if not has_server:
         print("  (Server-side KV metrics: no joined producer+consumer "
               "records — check metrics_sources)")
     print()
-    print("  Averages (ms) — per user spec (t_*/d_* naming):")
-    # ── Prefill / KV ────────────────────────────────────────────────
-    print(f"    d_prefill_start_load_kv {result.avg_d_prefill_start_load_kv_ms:9.2f}  "
-          "(start_load_kv hook: previous-iter drain + setup)")
-    print(f"    d_prefill              {result.avg_d_prefill_ms:9.2f}  "
-          "(t_prefill_wait_for_save_start − t_prefill_start_load_kv_end)")
-    print(f"    d_prefill_wait_for_save {result.avg_d_prefill_wait_for_save_ms:9.2f}  "
-          "(wait_for_save hook: sync drain + store + RDMA Put CQE)")
-    print(f"    d_kv_mnck_in           {result.avg_d_kv_mnck_in_ms:9.2f}  "
-          "(t_kv_start → t_kv_mnck_in_end: GPU→CPU + Mooncake Put)")
-    print(f"    d_kv_mnck              {result.avg_d_kv_mnck_ms:9.2f}  "
-          "(t_kv_mnck_in_end → t_kv_mnck_out_start: dwell in Mooncake)")
-    print(f"    d_kv_mnck_out          {result.avg_d_kv_mnck_out_ms:9.2f}  "
-          "(t_kv_mnck_out_start → t_kv_end: Mooncake Get + CPU→GPU)")
-    print(f"    d_total_kv             {result.avg_d_total_kv_ms:9.2f}  "
-          "(t_kv_start → t_kv_end: in + dwell + out)")
-    print(f"    d_total_kv_no_mnck     {result.avg_d_total_kv_no_mnck_ms:9.2f}  "
-          "(in + out only, excludes dwell)")
-    print(f"    d_exposed_kv           {result.avg_d_exposed_kv_ms:9.2f}  "
-          "(t_kv_end − t_prefill_end; = d_total_kv in no-overlap)")
-    print(f"    d_exposed_kv_no_mnck   "
-          f"{result.avg_d_exposed_kv_no_mnck_ms:9.2f}  "
-          "(d_exposed_kv − d_kv_mnck)")
-    # ── Client-visible ──────────────────────────────────────────────
-    print(f"    d_ttft                 {result.avg_d_ttft_ms:9.2f}  "
-          "(t_1st_token_recv − t_req_sent)")
-    print(f"    d_jct                  {result.avg_d_jct_ms:9.2f}  "
-          "(t_decode_end − t_req_sent)")
-    print(f"    d_jct_no_prefill_q     "
-          f"{result.avg_d_jct_no_prefill_q_ms:9.2f}  "
-          "(t_decode_end − t_prefill_start)")
-    # ── TBT family ──────────────────────────────────────────────────
-    print(f"    d_1st_tbt              {result.avg_d_1st_tbt_ms:9.2f}  "
-          "(t_2nd_token_recv − t_dec_req_sent: proxy-anchored)")
-    print(f"    d_1st_tbt_no_kv        {result.avg_d_1st_tbt_no_kv_ms:9.2f}  "
-          "(t_2nd_token_recv − t_kv_end: ≈ d_tbt in no-overlap)")
-    print(f"    d_decode               {result.avg_d_decode_ms:9.2f}  "
-          "(t_decode_end − t_kv_end: decode-only, no KV transfer)")
-    print(f"    d_tbt                  {result.avg_d_tbt_ms:9.2f}  "
-          "(d_decode / num_decode_tokens)")
+    print("  Per-d_* stats (ms) — mean | median | min | max | n:")
+    descriptions = {
+        "d_prefill_start_load_kv":
+            "start_load_kv hook: entry cuda.sync + retrieve (if any)",
+        "d_prefill":
+            "e_prefill_start → e_prefill_end (cuda.Event elapsed_time)",
+        "d_kv_mnck_in":
+            "t_kv_start → t_kv_mnck_in_end (D2H + Mooncake Put)",
+        "d_kv_mnck":
+            "t_kv_mnck_in_end → t_kv_mnck_out_start (Mooncake dwell)",
+        "d_kv_mnck_out":
+            "t_kv_mnck_out_start → t_kv_end (Mooncake Get + H2D)",
+        "d_total_kv":
+            "t_kv_end − t_kv_start (in + dwell + out)",
+        "d_total_kv_no_mnck":
+            "d_kv_mnck_in + d_kv_mnck_out (excludes dwell)",
+        "d_ttft":
+            "t_1st_token_recv − t_req_sent",
+        "d_jct":
+            "t_decode_end − t_req_sent",
+        "d_jct_no_prefill_q":
+            "t_decode_end − t_prefill_start (excl. prefill queue)",
+        "d_1st_tbt":
+            "t_2nd_token_recv − t_dec_req_sent (proxy-anchored)",
+        "d_1st_tbt_no_kv":
+            "t_2nd_token_recv − t_kv_end (≈ d_tbt in no-overlap)",
+        "d_decode":
+            "t_decode_end − t_kv_end (decode only, no KV transfer)",
+        "d_tbt":
+            "d_decode / num_decode_tokens",
+    }
+    for name in METRIC_NAMES:
+        s = result.stats.get(name, {})
+        print(
+            f"    {name:<24} "
+            f"{s.get('mean', 0.0):9.2f} | "
+            f"{s.get('median', 0.0):9.2f} | "
+            f"{s.get('min', 0.0):9.2f} | "
+            f"{s.get('max', 0.0):9.2f} | "
+            f"{s.get('n', 0):3d}   "
+            f"# {descriptions.get(name, '')}"
+        )
     # ── Reference (client-side vLLM) ────────────────────────────────
-    print(f"    ITL mean (all)         {result.avg_itl_ms:9.2f}  "
+    print(f"    ITL mean (all)           {result.avg_itl_ms:9.2f}  "
           "(client-side, includes ITL[0])")
-    print(f"    ITL mean (steady)      {result.avg_itl_steady_ms:9.2f}  "
+    print(f"    ITL mean (steady)        {result.avg_itl_steady_ms:9.2f}  "
           "(mean(itl[1:]); cross-check for d_tbt)")
 
     if has_server:
