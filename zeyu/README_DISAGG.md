@@ -875,8 +875,13 @@ SIGKILL (no traceback propagates back to the parent).
 
 This launcher fixes it by defaulting to a 2 GiB pool via
 `--kv-pool-size-gb`; it's plumbed into the config as
-`kv_connector_extra_config["mem_pool_size_gb"]`. If you still hit
-this on a very restrictive cluster, lower it further:
+`kv_connector_extra_config["mem_pool_size_gb"]`. **Before building
+the LLM**, the launcher also calls `_preflight_kv_pool()` which
+checks `RLIMIT_MEMLOCK` against the requested pool and prints a
+loud warning if the pool is too large — so you get an actionable
+message in the terminal instead of the silent SIGKILL. If you
+still hit this on a very restrictive cluster, lower the pool
+further:
 
 ```bash
 bash zeyu/disagg_run.sh --role prefill --kv-pool-size-gb 0.5 ...

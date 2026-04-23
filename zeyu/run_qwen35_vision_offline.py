@@ -556,6 +556,59 @@ def _setup_network_env(iface: str, local_ip: str | None = None):
         os.environ.setdefault("VLLM_HOST_IP", local_ip)
 
 
+def _preflight_kv_pool(pool_gb: float, local_ip: str) -> None:
+    """Warn (or error) early if the requested pinned-memory pool won't
+    fit under the process's RLIMIT_MEMLOCK. Without this check the
+    engine-core subprocess would be SIGKILL'd during
+    ``torch.empty(..., pin_memory=True)`` inside
+    TensorMemoryPool._allocate_pinned_memory(), leaving only a useless
+    "Failed core proc(s): {}" traceback in the parent.
+    """
+    import resource
+    import warnings
+
+    required_bytes = int(pool_gb * (1024 ** 3))
+
+    try:
+        soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    except (OSError, ValueError):
+        return  # can't check, skip
+
+    # soft == -1 (RLIM_INFINITY) means unlimited — no check needed.
+    if soft == resource.RLIM_INFINITY or soft < 0:
+        return
+
+    if soft < required_bytes:
+        soft_gib = soft / (1024 ** 3)
+        msg = (
+            f"\n{'=' * 70}\n"
+            f"WARNING: RLIMIT_MEMLOCK is {soft_gib:.2f} GiB but this script "
+            f"is about to allocate a {pool_gb:.2f} GiB pinned host-memory "
+            f"pool for KV transfer.\n"
+            f"The engine core subprocess will likely be SIGKILL'd during "
+            f"P2pNcclEngine init with a silent 'Failed core proc(s): {{}}' "
+            f"error.\n\n"
+            f"Fix options:\n"
+            f"  1) Lower the pool: pass --kv-pool-size-gb {max(0.5, soft_gib * 0.8):.2f}\n"
+            f"  2) Ask your admin to raise memlock "
+            f"(e.g. `ulimit -l unlimited` or "
+            f"'* hard memlock unlimited' in /etc/security/limits.conf).\n"
+            f"{'=' * 70}\n"
+        )
+        warnings.warn(msg, stacklevel=2)
+        # Also print to stderr so the warning is very visible.
+        print(msg, flush=True)
+
+    # Sanity check on the auto-detected IP.
+    if local_ip in ("", "0.0.0.0", "127.0.0.1", "::1"):
+        print(
+            f"\nWARNING: --iface produced local_ip={local_ip!r}, which will "
+            f"not work for cross-node KV transfer. Pass --iface <NIC> with a "
+            f"real external IPv4 address.\n",
+            flush=True,
+        )
+
+
 def _local_ip_for(iface: str) -> str:
     """Get the IPv4 address of the given interface. Falls back to
     a UDP-based heuristic if ``ip`` command is not available."""
@@ -610,6 +663,7 @@ def run_prefill_role(args, examples: list[dict]):
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     local_ip = _local_ip_for(args.iface)
     _setup_network_env(args.iface, local_ip=local_ip)
+    _preflight_kv_pool(args.kv_pool_size_gb, local_ip)
 
     # Route iteration logs into prefill/ subdir.
     log_dir = Path(os.environ.get("VLLM_ITERATION_LOG_DIR", str(OUTPUT_DIR)))
@@ -752,6 +806,7 @@ def run_decode_role(args, examples: list[dict]):
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     local_ip = _local_ip_for(args.iface)
     _setup_network_env(args.iface, local_ip=local_ip)
+    _preflight_kv_pool(args.kv_pool_size_gb, local_ip)
 
     log_dir = Path(os.environ.get("VLLM_ITERATION_LOG_DIR", str(OUTPUT_DIR)))
     decode_log_dir = log_dir / "decode"
