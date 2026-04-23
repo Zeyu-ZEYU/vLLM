@@ -289,6 +289,7 @@ Mismatches cause the handshake to fail or the KV exchange to deadlock.
 | `--iface IFACE` | `eth0` | NIC to bind NCCL/ZMQ to. Each side uses its own local NIC name; the IPs will differ. |
 | `--gpu IDX` | `0` | Local GPU index (as seen in `nvidia-smi` on *this* node). |
 | `--gpu-memory-utilization F` | `0.85` | Fraction of GPU memory for KV cache + model. |
+| `--kv-pool-size-gb N` | `2` | Size of the pinned host-memory staging buffer used by P2pNcclEngine (in GiB). Upstream vLLM defaults this to **32 GiB**, which silently kills the engine core subprocess on clusters with restrictive `ulimit -l` / RLIMIT_MEMLOCK. 2 GiB is enough for typical per-request KV payloads. Raise if you expect many concurrent large KV transfers. |
 | `--output-dir DIR` | `zeyu/outputs/disagg_<UTC-timestamp>` | Base output directory. The role-specific subdir (`prefill/` or `decode/`) is created under it. |
 | `--nsys` | off | Wrap this side's python in `nsys profile --trace=cuda,nvtx`. See [Optional: nsys profiling](#optional-nsys-profiling). Each side is independent — you can turn nsys on for one side only. |
 | `--sm-metrics` | off | Additionally enable `--gpu-metrics-devices=all` (requires GPU counter privilege). |
@@ -863,6 +864,36 @@ LLaVA-class models work.
 Another process is using the GPU, or `--gpu-memory-utilization` is
 too high. Check `nvidia-smi`, pick a different `--gpu` index, or
 lower `--gpu-memory-utilization 0.7`.
+
+**`RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}`** (engine subprocess dies silently, typically right after the log line `Initializing KVConnectorBase_V1`)
+The engine subprocess was killed by the kernel during
+`P2pNcclEngine.__init__` — most commonly while allocating the
+**pinned host-memory staging pool**. Upstream vLLM's
+`TensorMemoryPool` defaults to **32 GiB** of pinned memory, which
+exceeds `ulimit -l` on many HPC clusters and triggers a silent
+SIGKILL (no traceback propagates back to the parent).
+
+This launcher fixes it by defaulting to a 2 GiB pool via
+`--kv-pool-size-gb`; it's plumbed into the config as
+`kv_connector_extra_config["mem_pool_size_gb"]`. If you still hit
+this on a very restrictive cluster, lower it further:
+
+```bash
+bash zeyu/disagg_run.sh --role prefill --kv-pool-size-gb 0.5 ...
+bash zeyu/disagg_run.sh --role decode  --kv-pool-size-gb 0.5 ...
+```
+
+Confirm your memlock limit is at least a few times your
+`--kv-pool-size-gb`:
+
+```bash
+ulimit -l        # in KiB; "unlimited" or ≥ 2*1024*1024 is ideal
+prlimit -l       # same, different shell
+```
+
+If your cluster admin can raise the limit, ask them to set
+`LimitMEMLOCK=infinity` in the systemd unit / slurm prolog, or
+bump `memlock` in `/etc/security/limits.conf`.
 
 **`ModuleNotFoundError: No module named 'msgpack'` (or `pynvml` / `zmq`)**
 ```bash
