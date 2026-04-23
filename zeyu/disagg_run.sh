@@ -66,6 +66,7 @@ IFACE="eth0"
 KV_PORT=25555
 CTRL_PORT=25500
 GPU=0
+KV_POOL_GB="2"                  # Pinned-host staging-pool size (GiB).
 INPUT=""
 DELAY=""                        # Optional global inter-arrival delay (ms).
 PEER_IP=""                      # Required for --role decode.
@@ -102,6 +103,7 @@ while [[ $# -gt 0 ]]; do
         --kv-port) KV_PORT="$2"; shift 2;;
         --ctrl-port) CTRL_PORT="$2"; shift 2;;
         --gpu) GPU="$2"; shift 2;;
+        --kv-pool-size-gb) KV_POOL_GB="$2"; shift 2;;
         --input) INPUT="$2"; shift 2;;
         --delay) DELAY="$2"; shift 2;;
         --output-dir) OUTPUT_DIR="$2"; shift 2;;
@@ -182,6 +184,7 @@ echo "  GPU         : $GPU"
 echo "  Peer IP     : ${PEER_IP:-<unset (prefill binds & waits)>}"
 echo "  KV port     : $KV_PORT         (decode connects to kv_port+100 on peer)"
 echo "  Ctrl port   : $CTRL_PORT"
+echo "  KV pool     : ${KV_POOL_GB} GiB   (pinned host staging buffer; see --kv-pool-size-gb)"
 echo "  Model       : $MODEL"
 echo "  Prompts     : $NUM_PROMPTS         max_tokens=$MAX_TOKENS"
 echo "  Output dir  : $OUTPUT_DIR"
@@ -247,6 +250,7 @@ PY=(python "$LOCAL_REPO/zeyu/run_qwen35_vision_offline.py"
     --max-tokens "$MAX_TOKENS"
     --max-model-len "$MAX_MODEL_LEN"
     --gpu-memory-utilization "$GPU_MEM_UTIL"
+    --kv-pool-size-gb "$KV_POOL_GB"
     --output-dir "$OUTPUT_DIR"
     $INPUT_ARG $DELAY_ARG)
 

@@ -393,6 +393,17 @@ def main():
         "Default: eth0.",
     )
     parser.add_argument(
+        "--kv-pool-size-gb",
+        type=float,
+        default=2.0,
+        help="Pinned-host-memory staging pool size for KV transfer, in "
+        "GiB. This replaces the upstream P2pNcclEngine default of 32 "
+        "GiB, which fails on clusters with restrictive RLIMIT_MEMLOCK "
+        "(engine core subprocess dies silently during connector init). "
+        "Raise this if you expect many concurrent large KV transfers. "
+        "Default: 2.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
@@ -526,12 +537,23 @@ def _common_llm_kwargs(args, examples: list[dict]) -> dict:
     )
 
 
-def _setup_network_env(iface: str):
-    """Force NCCL/GLOO to use the specified network interface."""
+def _setup_network_env(iface: str, local_ip: str | None = None):
+    """Force NCCL/GLOO to use the specified network interface.
+
+    Also sets ``VLLM_HOST_IP`` to the interface's IPv4 address (when
+    provided) so that vLLM's ``get_ip()`` returns it — otherwise that
+    function uses a UDP connect() probe that picks the default-route
+    IP, which may be a different NIC than the one we asked for, causing
+    P2pNcclConnector to bind ZMQ / announce its address on the wrong
+    interface.
+    """
     os.environ.setdefault("NCCL_SOCKET_IFNAME", iface)
     os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
-    # Disable InfiniBand — we're using TCP over the management NIC.
+    # Disable InfiniBand by default — we use TCP over the chosen NIC.
+    # Set NCCL_IB_DISABLE=0 in your shell to override.
     os.environ.setdefault("NCCL_IB_DISABLE", "1")
+    if local_ip:
+        os.environ.setdefault("VLLM_HOST_IP", local_ip)
 
 
 def _local_ip_for(iface: str) -> str:
@@ -586,21 +608,22 @@ def run_prefill_role(args, examples: list[dict]):
     # late if any prior import already initialized CUDA.
     if "CUDA_VISIBLE_DEVICES" not in os.environ:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    _setup_network_env(args.iface)
+    local_ip = _local_ip_for(args.iface)
+    _setup_network_env(args.iface, local_ip=local_ip)
 
     # Route iteration logs into prefill/ subdir.
     log_dir = Path(os.environ.get("VLLM_ITERATION_LOG_DIR", str(OUTPUT_DIR)))
     prefill_log_dir = log_dir / "prefill"
     os.environ["VLLM_ITERATION_LOG_DIR"] = str(prefill_log_dir)
 
-    local_ip = _local_ip_for(args.iface)
     prefill_kv_port = args.kv_port
     decode_kv_port = args.kv_port + 100  # decode uses a different port
     print(
         f"[Prefill] Role=kv_producer  local_ip={local_ip}  "
         f"peer_ip={args.peer_ip or '<wait-for-connect>'}  "
         f"prefill_kv_port={prefill_kv_port}  decode_kv_port={decode_kv_port}  "
-        f"iface={args.iface}"
+        f"iface={args.iface}  "
+        f"kv_pool_gb={args.kv_pool_size_gb}"
     )
 
     # Build LLM with P2pNcclConnector kv_producer.
@@ -619,6 +642,13 @@ def run_prefill_role(args, examples: list[dict]):
         kv_connector_extra_config={
             "send_type": "PUT_ASYNC",
             "nccl_num_channels": "8",
+            # mem_pool_size_gb controls the PINNED-HOST-memory staging
+            # buffer allocated by P2pNcclEngine via torch.empty(
+            # pin_memory=True). The upstream default is 32 GiB, which
+            # fails on clusters with restrictive RLIMIT_MEMLOCK (the
+            # engine subprocess dies silently during connector init).
+            # 2 GiB is plenty for typical per-request KV payloads.
+            "mem_pool_size_gb": str(args.kv_pool_size_gb),
         },
     )
 
@@ -720,20 +750,21 @@ def run_decode_role(args, examples: list[dict]):
     # late if any prior import already initialized CUDA.
     if "CUDA_VISIBLE_DEVICES" not in os.environ:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    _setup_network_env(args.iface)
+    local_ip = _local_ip_for(args.iface)
+    _setup_network_env(args.iface, local_ip=local_ip)
 
     log_dir = Path(os.environ.get("VLLM_ITERATION_LOG_DIR", str(OUTPUT_DIR)))
     decode_log_dir = log_dir / "decode"
     os.environ["VLLM_ITERATION_LOG_DIR"] = str(decode_log_dir)
 
-    local_ip = _local_ip_for(args.iface)
     prefill_kv_port = args.kv_port
     decode_kv_port = args.kv_port + 100
     print(
         f"[Decode] Role=kv_consumer  local_ip={local_ip}  "
         f"peer_ip={args.peer_ip}  "
         f"prefill_kv_port={prefill_kv_port}  decode_kv_port={decode_kv_port}  "
-        f"iface={args.iface}"
+        f"iface={args.iface}  "
+        f"kv_pool_gb={args.kv_pool_size_gb}"
     )
 
     from vllm.config import KVTransferConfig
@@ -745,12 +776,19 @@ def run_decode_role(args, examples: list[dict]):
         kv_role="kv_consumer",
         kv_rank=1,
         kv_parallel_size=2,
-        kv_buffer_size=8e9,
+        # Threshold (not the actual pinned allocation). On the
+        # consumer side we want room to accept multiple inflight
+        # transfers before the producer throttles.
+        kv_buffer_size=args.kv_pool_size_gb * (1024 ** 3),
         kv_ip=local_ip,
         kv_port=str(decode_kv_port),
         kv_connector_extra_config={
             "send_type": "PUT_ASYNC",
             "nccl_num_channels": "8",
+            # Controls the actual pinned-host staging buffer
+            # allocated by P2pNcclEngine. See run_prefill_role for
+            # why the upstream 32 GiB default is unsafe.
+            "mem_pool_size_gb": str(args.kv_pool_size_gb),
         },
     )
 
