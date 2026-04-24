@@ -342,6 +342,61 @@ def correlate_kernels_to_ranges(
     return result
 
 
+def merge_busy_intervals(
+    kernels: list[dict],
+    window_start_ns: int | None = None,
+    window_end_ns: int | None = None,
+) -> list[tuple[int, int]]:
+    """Return the kernels' wall-clock busy intervals merged into a
+    minimal sorted, non-overlapping list of (start, end) tuples.
+
+    Optional ``window_*`` clips intervals to the range so that kernels
+    straddling the boundary do not count outside it.
+    """
+    if not kernels:
+        return []
+    raw = [(k["start_ns"], k["end_ns"]) for k in kernels]
+    if window_start_ns is not None and window_end_ns is not None:
+        raw = [
+            (max(s, window_start_ns), min(e, window_end_ns))
+            for s, e in raw
+        ]
+        raw = [(s, e) for s, e in raw if s < e]
+    if not raw:
+        return []
+    raw.sort()
+    merged: list[list[int]] = [list(raw[0])]
+    for s, e in raw[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
+def sum_interval_intersection_ns(
+    a: list[tuple[int, int]],
+    b: list[tuple[int, int]],
+) -> int:
+    """Total nanoseconds of wall-clock during which BOTH sorted,
+    non-overlapping interval lists ``a`` and ``b`` are active.
+
+    Two-pointer linear sweep.
+    """
+    i = j = 0
+    total = 0
+    while i < len(a) and j < len(b):
+        lo = max(a[i][0], b[j][0])
+        hi = min(a[i][1], b[j][1])
+        if lo < hi:
+            total += hi - lo
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return total
+
+
 def compute_gpu_util(
     kernels: list[dict],
     wall_time_ns: int,
@@ -678,6 +733,15 @@ def process_single_dir(
             record.update(gpu_metrics)
 
             ve_kernel_time_ns = 0
+            # Track the LAST enclosing VE range and all its kernels so we
+            # can later intersect with the forward range's kernels to get
+            # the true GPU-side overlap (i.e. how long the GPU was doing
+            # BOTH VE and text forward at the same wall-clock time —
+            # which is exactly what --mm-pipeline's side-stream design
+            # tries to create).
+            ve_rng_for_iter: dict | None = None
+            ve_kernels_for_iter: list[dict] = []
+
             for ve_rng in ve_ranges:
                 if (
                     ve_rng["start_ns"] >= rng["start_ns"]
@@ -704,8 +768,12 @@ def process_single_dir(
                     record["vision_encoder_kernel_launch_gap_pct"] = round(
                         ve_gap_ns / rng["duration_ns"] * 100, 2
                     ) if rng["duration_ns"] > 0 else 0.0
+                    ve_rng_for_iter = ve_rng
+                    ve_kernels_for_iter = ve_kernels
             record["vision_encoder_kernel_time_ns"] = ve_kernel_time_ns
 
+            fwd_rng_for_iter: dict | None = None
+            fwd_kernels_for_iter: list[dict] = []
             for fwd_rng in fwd_ranges:
                 if (
                     fwd_rng["start_ns"] >= rng["start_ns"]
@@ -734,7 +802,40 @@ def process_single_dir(
                     record["text_forward_kernel_launch_gap_pct"] = round(
                         fwd_gap_ns / rng["duration_ns"] * 100, 2
                     ) if rng["duration_ns"] > 0 else 0.0
+                    fwd_rng_for_iter = fwd_rng
+                    fwd_kernels_for_iter = fwd_kernels
                     break  # one forward per iteration
+
+            # --- Kernel-level VE↔forward overlap within this iter ---
+            # This is the metric that quantifies how much wall-clock time
+            # was "saved" by --mm-pipeline: the duration in this iter
+            # during which the GPU was executing BOTH VE kernels and
+            # text-forward kernels simultaneously (they must be on
+            # different CUDA streams for this to be non-zero).
+            #
+            # With --mm-pipeline off: VE and forward kernels all land on
+            # the default stream and are serialized by the GPU → 0.
+            # With --mm-pipeline on: VE runs on encoder_stream, forward
+            # on default → intersection can be > 0.
+            #
+            # Note: this is measured from the cuda_gpu_trace (real
+            # kernel execution), NOT from host-side NVTX range endpoints
+            # (which would always be ~0 because the host-side VE scope
+            # is just the launch time of async kernels).
+            if ve_kernels_for_iter and fwd_kernels_for_iter:
+                ve_busy = merge_busy_intervals(ve_kernels_for_iter)
+                fwd_busy = merge_busy_intervals(fwd_kernels_for_iter)
+                overlap_ns = sum_interval_intersection_ns(ve_busy, fwd_busy)
+                record["nvtx_overlap_ns"] = overlap_ns
+                if rng["duration_ns"] > 0:
+                    record["nvtx_overlap_pct"] = round(
+                        overlap_ns / rng["duration_ns"] * 100, 2
+                    )
+                else:
+                    record["nvtx_overlap_pct"] = 0.0
+            else:
+                record["nvtx_overlap_ns"] = 0
+                record["nvtx_overlap_pct"] = 0.0
 
             if ncu_by_name and iter_kernels:
                 sm_metrics = enrich_with_ncu(iter_kernels, ncu_by_name)

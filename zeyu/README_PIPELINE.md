@@ -243,30 +243,62 @@ reader of `encoder_cache` is preceded by a `wait_event`.
 
 ## Measuring speedup
 
-Both modes go through the existing iteration logger (`VLLM_LOG_ITERATIONS=1`)
-and, optionally, the nsys NVTX pipeline. Compare:
+Two data sources:
+
+1. **`iterations.jsonl`** (always on via `VLLM_LOG_ITERATIONS=1`) —
+   one record per scheduler iteration with sampled GPU util / memory
+   from pynvml and step-level timing.
+2. **`consolidated_iterations.jsonl`** (written by
+   `analyze_profile.py` when the run was wrapped in `nsys profile`, i.e.
+   `--nsys` was passed to the launcher) — same records with kernel-level
+   fields added from the nsys CSV exports.
+
+nsys is required for the fine-grained per-phase kernel metrics
+(kernel-busy % during the VE sub-range vs the text-forward sub-range,
+kernel-launch gap, etc.). pynvml alone gives 100 Hz sampled GPU util
+for the whole iteration, not broken down by phase.
+
+Compare between modes:
 
 | Metric | Source | Expected change with pipeline on |
 |---|---|---|
 | `step_latency_ms` | `iterations.jsonl` | Lower on iters with new-MM arrivals |
-| `vision_encoder_kernel_time_ns` | `consolidated_iterations.jsonl` (nsys) | Unchanged (same kernels) |
-| `text_forward_kernel_time_ns` | `consolidated_iterations.jsonl` (nsys) | Unchanged |
-| `rps_end_to_end` | `disagg_summary.json` or summary of single-GPU run | Higher when workload has new multimodal arrivals during ongoing decode |
+| `vision_encoder_kernel_time_ns` | `consolidated_iterations.jsonl` | Unchanged (same kernels) |
+| `text_forward_kernel_time_ns` | `consolidated_iterations.jsonl` | Unchanged |
+| **`nvtx_overlap_ns`** (per-iter) | `consolidated_iterations.jsonl` | **0 in off mode; > 0 on overlap iters in on mode** |
+| **`sum_nvtx_overlap_ns`** (summary) | `disagg_summary.json` per-phase block | Total pipeline wall-clock savings |
+| `rps_end_to_end` | summary | Higher when workload has new MM arrivals during ongoing decode |
 | `nvml_gpu_util_pct_mean` | `iterations.jsonl` | Higher on overlap iters |
 
-The two NVTX scopes `gpu_model_runner: vision_encoder` and
-`gpu_model_runner: forward` will **overlap in wall time** on iters where
-a VE was prefetched — this is the whole point. `analyze_profile.py` at
-[`parse_nsys_nvtx_by_name`](./analyze_profile.py) reads each by name and
-does not assume non-overlap, so no parser change is needed.
+### About `nvtx_overlap_ns`
 
-To measure the overlap window explicitly, derive per-iter:
+Computed in `analyze_profile.py` as the wall-clock duration during
+which the GPU was executing **both** vision-encoder kernels AND
+text-forward kernels at the same time, inside a single scheduler
+iteration. Measured from the `cuda_gpu_trace` (actual kernel start +
+end per stream), not from host-side NVTX endpoints — the host-side
+scopes for the encoder are just microseconds (the time to launch
+async kernels on the side stream), so they would always read ~0 and
+miss the real GPU-side concurrency.
 
-```python
-nvtx_overlap_ns = max(0, min(ve_end, fwd_end) - max(ve_start, fwd_start))
-```
+Implementation:
+1. Filter kernels whose start falls in each iter's VE NVTX window →
+   `ve_kernels`.
+2. Same for text forward → `fwd_kernels`.
+3. Merge each set's intervals → `ve_busy`, `fwd_busy`.
+4. Sum the length of their intersection.
 
-from the two NVTX CSV files produced by nsys.
+With `--mm-pipeline off`: both sets run on the default stream and are
+serialized by the GPU → intersection = 0 by construction.
+With `--mm-pipeline on`: VE is on `encoder_stream`, forward on default,
+and the GPU can execute both (compute-bound + memory-bound) → positive
+intersection whenever the iter has a prefetched VE concurrent with an
+ongoing decode / prefill.
+
+Aggregate: `disagg_summary.json["summary"]["decode" / "prefill" /
+"vision_encoder"]` blocks will include `avg_nvtx_overlap_pct` (per-iter
+fraction of the iter window that was overlapped) and `sum_nvtx_overlap_ns`
+(total wall-clock covered by overlap across all iters of that phase).
 
 ---
 

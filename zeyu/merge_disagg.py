@@ -115,6 +115,7 @@ def _aggregate_iter_metrics(iterations: list[dict]) -> dict:
         "vision_encoder_kernel_launch_gap_pct",
         "text_forward_gpu_util_pct",
         "text_forward_kernel_launch_gap_pct",
+        "nvtx_overlap_pct",
         "gpu_mem_allocated_MiB",
         "gpu_mem_peak_MiB",
         "sm_active_pct_mean",
@@ -137,6 +138,7 @@ def _aggregate_iter_metrics(iterations: list[dict]) -> dict:
         "vision_encoder_kernel_time_ns",
         "text_forward_kernel_launch_gap_ns",
         "text_forward_kernel_time_ns",
+        "nvtx_overlap_ns",
     ):
         v = _sum_of(k)
         if v is not None:
