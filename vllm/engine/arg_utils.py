@@ -80,7 +80,12 @@ from vllm.config.model import (
     RunnerOption,
     TokenizerMode,
 )
-from vllm.config.multimodal import MMCacheType, MMEncoderTPMode, MMTensorIPC
+from vllm.config.multimodal import (
+    MMCacheType,
+    MMEncoderTPMode,
+    MMPipelineMode,
+    MMTensorIPC,
+)
 from vllm.config.observability import DetailedTraceModules
 from vllm.config.parallel import (
     All2AllBackend,
@@ -512,6 +517,7 @@ class EngineArgs:
     skip_mm_profiling: bool = MultiModalConfig.skip_mm_profiling
     video_pruning_rate: float | None = MultiModalConfig.video_pruning_rate
     mm_tensor_ipc: MMTensorIPC = MultiModalConfig.mm_tensor_ipc
+    mm_pipeline: MMPipelineMode = MultiModalConfig.mm_pipeline
     # LoRA fields
     enable_lora: bool = False
     max_loras: int = LoRAConfig.max_loras
@@ -1116,6 +1122,9 @@ class EngineArgs:
         multimodal_group.add_argument(
             "--mm-tensor-ipc", **multimodal_kwargs["mm_tensor_ipc"]
         )
+        multimodal_group.add_argument(
+            "--mm-pipeline", **multimodal_kwargs["mm_pipeline"]
+        )
 
         # LoRA related configs
         lora_kwargs = get_kwargs(LoRAConfig)
@@ -1448,6 +1457,7 @@ class EngineArgs:
             logits_processors=self.logits_processors,
             video_pruning_rate=self.video_pruning_rate,
             mm_tensor_ipc=self.mm_tensor_ipc,
+            mm_pipeline=self.mm_pipeline,
             io_processor_plugin=self.io_processor_plugin,
             renderer_num_workers=self.renderer_num_workers,
         )

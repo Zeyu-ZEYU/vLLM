@@ -411,6 +411,20 @@ def main():
         "Used by disagg launcher to keep role logs together.",
     )
 
+    # mono_kernel: single-GPU MM pipeline mode.
+    parser.add_argument(
+        "--mm-pipeline",
+        choices=["off", "on"],
+        default="off",
+        help="Enable single-GPU overlap of the vision encoder with "
+        "text decode on a dedicated CUDA side stream. The scheduler "
+        "pre-schedules the VE of waiting requests so its kernels run "
+        "concurrently with the current iter's text forward. This flag "
+        "is single-GPU only; it is silently ignored when --role is "
+        "prefill or decode (those run on separate nodes). "
+        "Default: off.",
+    )
+
     # Deprecated flag kept for backward compatibility.
     parser.add_argument(
         "--disagg",
@@ -420,6 +434,15 @@ def main():
         "Prefer --role prefill / --role decode for cross-node.",
     )
     args = parser.parse_args()
+
+    # mono_kernel: MM pipeline is single-GPU only. When a PD-disagg role
+    # (prefill / decode) is selected, silently force it off.
+    if args.role in ("prefill", "decode") and args.mm_pipeline != "off":
+        print(
+            f"[main] --mm-pipeline {args.mm_pipeline!r} is single-GPU only; "
+            f"forcing off for --role {args.role}."
+        )
+        args.mm_pipeline = "off"
 
     # Set up output dir.
     global OUTPUT_DIR
@@ -520,7 +543,7 @@ def _common_llm_kwargs(args, examples: list[dict]) -> dict:
         (ex.get("num_images", 0) for ex in examples), default=1
     )
     max_images = max(max_images, 1)
-    return dict(
+    kw: dict = dict(
         model=args.model,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
@@ -535,6 +558,13 @@ def _common_llm_kwargs(args, examples: list[dict]) -> dict:
         disable_log_stats=False,
         seed=42,
     )
+    # mono_kernel: forward the pipeline flag to LLM (-> MultiModalConfig).
+    # Only applies when --role is none (single-GPU offline); the PD-disagg
+    # prefill / decode roles ignore this (pipeline is single-GPU only).
+    mm_pipeline = getattr(args, "mm_pipeline", "off")
+    if mm_pipeline != "off":
+        kw["mm_pipeline"] = mm_pipeline
+    return kw
 
 
 def _setup_network_env(iface: str, local_ip: str | None = None):

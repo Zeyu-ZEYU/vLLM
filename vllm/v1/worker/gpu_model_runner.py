@@ -590,6 +590,21 @@ class GPUModelRunner(
         self.num_prompt_logprobs: dict[str, int] = {}
         self.comm_stream = torch.cuda.Stream()
 
+        # --- mono_kernel: single-GPU MM-pipeline side stream ---
+        # When `multimodal_config.mm_pipeline == "on"`, the vision-encoder
+        # kernels run on this dedicated stream so they can overlap with the
+        # default-stream text forward of other requests. `encoder_done_event`
+        # is recorded at the end of each _execute_mm_encoder() invocation;
+        # the default stream waits on it before consuming the encoder cache.
+        self._mm_pipeline_on: bool = (
+            getattr(getattr(model_config, "multimodal_config", None),
+                    "mm_pipeline", "off") == "on"
+        )
+        self.encoder_stream: torch.cuda.Stream | None = (
+            torch.cuda.Stream() if self._mm_pipeline_on else None
+        )
+        self.encoder_done_event: torch.cuda.Event | None = None
+
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
         # `initialize_kv_cache` based on the kv cache config. However, as in
@@ -1119,6 +1134,24 @@ class GPUModelRunner(
         deferred_spec_decode_corrections = []
 
         # Add new requests to the cached states.
+        # mono_kernel pipeline mode: detect "pipeline-prefetch" new reqs —
+        # those whose num_scheduled_tokens[req_id] == 0 AND who have
+        # scheduled_encoder_inputs[req_id]. The scheduler attaches a
+        # minimal NewRequestData (empty block_ids) for them so this loop
+        # can create a CachedRequestState for mm_features access, but
+        # they are NOT added to the input_batch this iter (no text
+        # tokens to run). They will be re-announced in a LATER iter's
+        # scheduled_new_reqs with real block_ids, and
+        # _update_streaming_request will then add them to input_batch.
+        _sched_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+        _sched_num_tokens = scheduler_output.num_scheduled_tokens
+
+        def _is_pipeline_prefetch_only(req_id: str) -> bool:
+            return (
+                _sched_num_tokens.get(req_id, 0) == 0
+                and bool(_sched_encoder_inputs.get(req_id))
+            )
+
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             if req_id in self.requests:
@@ -1178,6 +1211,12 @@ class GPUModelRunner(
             # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
             if self.uses_xdrope_dim > 0:
                 self._init_xdrope_positions(req_state)
+
+            if _is_pipeline_prefetch_only(req_id):
+                # Pipeline-prefetch: keep req_state in self.requests (so
+                # _batch_mm_inputs_from_scheduler can find mm_features)
+                # but do NOT add to input_batch — this iter runs only VE.
+                continue
 
             reqs_to_add.append(req_state)
             # Track new requests for ngram_gpu full tensor copy
@@ -2797,6 +2836,19 @@ class GPUModelRunner(
             "gpu_model_runner: vision_encoder"
         )
         _ve_scope.__enter__()
+
+        # --- mono_kernel MM-pipeline: side-stream entry ---
+        # When pipeline is on, launch all VE kernels on `self.encoder_stream`
+        # instead of the default stream so they can overlap with the
+        # default-stream text forward of other requests. We wait on the
+        # default stream first so any H2D copies of mm_kwargs (staged by
+        # group_and_batch_mm_kwargs below) are ordered correctly.
+        _default_stream_before_ve: torch.cuda.Stream | None = None
+        if self.encoder_stream is not None:
+            _default_stream_before_ve = torch.cuda.current_stream()
+            self.encoder_stream.wait_stream(_default_stream_before_ve)
+            torch.cuda.set_stream(self.encoder_stream)
+
         for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
             mm_kwargs,
             device=self.device,
@@ -2875,6 +2927,18 @@ class GPUModelRunner(
             encoder_outputs.extend(batch_outputs)
 
             current_item_idx += num_items
+
+        # --- mono_kernel MM-pipeline: side-stream exit + event record ---
+        # Record a CUDA event on encoder_stream after the last VE kernel is
+        # issued; default-stream consumers will wait on this event before
+        # reading self.encoder_cache. Then restore the original current
+        # stream so the rest of execute_model() continues on the default
+        # stream as before.
+        if self.encoder_stream is not None:
+            self.encoder_done_event = torch.cuda.Event()
+            self.encoder_done_event.record(self.encoder_stream)
+            assert _default_stream_before_ve is not None
+            torch.cuda.set_stream(_default_stream_before_ve)
 
         _ve_scope.__exit__(None, None, None)
 
@@ -3214,6 +3278,20 @@ class GPUModelRunner(
                 encoder_cache=self.encoder_cache,
             ) as ec_connector_output:
                 self._execute_mm_encoder(scheduler_output)
+                # --- mono_kernel MM-pipeline: default-stream wait ---
+                # If VE kernels were launched on self.encoder_stream, the
+                # default stream must synchronize on the recorded event
+                # before any op that consumes the cached encoder outputs
+                # (embed_input_ids below reads the tensor slices gathered
+                # here). Consumed here regardless of whether this iter
+                # launched the VE or a prior iter prefetched it.
+                if self.encoder_done_event is not None:
+                    torch.cuda.current_stream().wait_event(
+                        self.encoder_done_event
+                    )
+                    # Event is single-shot; clear so subsequent iters that
+                    # do not run VE don't wait on a stale record.
+                    self.encoder_done_event = None
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
@@ -3293,6 +3371,11 @@ class GPUModelRunner(
             # We are not doing any prompt replacement. We also will only
             # ever have a single encoder input.
             encoder_outputs = self._execute_mm_encoder(scheduler_output)
+            # mono_kernel MM-pipeline: sync default stream before decoder
+            # consumes encoder_outputs from the side stream.
+            if self.encoder_done_event is not None:
+                torch.cuda.current_stream().wait_event(self.encoder_done_event)
+                self.encoder_done_event = None
             model_kwargs.update({"encoder_outputs": encoder_outputs})
 
         return (

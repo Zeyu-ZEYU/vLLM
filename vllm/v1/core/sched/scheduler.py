@@ -204,6 +204,14 @@ class Scheduler(SchedulerInterface):
             mm_budget.encoder_compute_budget if mm_budget else 0
         )
         encoder_cache_size = mm_budget.encoder_cache_size if mm_budget else 0
+
+        # mono_kernel: pre-schedule VE of waiting reqs so VE kernels can
+        # overlap with the current iter's text forward on a side stream
+        # in the worker.
+        mm_cfg = getattr(self.vllm_config.model_config, "multimodal_config", None)
+        self._mm_pipeline_on: bool = (
+            getattr(mm_cfg, "mm_pipeline", "off") == "on"
+        )
         self.encoder_cache_manager = (
             EncoderDecoderCacheManager(cache_size=encoder_cache_size)
             if self.is_encoder_decoder
@@ -553,6 +561,30 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
+        # mono_kernel pipeline prefetch pass: if enabled, pre-schedule the
+        # vision encoder for requests that are still in waiting but whose
+        # multimodal inputs are not yet in the encoder cache. This lets
+        # the worker launch their VE kernels on a side stream THIS iter
+        # while the default stream runs text forward for running reqs.
+        # The prefetched reqs stay in waiting — they will be admitted
+        # normally in a LATER iter, at which point `_try_schedule_encoder
+        # _inputs` will see the encoder cache hit and run only text.
+        #
+        # `pipeline_prefetch_new_reqs_data` collects minimal NewRequestData
+        # entries so the worker has mm_features available to feed the
+        # encoder. `pipeline_prefetched_req_ids` tells the waiting-
+        # admission loop below to SKIP these reqs this iter (their text
+        # prefill is deferred).
+        pipeline_prefetched_req_ids: set[str] = set()
+        pipeline_prefetch_new_reqs_data: list[NewRequestData] = []
+        encoder_compute_budget = self._schedule_pipeline_prefetch(
+            encoder_compute_budget=encoder_compute_budget,
+            scheduled_encoder_inputs=scheduled_encoder_inputs,
+            num_scheduled_tokens=num_scheduled_tokens,
+            pipeline_prefetched_req_ids=pipeline_prefetched_req_ids,
+            pipeline_prefetch_new_reqs_data=pipeline_prefetch_new_reqs_data,
+        )
+
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
@@ -566,6 +598,17 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                # mono_kernel: if this req had its VE prefetched this iter,
+                # defer its text-prefill admission to a later iter so that
+                # the VE kernels (on the side stream) get wall-clock time
+                # to finish concurrently with the current iter's text
+                # forward. Route the req into skipped_waiting so it will
+                # be retried next iter.
+                if request_id in pipeline_prefetched_req_ids:
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -885,6 +928,13 @@ class Scheduler(SchedulerInterface):
                 for req in scheduled_new_reqs
             ]
 
+        # mono_kernel pipeline prefetch: append NewRequestData entries that
+        # carry only the mm_features (no KV blocks, no token ids to compute)
+        # so the worker can run the vision encoder for them on the side
+        # stream. These reqs will be re-admitted normally in a later iter.
+        if pipeline_prefetch_new_reqs_data:
+            new_reqs_data.extend(pipeline_prefetch_new_reqs_data)
+
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
                 scheduled_running_reqs,
@@ -1104,6 +1154,131 @@ class Scheduler(SchedulerInterface):
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
         )
+
+    def _schedule_pipeline_prefetch(
+        self,
+        encoder_compute_budget: int,
+        scheduled_encoder_inputs: dict[str, list[int]],
+        num_scheduled_tokens: dict[str, int],
+        pipeline_prefetched_req_ids: set[str],
+        pipeline_prefetch_new_reqs_data: list[NewRequestData],
+    ) -> int:
+        """Look-ahead VE scheduling for the single-GPU MM pipeline mode.
+
+        For each request still in ``self.waiting`` / ``self.skipped_waiting``
+        that has a multimodal input NOT yet in the encoder cache, schedule
+        its encoder inputs for this iteration without admitting the request
+        itself into ``running``. The worker's :meth:`_execute_mm_encoder`
+        will launch the VE kernels on the dedicated encoder stream,
+        overlapping them with the current iteration's text forward for
+        running reqs on the default stream.
+
+        The request stays in the waiting queue; on the iteration that
+        actually admits it, :meth:`_try_schedule_encoder_inputs` will see
+        the cache hit and skip re-running the encoder.
+
+        Invariants preserved:
+        - Token budget (``max_num_batched_tokens``) is untouched — only
+          encoder budget is consumed.
+        - KV cache allocator is untouched (no ``allocate_slots``).
+        - The prefetched req is not added to ``scheduled_running_reqs`` /
+          ``scheduled_new_reqs``; its entry in ``num_scheduled_tokens`` is
+          0, signalling to the worker: "encoder inputs only this iter".
+        """
+        if not self._mm_pipeline_on:
+            return encoder_compute_budget
+        if encoder_compute_budget <= 0:
+            return encoder_compute_budget
+        # Encoder-decoder models have their own one-shot encoder semantics;
+        # keep pipeline prefetch off there for now.
+        if self.is_encoder_decoder:
+            return encoder_compute_budget
+
+        # Iterate both waiting queues WITHOUT dequeueing. The built-in
+        # RequestQueue.__iter__ preserves the queue's internal order.
+        for request in list(self.waiting) + list(self.skipped_waiting):
+            if encoder_compute_budget <= 0:
+                break
+            if not request.has_encoder_inputs:
+                continue
+            if request.request_id in scheduled_encoder_inputs:
+                # Already prefetched in this iter (e.g. running pass did
+                # it) — don't double up.
+                continue
+            # Use the full remaining prompt range so we discover every
+            # encoder input the req will eventually need. We are not
+            # actually going to schedule any text tokens this iter.
+            num_remaining = (
+                request.num_prompt_tokens - request.num_computed_tokens
+            )
+            if num_remaining <= 0:
+                continue
+
+            (
+                encoder_inputs_to_schedule,
+                _adjusted_num_new_tokens,
+                new_encoder_compute_budget,
+                external_load_encoder_input,
+            ) = self._try_schedule_encoder_inputs(
+                request,
+                request.num_computed_tokens,
+                num_remaining,
+                encoder_compute_budget,
+                shift_computed_tokens=0,
+            )
+            if not encoder_inputs_to_schedule and not external_load_encoder_input:
+                continue
+
+            # Reserve encoder cache slots so subsequent iters see the
+            # cache as populated / in-flight and skip re-scheduling.
+            for i in encoder_inputs_to_schedule:
+                self.encoder_cache_manager.allocate(request, i)
+                if self.ec_connector is not None:
+                    self.ec_connector.update_state_after_alloc(request, i)
+            for i in external_load_encoder_input:
+                self.encoder_cache_manager.allocate(request, i)
+                if self.ec_connector is not None:
+                    self.ec_connector.update_state_after_alloc(request, i)
+
+            if encoder_inputs_to_schedule:
+                scheduled_encoder_inputs[request.request_id] = (
+                    encoder_inputs_to_schedule
+                )
+            # Force an explicit num_scheduled_tokens=0 entry so the
+            # worker's `scheduler_output.num_scheduled_tokens` dict knows
+            # about this req_id (even though no text tokens run).
+            num_scheduled_tokens.setdefault(request.request_id, 0)
+
+            # Mark so the waiting-admission loop below skips this req
+            # (defer its text-prefill to a later iter — VE needs to run
+            # first on the side stream).
+            pipeline_prefetched_req_ids.add(request.request_id)
+
+            # Create a minimal NewRequestData so the worker can reach
+            # this request's mm_features. Empty block_ids are fine — we
+            # won't allocate KV this iter; when the req is finally
+            # admitted, the real `scheduled_new_reqs` entry (with
+            # non-empty block_ids) takes over via _update_streaming_
+            # request in the worker.
+            num_kv_groups = len(self.kv_cache_config.kv_cache_groups)
+            empty_block_ids: tuple[list[int], ...] = tuple(
+                [] for _ in range(num_kv_groups)
+            )
+            if self.use_v2_model_runner:
+                pipeline_prefetch_new_reqs_data.append(
+                    NewRequestData.from_request(
+                        request,
+                        empty_block_ids,
+                        request._all_token_ids,
+                    )
+                )
+            else:
+                pipeline_prefetch_new_reqs_data.append(
+                    NewRequestData.from_request(request, empty_block_ids)
+                )
+            encoder_compute_budget = new_encoder_compute_budget
+
+        return encoder_compute_budget
 
     def _try_schedule_encoder_inputs(
         self,

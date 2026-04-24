@@ -60,6 +60,7 @@ class MultiModalDummyOptionsBuiltins(TypedDict, total=False):
 MMEncoderTPMode = Literal["weights", "data"]
 MMCacheType = Literal["shm", "lru"]
 MMTensorIPC = Literal["direct_rpc", "torch_shm"]
+MMPipelineMode = Literal["off", "on"]
 MMDummyOptions: TypeAlias = dict[str, BaseDummyOptions]
 """
 A dictionary containing an entry for each modality type of dummy data.
@@ -178,6 +179,21 @@ class MultiModalConfig:
     - "direct_rpc": Use msgspec serialization via RPC
     - "torch_shm": Use torch.multiprocessing shared memory for zero-copy IPC
     Defaults to "direct_rpc". """
+    mm_pipeline: MMPipelineMode = "off"
+    """Enable single-GPU overlap of the vision encoder (compute-bound) with
+    text decode (memory-bandwidth-bound) on a dedicated CUDA side stream.
+
+    - `"off"` (default): vision encoder and text forward run sequentially
+      on the default stream (upstream behavior).
+    - `"on"`: the V1 scheduler pre-schedules the vision encoder of requests
+      still in the `waiting` queue so it can run concurrently with the
+      current iteration's text forward for other requests. The engine core
+      launches vision-encoder kernels on a dedicated `encoder_stream`, and
+      the default-stream text forward synchronizes on the resulting CUDA
+      event only before consuming the encoder cache.
+
+    Only meaningful for multimodal models. For text-only models the setting
+    is silently ignored."""
 
     @field_validator("limit_per_prompt", mode="before")
     @classmethod
