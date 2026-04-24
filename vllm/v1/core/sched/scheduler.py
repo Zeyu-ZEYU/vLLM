@@ -1194,6 +1194,15 @@ class Scheduler(SchedulerInterface):
         if self.is_encoder_decoder:
             return encoder_compute_budget
 
+        import os as _os  # noqa
+        _dbg = _os.environ.get("VLLM_MM_PIPELINE_DEBUG", "0") == "1"
+        if _dbg:
+            logger.info(
+                "[mm-pipeline prefetch] enter: waiting=%d skipped=%d budget=%d",
+                len(self.waiting), len(self.skipped_waiting),
+                encoder_compute_budget,
+            )
+
         # Iterate both waiting queues WITHOUT dequeueing. The built-in
         # RequestQueue.__iter__ preserves the queue's internal order.
         for request in list(self.waiting) + list(self.skipped_waiting):
@@ -1253,6 +1262,12 @@ class Scheduler(SchedulerInterface):
             # (defer its text-prefill to a later iter — VE needs to run
             # first on the side stream).
             pipeline_prefetched_req_ids.add(request.request_id)
+            if _dbg:
+                logger.info(
+                    "[mm-pipeline prefetch] prefetch req=%s inputs=%s",
+                    request.request_id,
+                    encoder_inputs_to_schedule,
+                )
 
             # Create a minimal NewRequestData so the worker can reach
             # this request's mm_features. Empty block_ids are fine — we
