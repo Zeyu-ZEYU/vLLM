@@ -3278,19 +3278,49 @@ class GPUModelRunner(
                 encoder_cache=self.encoder_cache,
             ) as ec_connector_output:
                 self._execute_mm_encoder(scheduler_output)
-                # --- mono_kernel MM-pipeline: default-stream wait ---
-                # If VE kernels were launched on self.encoder_stream, the
-                # default stream must synchronize on the recorded event
-                # before any op that consumes the cached encoder outputs
-                # (embed_input_ids below reads the tensor slices gathered
-                # here). Consumed here regardless of whether this iter
-                # launched the VE or a prior iter prefetched it.
+                # --- mono_kernel MM-pipeline: conditional default-stream wait ---
+                # Default stream only needs to wait on the side-stream VE
+                # event if some ADMITTED request this iter is actually
+                # going to read an encoder_cache entry whose mm_hash was
+                # populated by the VE kernels just launched on
+                # self.encoder_stream. If the VE was purely a prefetch
+                # for a request NOT in this iter's input_batch AND none
+                # of the admitted reqs share that mm_hash, the default
+                # stream can skip the wait and run decode/forward
+                # concurrently with the side-stream VE — exactly the
+                # overlap the pipeline exists for.
                 if self.encoder_done_event is not None:
-                    torch.cuda.current_stream().wait_event(
-                        self.encoder_done_event
-                    )
-                    # Event is single-shot; clear so subsequent iters that
-                    # do not run VE don't wait on a stale record.
+                    just_produced_hashes: set[str] = set()
+                    for req_id, input_ids in (
+                        scheduler_output.scheduled_encoder_inputs.items()
+                    ):
+                        req_state = self.requests.get(req_id)
+                        if req_state is None or not req_state.mm_features:
+                            continue
+                        for i in input_ids:
+                            just_produced_hashes.add(
+                                req_state.mm_features[i].identifier
+                            )
+                    need_wait = False
+                    if just_produced_hashes:
+                        for admitted_req_id in self.input_batch.req_ids:
+                            if admitted_req_id is None:
+                                continue
+                            req_state = self.requests.get(admitted_req_id)
+                            if req_state is None or not req_state.mm_features:
+                                continue
+                            for f in req_state.mm_features:
+                                if f.identifier in just_produced_hashes:
+                                    need_wait = True
+                                    break
+                            if need_wait:
+                                break
+                    if need_wait:
+                        torch.cuda.current_stream().wait_event(
+                            self.encoder_done_event
+                        )
+                    # Event is single-shot; clear regardless so subsequent
+                    # iters that do not run VE don't wait on a stale record.
                     self.encoder_done_event = None
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
