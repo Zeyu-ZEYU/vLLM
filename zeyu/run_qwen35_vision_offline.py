@@ -411,6 +411,18 @@ def main():
         "Used by disagg launcher to keep role logs together.",
     )
 
+    # Useful for nsys profiling of single-GPU runs: turns off CUDA graph
+    # capture so every kernel launch shows up individually in the nsys
+    # cuda_gpu_trace. With CUDA graphs on, the trace can come back empty
+    # depending on the driver/nsys/CUPTI combination.
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        default=False,
+        help="Disable torch.compile + CUDA graphs. Recommended when "
+        "wrapping this script in `nsys profile`.",
+    )
+
     # mono_kernel: single-GPU MM pipeline mode.
     parser.add_argument(
         "--mm-pipeline",
@@ -564,6 +576,8 @@ def _common_llm_kwargs(args, examples: list[dict]) -> dict:
     mm_pipeline = getattr(args, "mm_pipeline", "off")
     if mm_pipeline != "off":
         kw["mm_pipeline"] = mm_pipeline
+    if getattr(args, "enforce_eager", False):
+        kw["enforce_eager"] = True
     return kw
 
 
