@@ -1511,6 +1511,13 @@ class Scheduler(SchedulerInterface):
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+            # mono_kernel MM pipeline: prefetched reqs have
+            # num_scheduled_tokens[req_id] == 0 (encoder-only this iter).
+            # They are not in self.running yet; the update_from_output
+            # bookkeeping below (sampled tokens, stop checks, draft
+            # tokens, etc.) does not apply. Skip them.
+            if num_tokens_scheduled == 0:
+                continue
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
