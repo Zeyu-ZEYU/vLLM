@@ -241,6 +241,102 @@ reader of `encoder_cache` is preceded by a `wait_event`.
 
 ---
 
+## Wrapping runs with nsys
+
+To actually populate `nvtx_overlap_ns` and the per-phase kernel
+metrics, wrap the python invocation in `nsys profile`. On the tested
+cluster two extra things were required:
+
+1. **Install standalone Nsight Systems inside the container.** The
+   simplest reliable way is to grab it from the host side and
+   `docker cp` it in (the container's apt state was broken and apt
+   install wasn't always reliable):
+
+   ```bash
+   # on host
+   docker cp /opt/nvidia/nsight-systems/2025.6.3 \
+             fe_rnic:/opt/nvidia/nsight-systems/2025.6.3
+   docker exec -u root fe_rnic ln -sf \
+             /opt/nvidia/nsight-systems/2025.6.3/bin/nsys \
+             /usr/local/bin/nsys
+   docker exec fe_rnic nsys --version
+   ```
+
+2. **Disable CUDA graphs and V1 multiprocessing** when wrapping with
+   nsys. Without these, the `cuda_gpu_trace` report comes back
+   `SKIPPED: nsys_report.sqlite does not contain GPU trace data`
+   (CUPTI's kernel-activity channel either didn't attach or the graph
+   replay wasn't expanded per-node):
+
+   - `--enforce-eager` on the script (disables CUDA graphs).
+   - `VLLM_ENABLE_V1_MULTIPROCESSING=0` env (runs the engine in the
+     same process nsys is tracing, rather than in a spawn'd subproc
+     that CUPTI loses track of).
+
+Example single-GPU pipeline=on run with nsys:
+
+```bash
+cd /home/zeyu/vllm/mono_kernel
+mkdir -p zeyu/outputs/nsys_on && cd zeyu/outputs/nsys_on
+
+CUDA_VISIBLE_DEVICES=7 \
+VLLM_LOG_ITERATIONS=1 \
+VLLM_NVTX_SCOPES_FOR_PROFILING=1 \
+VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+VLLM_ITERATION_LOG_DIR=. \
+nsys profile --trace=cuda,nvtx \
+     --output=nsys_report --force-overwrite=true \
+  python /home/zeyu/vllm/mono_kernel/zeyu/run_qwen35_vision_offline.py \
+         --model /home/zeyu/models/Qwen3-VL-8B-Instruct \
+         --num-prompts 4 --max-tokens 32 \
+         --enforce-eager --mm-pipeline on \
+         --output-dir /home/zeyu/vllm/mono_kernel/zeyu/outputs/nsys_on
+
+# Export CSVs
+nsys stats --force-export=true --format csv -r cuda_gpu_trace \
+           --output nsys_kernels nsys_report.nsys-rep
+nsys stats --force-export=true --format csv -r nvtx_pushpop_trace \
+           --output nsys_nvtx_pushpop nsys_report.nsys-rep
+
+# Enrich iterations.jsonl with kernel-level metrics
+cd /home/zeyu/vllm/mono_kernel
+python zeyu/analyze_profile.py zeyu/outputs/nsys_on
+```
+
+This produces `zeyu/outputs/nsys_on/consolidated_iterations.jsonl`
+with `nvtx_overlap_ns`, `vision_encoder_kernel_time_ns`,
+`text_forward_kernel_time_ns`, `gpu_util_pct` (kernel-busy), and the
+per-iter NVML samples already in `iterations.jsonl`.
+
+## When does `nvtx_overlap_ns` actually go > 0?
+
+Based on empirical measurement on this fork:
+
+- **Batch-submit workload** (all reqs enqueued via a single
+  `llm.generate([...])` call): `nvtx_overlap_ns = 0` across all iters,
+  even with `--mm-pipeline on`. Reason: the scheduler's first iter is
+  either "prefetch all reqs' VE, admit nothing" (empty default stream)
+  or "prefetch subset + admit shared-image reqs" (forced wait because
+  admitted reqs share mm_hashes with prefetched ones). Iter 1 and
+  later are pure-decode with no VE work to overlap against.
+- **True streaming workload** (new MM req arrives while an existing
+  req is decoding): `nvtx_overlap_ns > 0` on iters where (a) the
+  scheduler's waiting queue has a new multimodal req, (b) the prefetch
+  pass schedules its VE, (c) the admission loop can't promote it yet
+  (e.g. `max_num_seqs` full), and (d) the already-running decoding
+  reqs DON'T share an mm_hash with the newly-prefetched one. The
+  conditional `wait_event` in the worker skips the default-stream
+  sync in that case, letting decode kernels run in parallel with VE
+  kernels on the side stream.
+
+The offline script (`zeyu/run_qwen35_vision_offline.py`) uses
+synchronous `llm.generate(...)` / `llm.enqueue(...)` / 
+`llm.wait_for_completion()` APIs, neither of which stream requests
+into a running engine — so neither reaches the overlap scenario. To
+demonstrate the speedup empirically, serve the model via vLLM's
+OpenAI-compatible API server with `--mm-pipeline on` and drive it
+with a client that issues multimodal requests at a steady rate.
+
 ## Measuring speedup
 
 Two data sources:
