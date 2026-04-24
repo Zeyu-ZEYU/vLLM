@@ -604,6 +604,14 @@ class GPUModelRunner(
             torch.cuda.Stream() if self._mm_pipeline_on else None
         )
         self.encoder_done_event: torch.cuda.Event | None = None
+        # mm_hashes whose VE kernels were issued on `encoder_stream` but
+        # whose completion has NOT yet been observed by the default stream
+        # (no matching wait_event yet). Accumulates across iters because a
+        # prefetched VE may not be consumed until N iters later. When we
+        # wait on `encoder_done_event`, stream ordering on encoder_stream
+        # guarantees all prior kernels (hence all hashes in this set) are
+        # visible — so we clear the whole set then.
+        self._pending_ve_hashes: set[str] = set()
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -2937,6 +2945,11 @@ class GPUModelRunner(
         if self.encoder_stream is not None:
             self.encoder_done_event = torch.cuda.Event()
             self.encoder_done_event.record(self.encoder_stream)
+            # Track hashes whose VE is in-flight on the side stream. Must
+            # happen under the stream-swap scope so the hashes recorded
+            # here are the ones whose kernels are stream-ordered BEFORE
+            # the event we just recorded.
+            self._pending_ve_hashes.update(mm_hashes)
             assert _default_stream_before_ve is not None
             torch.cuda.set_stream(_default_stream_before_ve)
 
@@ -3279,49 +3292,38 @@ class GPUModelRunner(
             ) as ec_connector_output:
                 self._execute_mm_encoder(scheduler_output)
                 # --- mono_kernel MM-pipeline: conditional default-stream wait ---
-                # Default stream only needs to wait on the side-stream VE
-                # event if some ADMITTED request this iter is actually
-                # going to read an encoder_cache entry whose mm_hash was
-                # populated by the VE kernels just launched on
-                # self.encoder_stream. If the VE was purely a prefetch
-                # for a request NOT in this iter's input_batch AND none
-                # of the admitted reqs share that mm_hash, the default
-                # stream can skip the wait and run decode/forward
-                # concurrently with the side-stream VE — exactly the
-                # overlap the pipeline exists for.
-                if self.encoder_done_event is not None:
-                    just_produced_hashes: set[str] = set()
-                    for req_id, input_ids in (
-                        scheduler_output.scheduled_encoder_inputs.items()
-                    ):
-                        req_state = self.requests.get(req_id)
+                # We maintain `self._pending_ve_hashes` across iterations:
+                # every hash whose VE kernels have been issued on the side
+                # stream but whose completion has NOT yet been observed by
+                # the default stream. The default stream only needs to
+                # wait on `encoder_done_event` when some ADMITTED request
+                # this iter will read an encoder_cache entry whose hash is
+                # still pending. If none of the admitted reqs consume a
+                # pending hash, the default stream runs decode/forward in
+                # parallel with any in-flight side-stream VE — the overlap
+                # the pipeline exists for. Stream ordering on
+                # `encoder_stream` guarantees a later `wait_event` covers
+                # all earlier recorded events, so when we DO wait we can
+                # safely clear the full pending set.
+                if self.encoder_done_event is not None and self._pending_ve_hashes:
+                    admitted_hashes: set[str] = set()
+                    for admitted_req_id in self.input_batch.req_ids:
+                        if admitted_req_id is None:
+                            continue
+                        req_state = self.requests.get(admitted_req_id)
                         if req_state is None or not req_state.mm_features:
                             continue
-                        for i in input_ids:
-                            just_produced_hashes.add(
-                                req_state.mm_features[i].identifier
-                            )
-                    need_wait = False
-                    if just_produced_hashes:
-                        for admitted_req_id in self.input_batch.req_ids:
-                            if admitted_req_id is None:
-                                continue
-                            req_state = self.requests.get(admitted_req_id)
-                            if req_state is None or not req_state.mm_features:
-                                continue
-                            for f in req_state.mm_features:
-                                if f.identifier in just_produced_hashes:
-                                    need_wait = True
-                                    break
-                            if need_wait:
-                                break
-                    if need_wait:
+                        for f in req_state.mm_features:
+                            admitted_hashes.add(f.identifier)
+                    if self._pending_ve_hashes & admitted_hashes:
                         torch.cuda.current_stream().wait_event(
                             self.encoder_done_event
                         )
-                    # Event is single-shot; clear regardless so subsequent
-                    # iters that do not run VE don't wait on a stale record.
-                    self.encoder_done_event = None
+                        self._pending_ve_hashes.clear()
+                        self.encoder_done_event = None
+                    # else: leave state alive — a future iter that admits
+                    # a req consuming a pending hash will wait then. Not
+                    # waiting here is what enables overlap.
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
@@ -3402,10 +3404,13 @@ class GPUModelRunner(
             # ever have a single encoder input.
             encoder_outputs = self._execute_mm_encoder(scheduler_output)
             # mono_kernel MM-pipeline: sync default stream before decoder
-            # consumes encoder_outputs from the side stream.
+            # consumes encoder_outputs from the side stream. Encoder-
+            # decoder models always have immediate consumption — no
+            # overlap opportunity here — so we always wait.
             if self.encoder_done_event is not None:
                 torch.cuda.current_stream().wait_event(self.encoder_done_event)
                 self.encoder_done_event = None
+                self._pending_ve_hashes.clear()
             model_kwargs.update({"encoder_outputs": encoder_outputs})
 
         return (
