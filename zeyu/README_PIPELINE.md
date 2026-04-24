@@ -226,6 +226,19 @@ wrong. Most likely culprit: missing `wait_event` before a consumer of
 `vllm/v1/worker/gpu_model_runner.py:execute_model` and confirm each
 reader of `encoder_cache` is preceded by a `wait_event`.
 
+> **Important caveat for token-match testing.** Compare modes only
+> under **batch-submit** workloads (all requests enqueued at once via
+> `llm.generate(...)`). Staggered arrivals (`--delay N`, or
+> `llm.enqueue(...)` in a loop) introduce timing-dependent batch
+> composition that changes the order of floating-point reductions,
+> and *two back-to-back runs of the same mode* can produce a few
+> different tokens. This is not a pipeline bug — it is an inherent
+> property of async scheduling with chunked prefill. Measured on
+> this fork (Qwen3-VL-8B-Instruct, 20 reqs, 100 ms inter-arrival):
+> two back-to-back `--mm-pipeline off` runs diverged on 2 of 20
+> requests, the same order as the `on` vs `off` diff. Bit-exact
+> comparison is only meaningful when submission is deterministic.
+
 ---
 
 ## Measuring speedup
