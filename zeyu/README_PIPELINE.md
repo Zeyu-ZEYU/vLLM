@@ -21,13 +21,16 @@ does not use cross-node KV transfer.
 2. [Prerequisites](#prerequisites)
 3. [Checkout + build](#checkout--build)
 4. [Quick start (offline, single GPU)](#quick-start-offline-single-gpu)
-5. [Verify correctness](#verify-correctness)
-6. [Profile with nsys (optional but recommended)](#profile-with-nsys-optional-but-recommended)
-7. [Observe the overlap empirically: server + async client](#observe-the-overlap-empirically-server--async-client)
-8. [Metrics reference](#metrics-reference)
-9. [Limitations](#limitations)
-10. [Troubleshooting](#troubleshooting)
-11. [Appendix: how it works inside](#appendix-how-it-works-inside)
+5. [Providing your own dataset](#providing-your-own-dataset)
+6. [Verify correctness](#verify-correctness)
+7. [Profile with nsys (optional but recommended)](#profile-with-nsys-optional-but-recommended)
+8. [Observe the overlap empirically: server + async client](#observe-the-overlap-empirically-server--async-client)
+9. [Output layout](#output-layout)
+10. [Viewing and processing metrics](#viewing-and-processing-metrics)
+11. [Metrics reference](#metrics-reference)
+12. [Limitations](#limitations)
+13. [Troubleshooting](#troubleshooting)
+14. [Appendix: how it works inside](#appendix-how-it-works-inside)
 
 ---
 
@@ -118,6 +121,88 @@ why the offline script is only meaningful for correctness testing.
 
 If you have multiple GPUs, pin one with `--gpu N` (sets
 `CUDA_VISIBLE_DEVICES`).
+
+---
+
+## Providing your own dataset
+
+The built-in prompts cycle 4 toy images (2 unique: cherry-blossom and
+stop-sign) and are only useful as a smoke test — they share `mm_hash`es,
+so the encoder cache coalesces them and you can't see VE work spread
+over multiple iters. For any real measurement, provide your own JSONL
+dataset via `--input`.
+
+### JSONL format
+
+One request per line, each line a JSON object:
+
+| Field | Type | Required? | Description |
+|---|---|---|---|
+| `text` | string | **yes** | Raw user-side prompt. The launcher wraps it in the Qwen3 chat template automatically. |
+| `images` | string **or** list of strings | no | Local file path(s) to images (JPEG/PNG/WebP/anything PIL can open). HTTP URLs are **not** fetched; download first. Omit or leave empty for a text-only request. |
+| `delay` | integer | no | Milliseconds to sleep before submitting this request (simulates inter-arrival spacing). Default `0`. Overridden by `--delay` if passed. |
+
+### Example — `my_dataset.jsonl`
+
+```jsonl
+{"text": "What is in this picture?", "images": "/data/images/cat.jpg"}
+{"text": "Summarize the chart.", "images": ["/data/images/chart.png"]}
+{"text": "Compare these two screenshots.", "images": ["/data/a.png", "/data/b.png"]}
+{"text": "Write a haiku about autumn."}
+{"text": "Describe the key finding.", "images": "/data/figure2.webp", "delay": 100}
+```
+
+### Running with your dataset
+
+```bash
+python zeyu/run_qwen35_vision_offline.py \
+    --model Qwen/Qwen3-VL-8B-Instruct \
+    --input /path/to/my_dataset.jsonl \
+    --max-tokens 64 \
+    --mm-pipeline on \
+    --output-dir ./out_custom
+```
+
+`--num-prompts` is ignored when `--input` is given; the launcher runs
+exactly one request per JSONL line.
+
+### Design notes for a workload that exercises pipeline mode
+
+Pipeline mode overlaps ViT with ongoing decode. To actually observe
+that overlap (`nvtx_overlap_ns > 0`), your dataset should:
+
+1. **Use distinct images.** If many requests reuse the same image,
+   their `mm_hash` is identical; the encoder cache coalesces them and
+   only one VE runs. Each request should have a unique image or
+   sufficiently different crops.
+2. **Span varied text/image sizes.** Uniform requests batch too
+   cleanly and don't stress chunked prefill or continuous batching.
+3. **Stagger arrivals** (offline: set per-request `delay` in the
+   JSONL; online: use the server recipe below). Batch-submit still
+   runs but all VE fires in iter 0 and there's nothing to overlap
+   against.
+
+### Building from common MM benchmarks
+
+No benchmark-specific loader is shipped. Quick recipes to convert the
+most common formats to the JSONL above:
+
+- **COCO VQA / VQAv2**: `{"text": question, "images": image_path}` per
+  question JSON.
+- **MMBench / MME / MMMU**: flatten the multiple-choice options into
+  one string: `text = f"{question}\nA. {a}\nB. {b}\n...\nAnswer with
+  the letter only."`, `images = image_path`.
+- **ShareGPT4V / LLaVA-Bench**: use the `question` + `image` fields
+  directly.
+- **TextVQA / DocVQA** (long prompts): no special handling; just
+  ensure `--max-model-len` covers the concatenated prompt + image-
+  token count.
+
+### Validate your dataset
+
+Run with `--mm-pipeline off` first to make sure every line parses and
+produces output. Then re-run with `--mm-pipeline on` for correctness
+diff (see next section).
 
 ---
 
@@ -338,37 +423,277 @@ Same server + client, skip the nsys wrapper. You will not get
 
 ---
 
+## Output layout
+
+Every run writes to a single `--output-dir` (or `zeyu/outputs/
+pipeline_<mode>_<UTC>/` if you use `zeyu/pipeline_run.sh`). Layout:
+
+```
+<OUT>/
+├── latency_<timestamp>.json       # per-request metrics + top-level summary
+├── iterations.jsonl               # one line per scheduler iteration (pynvml path, always written)
+└── run.log                        # stdout/stderr (only when launched via pipeline_run.sh)
+```
+
+With `--nsys` (equivalently `bash zeyu/pipeline_run.sh --nsys`):
+
+```
+<OUT>/
+├── latency_<timestamp>.json
+├── iterations.jsonl
+├── run.log
+├── nsys_report.nsys-rep                    # raw nsys profile, open in Nsight GUI
+├── nsys_report.sqlite                      # same data as SQLite (used by `nsys stats`)
+├── nsys_kernels_cuda_gpu_trace.csv         # every kernel start/end on each CUDA stream
+├── nsys_nvtx_pushpop_nvtx_pushpop_trace.csv   # NVTX ranges (iter boundaries, VE / forward scopes)
+├── consolidated_iterations.jsonl           # iterations.jsonl + kernel-level fields
+├── consolidated_requests.jsonl             # per-request kernel-level rollup
+└── analyze.log                             # stdout from analyze_profile.py
+```
+
+All files are local to the run directory — nothing to merge, nothing
+to copy from a second node (pipeline mode is single-GPU).
+
+---
+
+## Viewing and processing metrics
+
+After a run finishes, **`latency_<timestamp>.json`** is the file you
+open first. Schema:
+
+```json
+{
+  "model": "Qwen/Qwen3-VL-8B-Instruct",
+  "mode": "single",
+  "timestamp": "2026-04-24T15:30:12+00:00",
+  "config": {
+     "max_model_len": 4096,
+     "max_num_seqs": 5,
+     "max_tokens": 64,
+     "tensor_parallel_size": 1,
+     "temperature": 0.0,
+     "dtype": "auto"
+  },
+  "summary": {
+     "mode": "single",
+     "num_requests": 20,
+     "num_encoder_runs": 2,
+     "total_decode_tokens": 1280,
+     "avg_vision_encoder_time_ms": 60.20,
+     "avg_prefill_time_ms": 83.38,
+     "avg_decode_time_ms": 414.51,
+     "avg_tpot_ms": 6.58,
+     "wall_time_s": 3.77,
+     "rps": 5.30
+  },
+  "requests": [
+     {"request_id": 0,
+      "image_source": "cherry_blossom (built-in)",
+      "question": "What is in this picture?",
+      "num_prompt_tokens": 1324, "num_generation_tokens": 64,
+      "vision_encoder_time_s": 0.0602, "vision_encoder_time_ms": 60.20,
+      "prefill_time_s": 0.083, "prefill_time_ms": 83.38,
+      "decode_time_s": 0.414, "decode_time_ms": 414.51,
+      "tpot_ms": 6.58,
+      "arrival_ts": ..., "scheduled_ts": ..., "first_token_ts": ..., "last_token_ts": ...,
+      "generated_text": "This image shows a cherry blossom tree in full bloom..."},
+     ... one per request ...
+  ]
+}
+```
+
+The stdout table at end-of-run has the same data in a compact form;
+`latency_*.json` is the canonical source.
+
+### Quick queries with `jq`
+
+```bash
+OUT=./out_custom    # ← your --output-dir
+
+# Top-line numbers
+jq '.summary' $OUT/latency_*.json
+
+# Per-request table as CSV (idx, VE_ms, prefill_ms, decode_ms, tpot_ms)
+jq -r '.requests[] | [.request_id, .vision_encoder_time_ms,
+                      .prefill_time_ms, .decode_time_ms, .tpot_ms] | @csv' \
+   $OUT/latency_*.json
+
+# Slowest 5 requests by prefill time
+jq -r '.requests | sort_by(-.prefill_time_ms) | .[0:5] |
+       .[] | "\(.request_id) \(.prefill_time_ms) \(.image_source)"' \
+   $OUT/latency_*.json
+
+# Step-latency timeline (from iterations.jsonl) as CSV
+jq -r '[.iter, .step_latency_ms, .num_scheduled_tokens,
+        .nvml_gpu_util_pct_mean] | @csv' \
+   $OUT/iterations.jsonl > iter_timeline.csv
+```
+
+### Python recipes for plotting / analysis
+
+```python
+import json, glob, numpy as np, matplotlib.pyplot as plt
+
+# Load the latest run's latency JSON.
+lat = json.load(open(sorted(glob.glob("./out_custom/latency_*.json"))[-1]))
+reqs = lat["requests"]
+
+# 1. Per-request time breakdown (stacked bar: VE / prefill / decode).
+N = len(reqs)
+ve = [r["vision_encoder_time_ms"] for r in reqs]
+pf = [r["prefill_time_ms"]        for r in reqs]
+de = [r["decode_time_ms"]         for r in reqs]
+x = np.arange(N)
+plt.bar(x, ve, label="VE")
+plt.bar(x, pf, bottom=ve, label="Prefill")
+plt.bar(x, de, bottom=np.add(ve, pf), label="Decode")
+plt.xlabel("Request #"); plt.ylabel("Time (ms)"); plt.legend(); plt.show()
+
+# 2. Step-latency timeline.
+iters = [json.loads(l) for l in open("./out_custom/iterations.jsonl") if l.strip()]
+lat_ms = [it["step_latency_ms"] for it in iters]
+plt.plot(lat_ms); plt.xlabel("Iteration"); plt.ylabel("step_latency_ms"); plt.show()
+
+# 3. GPU util timeline (pynvml path).
+util = [it["nvml_gpu_util_pct_mean"] for it in iters]
+plt.plot(util); plt.xlabel("Iteration"); plt.ylabel("GPU util %"); plt.show()
+```
+
+### Overlap analysis (nsys path)
+
+When `--nsys` is on, `analyze_profile.py` produces
+`consolidated_iterations.jsonl` with kernel-level fields. Count
+overlap iters and sum wall-clock savings:
+
+```python
+import json
+rows = [json.loads(l) for l in open("./out_custom/consolidated_iterations.jsonl") if l.strip()]
+
+# Iters where VE and forward ran concurrently on different streams.
+overlapped = [r for r in rows if r.get("nvtx_overlap_ns", 0) > 0]
+total_ov_ms = sum(r.get("nvtx_overlap_ns", 0) for r in rows) / 1e6
+print(f"iters: {len(rows)}  overlap_iters: {len(overlapped)}  total overlap: {total_ov_ms:.2f} ms")
+
+# Fraction of VE wall time that was hidden behind forward.
+ve_total_ms  = sum(r.get("vision_encoder_kernel_time_ns", 0) for r in rows) / 1e6
+if ve_total_ms > 0:
+    print(f"VE total: {ve_total_ms:.2f} ms  hidden by overlap: "
+          f"{total_ov_ms / ve_total_ms * 100:.2f}%")
+```
+
+### Re-running analysis without re-running the workload
+
+If you change `analyze_profile.py` or need to regenerate
+`consolidated_iterations.jsonl`:
+
+```bash
+python zeyu/analyze_profile.py ./out_custom/
+```
+
+### Comparing two runs (off vs on)
+
+```python
+import json, glob, pandas as pd
+
+def load(path):
+    lat = json.load(open(sorted(glob.glob(f"{path}/latency_*.json"))[-1]))
+    return lat["summary"]
+
+rows = []
+for label, path in [("off", "./out_off"), ("on", "./out_on")]:
+    s = load(path)
+    rows.append({"mode": label, **{k: s[k] for k in
+                 ("avg_vision_encoder_time_ms", "avg_prefill_time_ms",
+                  "avg_decode_time_ms", "avg_tpot_ms", "wall_time_s", "rps")}})
+df = pd.DataFrame(rows)
+print(df.to_string(index=False))
+```
+
+---
+
 ## Metrics reference
 
-Produced without nsys (just `VLLM_LOG_ITERATIONS=1`):
+### Per request — `latency_<timestamp>.json["requests"][i]`
 
-| Field | File | What it is |
-|---|---|---|
-| `step_latency_ms` | `iterations.jsonl` | Wall time of this scheduler iteration. |
-| `nvml_gpu_util_pct_mean` | `iterations.jsonl` | Mean pynvml-sampled GPU utilization during the iter. |
-| `nvml_gpu_util_pct_max` | `iterations.jsonl` | Peak sample during the iter. |
-| `num_scheduled_tokens` | `iterations.jsonl` | Total text tokens scheduled this iter. |
-| Request-level TTFT / JCT / decode times | `latency_*.json` | Per-request timing from `RequestOutput.metrics`. |
-
-Added by nsys + `analyze_profile.py` (writes `consolidated_iterations.jsonl`):
-
-| Field | What it is |
+| Field | Description |
 |---|---|
-| `gpu_util_pct` | Fraction of iter window during which at least one GPU kernel was running. |
-| `vision_encoder_kernel_time_ns` | Total kernel wall time inside the `vision_encoder` NVTX window (side stream when pipeline is on). |
-| `text_forward_kernel_time_ns` | Same for the `forward` NVTX window (default stream). |
-| `kernel_launch_gap_ns` | Sum of gaps between consecutive kernels — a large value means CPU-bound, small means GPU saturated. |
+| `request_id` | Integer index in submission order (0, 1, ...). |
+| `image_source` | Display label for the image (from built-in assets or the JSONL's `images` path). |
+| `question` | The user-side prompt passed to the chat template. |
+| `num_prompt_tokens` | Number of tokens after prompt-side tokenization (includes image-placeholder tokens). |
+| `num_generation_tokens` | Number of decode iterations = output tokens produced. |
+| `vision_encoder_time_s` / `vision_encoder_time_ms` | Time inside `embed_multimodal()`. **0** if the image hit the processor cache (a repeat of a previously-seen image). Not wall-clock-attributable when `--mm-pipeline on` — the VE runs on the side stream and is overlapped with something else. |
+| `prefill_time_s` / `prefill_time_ms` | `first_token_ts − scheduled_ts`. |
+| `decode_time_s` / `decode_time_ms` | `last_token_ts − first_token_ts`. |
+| `tpot_s` / `tpot_ms` | `decode_time / (num_generation_tokens − 1)`. |
+| `arrival_ts`, `scheduled_ts`, `first_token_ts`, `last_token_ts` | Unix timestamps (seconds, from `RequestOutput.metrics`). Use these to compute your own derived metrics if the pre-computed ones don't fit. |
+| `generated_text` | The decoded output string. Compare between `off` and `on` for correctness. |
+
+### Summary — `latency_<timestamp>.json["summary"]`
+
+| Field | Description |
+|---|---|
+| `mode` | `"single"` for pipeline runs; `"prefill"` / `"decode"` for PD-disagg. |
+| `num_requests` | Number of requests processed. |
+| `num_encoder_runs` | Number of requests that actually invoked the vision encoder (cache hits excluded). Useful to spot when the workload has too few unique images to exercise the pipeline. |
+| `total_decode_tokens` | Sum of `num_generation_tokens` across requests. |
+| `avg_vision_encoder_time_ms` | Mean VE time across requests that had a VE run. |
+| `avg_prefill_time_ms`, `avg_decode_time_ms`, `avg_tpot_ms` | Means across all requests. |
+| `wall_time_s` | End-to-end wall clock of `llm.generate(...)`. |
+| `rps` | `num_requests / wall_time_s`. |
+
+### Per iteration — `iterations.jsonl` (always written)
+
+One line per scheduler step.
+
+| Field | Description |
+|---|---|
+| `iter` | Iteration index (0-based, monotonic). |
+| `ts_mono`, `ts_wall` | Timestamps in seconds. Use `ts_mono` for durations. |
+| `step_latency_ms` | Wall time from the prior iter's end to this iter's end. |
+| `num_reqs` | Number of requests in this iter's `input_batch`. |
+| `step_rps` | Instantaneous RPS estimate. |
+| `has_encoder`, `encoder_req_ids[]` | Whether this iter ran VE; which req IDs. |
+| `prefill_req_ids[]`, `num_prefill_reqs`, `num_prefill_tokens` | Prefill work in this iter. |
+| `decode_req_ids[]`, `num_decode_reqs`, `num_decode_tokens` | Decode work in this iter. |
+| `total_tokens` | `num_prefill_tokens + num_decode_tokens`. |
+| `gpu_mem_allocated_MiB`, `gpu_mem_peak_MiB`, `gpu_mem_delta_MiB` | PyTorch allocator state at the end of the iter. |
+| `nvml_gpu_util_pct_mean`, `nvml_gpu_util_pct_max` | pynvml-sampled GPU util during the iter window. |
+| `nvml_mem_util_pct_mean` | pynvml-sampled memory-bus util. |
+| `nvml_mem_used_MiB_mean`, `nvml_mem_used_MiB_max` | Total GPU memory used (all processes). |
+
+### Per iteration — `consolidated_iterations.jsonl` (only with `--nsys`)
+
+Same shape as `iterations.jsonl` plus kernel-derived fields from the
+`nsys stats` CSVs:
+
+| Field | Description |
+|---|---|
+| `gpu_util_pct` | Fraction of iter window during which at least one GPU kernel was running (kernel-busy %). |
+| `total_kernel_time_ns` | Absolute kernel wall time in the iter window. |
 | `num_kernels` | Kernel count in the iter. |
-| **`nvtx_overlap_ns`** | Wall-clock duration during which VE kernels and text-forward kernels were both executing simultaneously (kernel-level intersection between the two streams). **This is the headline metric.** |
-| `nvtx_overlap_pct` | Same as above, normalized by iter window. |
+| `kernel_launch_gap_ns`, `kernel_launch_gap_pct` | Time during the iter when no kernel was running (often indicates CPU-bound stretches). |
+| `vision_encoder_gpu_util_pct` | Kernel-busy % during the `gpu_model_runner: vision_encoder` NVTX sub-range only. |
+| `vision_encoder_kernel_time_ns` | Absolute VE kernel wall time in this iter. When `--mm-pipeline on` this measures kernels on `encoder_stream`. |
+| `text_forward_gpu_util_pct` | Kernel-busy % during the `gpu_model_runner: forward` NVTX sub-range. |
+| `text_forward_kernel_time_ns` | Absolute text-forward kernel wall time. |
+| **`nvtx_overlap_ns`** | Wall-clock time during which VE kernels AND text-forward kernels were both executing **simultaneously** (kernel-level intersection between the two streams). **This is the headline metric.** |
+| `nvtx_overlap_pct` | `nvtx_overlap_ns` normalized by the iter window. |
 
-With `--mm-pipeline off` all VE and forward kernels are on the default
-stream so they're serialized by the GPU — `nvtx_overlap_ns = 0` by
-construction.
+With `--mm-pipeline off` all VE + forward kernels are serialized on
+the default stream → `nvtx_overlap_ns = 0` by construction.
 
-With `--mm-pipeline on` in a streaming workload `nvtx_overlap_ns > 0`
-on iters where a prefetched VE ran concurrent with an ongoing
-decode / prefill.
+With `--mm-pipeline on` and a streaming workload,
+`nvtx_overlap_ns > 0` on iters where a prefetched VE ran concurrent
+with an ongoing decode / prefill.
+
+### Per request — `consolidated_requests.jsonl` (only with `--nsys`)
+
+One record per request with rollups over the iters that request
+occupied. Fields include `external_id`, `request_id`, `first_iter`,
+`last_iter`, and the per-phase aggregates
+(`encoder_iters`, `prefill_iters`, `decode_iters`, plus their
+`*_kernel_time_ns` / `*_gpu_util_pct` summed or averaged).
 
 ---
 
