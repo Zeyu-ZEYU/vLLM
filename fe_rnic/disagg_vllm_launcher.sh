@@ -161,6 +161,7 @@ prefill)
         --max-num-seqs 256 \
         --gpu-memory-utilization 0.9 \
         --no-enable-prefix-caching \
+        --compilation-config '{"cudagraph_mode":"PIECEWISE"}' \
         --kv-transfer-config "$KV_CONFIG"
     ;;
 
@@ -222,6 +223,7 @@ decode)
         --max-num-seqs 256 \
         --gpu-memory-utilization 0.9 \
         --no-enable-prefix-caching \
+        --compilation-config '{"cudagraph_mode":"PIECEWISE"}' \
         --kv-transfer-config "$DEC_KV_CONFIG"
     ;;
 
@@ -240,12 +242,11 @@ proxy)
     echo "[proxy] Prefiller: ${PREFILL_PRIMARY_IP}:${PREFILL_PORT}"
     echo "[proxy] Decoders ($NUM_DECODERS): ${DECODE_HOSTS} port=${DECODE_PORT}"
 
-    RDMA_HOST_ARG=""
-    if [[ -n "${DECODE_RDMA_IPS:-}" ]]; then
-        RDMA_HOST_ARG="--decoder-rdma-host $DECODE_RDMA_IPS"
-        echo "[proxy] Decode RDMA hosts: ${DECODE_RDMA_IPS}"
-    fi
-
+    # NOTE: the proxy is a verbatim copy of the colleague's reference
+    # disagg_proxy_server.py (upstream LMCache PD-disagg sample). It does
+    # not accept --decoder-rdma-host. If you need the KV-overlap path
+    # (receiver_rdma_host injection), switch back to the fe_rnic branch
+    # variant of this proxy.
     python3 "$SCRIPT_DIR/disagg_proxy_server.py" \
         --host "0.0.0.0" \
         --port "$PROXY_PORT" \
@@ -254,8 +255,7 @@ proxy)
         --num-prefillers 1 \
         --decoder-host "$DECODE_HOSTS" \
         --decoder-port "$DECODE_PORTS" \
-        --num-decoders "$NUM_DECODERS" \
-        $RDMA_HOST_ARG
+        --num-decoders "$NUM_DECODERS"
     ;;
 
 # ------------------------------------------------------------------

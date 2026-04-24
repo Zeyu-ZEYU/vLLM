@@ -6,13 +6,12 @@ from dataclasses import dataclass
 from typing import Optional
 import argparse
 import asyncio
-import itertools
 import json
 import os
 import time
 
 # Third Party
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 import httpx
 import msgspec
@@ -24,7 +23,6 @@ import zmq.asyncio
 from lmcache.logging import init_logger
 from lmcache.v1.storage_backend.pd_backend import (
     PDMsg,
-    ProxyNotif,
 )
 
 logger = init_logger(__name__)
@@ -100,9 +98,6 @@ async def lifespan(app: FastAPI):
         len(dec_hosts) == 1 and len(dec_ports) == 1 and global_args.num_decoders > 1
     )
 
-    # Resolve per-decoder RDMA hostnames (for KV overlap)
-    dec_rdma_hosts = global_args.decoder_rdma_host or []
-
     for i, (host, port) in enumerate(decoder_pairs):
         decoder_base_url = f"http://{host}:{int(port)}"
         decode_client = httpx.AsyncClient(timeout=None, base_url=decoder_base_url)
@@ -115,23 +110,12 @@ async def lifespan(app: FastAPI):
             init_ports = list(global_args.decoder_init_port)
             alloc_ports = list(global_args.decoder_alloc_port)
 
-        # Map decoder index to its RDMA hostname (if available)
-        rdma_host = None
-        if dec_rdma_hosts:
-            rdma_host = dec_rdma_hosts[i % len(dec_rdma_hosts)]
-
-        # Use keyword arguments to avoid positional-order bugs:
-        # ClientInfo field order is (client, host, rdma_host, init_port,
-        # alloc_port); passing positional by mistake put init_ports into
-        # rdma_host which then propagated as a bogus preferred_segment
-        # to Mooncake — silently breaking KV Put on prefill.
         app.state.decode_clients.append(
             ClientInfo(
-                client=decode_client,
-                host=host,
-                rdma_host=rdma_host,
-                init_port=init_ports,
-                alloc_port=alloc_ports,
+                decode_client,
+                host,
+                init_ports,
+                alloc_ports,
             )
         )
 
@@ -141,12 +125,11 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: Close clients — ClientInfo wraps httpx.AsyncClient,
-    # so we must close the inner .client attribute, not the wrapper.
-    for info in app.state.prefill_clients:
-        await info.client.aclose()
-    for info in app.state.decode_clients:
-        await info.client.aclose()
+    # Shutdown: Close clients
+    for client in app.state.prefill_clients:
+        await client.aclose()
+    for client in app.state.decode_clients:
+        await client.aclose()
 
     global run_proxy
     run_proxy = False
@@ -209,12 +192,6 @@ def parse_args():
     parser.add_argument("--decoder-port", type=csv_ints, default=[8200])
     parser.add_argument("--decoder-init-port", type=csv_ints, default=[8300])
     parser.add_argument("--decoder-alloc-port", type=csv_ints, default=[8400])
-    parser.add_argument(
-        "--decoder-rdma-host",
-        type=csv_strs,
-        default=None,
-        help="Decode nodes' Mooncake RDMA hostnames (IPv6) for KV overlap",
-    )
 
     parser.add_argument("--num-decoders", type=int, default=1)
     parser.add_argument("--proxy-host", type=str, default="localhost")
@@ -228,7 +205,6 @@ def parse_args():
 class ClientInfo:
     client: httpx.AsyncClient
     host: Optional[str] = None
-    rdma_host: Optional[str] = None  # Mooncake RDMA hostname for KV overlap
     init_port: Optional[list[int]] = None
     alloc_port: Optional[list[int]] = None
 
@@ -237,13 +213,6 @@ class ClientInfo:
 app.state.prefill_clients = []
 app.state.decode_clients = []
 app.state.total_clients = []
-
-"""
-client_request and prefill/decode map
-key:   str    - unique id for requests across same conversation
-value: tuple  - (tokenization_client, prefiller_client, decoder_client)
-"""
-app.state.bound_clients = {}
 
 # Keep finished reqs
 app.state.finished_reqs = defaultdict(int)
@@ -256,42 +225,21 @@ run_proxy = True  # Shutdown flag
 async def zmq_pull_server():
     socket = zmq_ctx.socket(zmq.PULL)
     proxy_url = f"{global_args.proxy_host}:{global_args.proxy_port}"
-    try:
-        socket.bind(f"tcp://{proxy_url}")
-    except zmq.ZMQError:
-        logger.exception("ZMQ proxy server failed to bind on %s", proxy_url)
-        return
-    logger.info("ZMQ proxy server started on %s", proxy_url)
+    socket.bind(f"tcp://{proxy_url}")
+    logger.info(f"ZMQ proxy server started on {proxy_url}")
 
     while run_proxy:
         try:
             msg_bytes = await socket.recv()
+            msg = msgspec.msgpack.decode(msg_bytes, type=PDMsg)
+            req_id = msg.req_id
+            app.state.finished_reqs[req_id] += 1
+            logger.debug(f"Prefill of req {req_id} done.")
         except zmq.Again:
             await asyncio.sleep(0.01)  # Avoid busy loop
-            continue
-        except zmq.ZMQError as exc:
-            if exc.errno in (zmq.ETERM, zmq.ENOTSOCK):
-                break
-            logger.warning("ZMQ recv error: %s", exc)
-            await asyncio.sleep(0.05)
-            continue
-
-        try:
-            msg = msgspec.msgpack.decode(msg_bytes, type=PDMsg)
-        except msgspec.DecodeError as exc:
-            logger.warning("ZMQ received non-PD message: %s", exc)
-            continue
-        except Exception as exc:
-            logger.exception("ZMQ message decode failed: %s", exc)
-            continue
-
-        if not isinstance(msg, ProxyNotif):
-            logger.debug("ZMQ ignored message type: %s", type(msg).__name__)
-            continue
-
-        req_id = msg.req_id
-        app.state.finished_reqs[req_id] += 1
-        logger.debug("Prefill of req %s done.", req_id)
+        except Exception as e:
+            print("ZMQ Error:", e)
+            break
 
     socket.close()
     logger.info("ZMQ PULL server stopped.")
@@ -329,69 +277,11 @@ def round_robin_pick_client(clients, idx):
     return clients[idx % len(clients)]
 
 
-round_robin_counter = itertools.count()
-
-
-def round_robin_pick_clients() -> tuple[ClientInfo, ClientInfo, ClientInfo]:
-    idx = next(round_robin_counter)
-    tokenization_client = round_robin_pick_client(app.state.total_clients, idx)
-    prefill_client = round_robin_pick_client(app.state.prefill_clients, idx)
-    decode_client = round_robin_pick_client(app.state.decode_clients, idx)
-    return tokenization_client, prefill_client, decode_client
-
-
 async def wait_decode_kv_ready(req_id: str, num_tp_rank: int):
     while app.state.finished_reqs[req_id] < num_tp_rank:
         await asyncio.sleep(0.0001)  # sleep for 0.1 ms
     logger.debug(f"Prefill node signaled kv ready for req {req_id}")
     app.state.finished_reqs.pop(req_id)
-
-
-BOUND_CLIENTS_MAX_NUM = 1024 * 1024
-
-
-def pick_up_bound_clients(client_id: str) -> tuple[ClientInfo, ClientInfo, ClientInfo]:
-    if client_id not in app.state.bound_clients:
-        if len(app.state.bound_clients) >= BOUND_CLIENTS_MAX_NUM:
-            # Here simply clear the bound_clients if full
-            app.state.bound_clients.clear()
-        app.state.bound_clients[client_id] = round_robin_pick_clients()
-    return app.state.bound_clients[client_id]
-
-
-BOUND_CLIENT = os.getenv("CLIENT_BOUND", "false").lower() == "true"
-# CLIENT_BOUND_KEY, the field name of the client uid in http request
-CLIENT_BOUND_KEY = os.getenv("CLIENT_BOUND_KEY", "session-id")
-
-
-def pick_up_clients(request: Request) -> tuple[ClientInfo, ClientInfo, ClientInfo]:
-    bound_client_id = request.headers.get(CLIENT_BOUND_KEY) if BOUND_CLIENT else None
-    if bound_client_id:
-        # Use or create a persistent set of clients for the session.
-        return pick_up_bound_clients(bound_client_id)
-    return round_robin_pick_clients()
-
-
-@app.post("/tokenize")
-async def handle_tokenize(request: Request):
-    """Forward /tokenize to the prefiller.
-
-    The benchmark uses this when --exact-tokens is set: it tokenizes a
-    seed string via the proxy, slices the result to exactly input_len,
-    then sends the token list back on /v1/completions (where we skip
-    the proxy's own /tokenize round trip).
-    """
-    try:
-        body = await request.json()
-        tokenization_client, _, _ = pick_up_clients(request)
-        resp = await send_request_to_service(
-            tokenization_client.client, "/tokenize", body
-        )
-        return resp.json()
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/v1/completions")
@@ -404,24 +294,19 @@ async def handle_completions(request: Request):
     try:
         req_data = await request.json()
 
-        # Pick tokenization, prefill and decode client
-        tokenization_client, prefill_client, decode_client = pick_up_clients(request)
+        tokenization_client = round_robin_pick_client(app.state.total_clients, counter)
 
-        # If the client already sent a list of token IDs (benchmark's
-        # --exact-tokens path), skip the server-side /tokenize round
-        # trip and use the list as-is. This lets the caller control
-        # prefill's exact token count deterministically.
-        if isinstance(req_data.get("prompt"), list):
-            pass
-        else:
-            tokenize_output = await send_request_to_service(
-                tokenization_client.client, "/tokenize", {"prompt": req_data["prompt"]}
-            )
-            tokenize_output = tokenize_output.json()
-            req_data["prompt"] = tokenize_output["tokens"]
+        tokenize_output = await send_request_to_service(
+            tokenization_client.client, "/tokenize", {"prompt": req_data["prompt"]}
+        )
+        tokenize_output = tokenize_output.json()
 
         org_max_tokens = req_data["max_tokens"]
+        req_data["prompt"] = tokenize_output["tokens"]
         req_data["max_tokens"] = 1
+
+        # Pick decode client
+        decode_client = round_robin_pick_client(app.state.decode_clients, counter)
 
         disagg_spec = {
             "req_id": req_id,
@@ -429,9 +314,7 @@ async def handle_completions(request: Request):
             "receiver_init_port": decode_client.init_port,
             "receiver_alloc_port": decode_client.alloc_port,
         }
-        if decode_client.rdma_host:
-            disagg_spec["receiver_rdma_host"] = decode_client.rdma_host
-        num_tp_rank = len(decode_client.init_port or [])
+        num_tp_rank = len(decode_client.init_port)
 
         req_data["kv_transfer_params"] = {
             "ret_first_tok": True,
@@ -441,7 +324,8 @@ async def handle_completions(request: Request):
         req_data["stream"] = False
         stream_options = req_data.pop("stream_options", None)
 
-        # Send request to prefill service, ignore the response
+        # Send request to prefill service round robin, ignore the response
+        prefill_client = round_robin_pick_client(app.state.prefill_clients, counter)
         prefill_output = await send_request_to_service(
             prefill_client.client, "/v1/completions", req_data
         )
@@ -454,43 +338,12 @@ async def handle_completions(request: Request):
         req_data["max_tokens"] = org_max_tokens - 1
         req_data["prompt"].append(prefill_output["kv_transfer_params"]["first_tok"])
         req_data.pop("kv_transfer_params")
-        # Inject the PREFILL completion id as a correlation_id for the
-        # decode request. This is the same id the client sees in its
-        # first streaming chunk and the same id that shows up as the
-        # prefix of the producer-side JSONL's req_id. By having decode's
-        # adapter tag its consumer-side JSONL with this id too, the
-        # benchmark can join producer+consumer by a single key.
-        req_data["kv_transfer_params"] = {
-            "correlation_id": prefill_output["id"],
-        }
         req_data["stream"] = True
         if stream_options is not None:
             req_data["stream_options"] = stream_options
 
         # Stream response from decode service
         async def generate_stream():
-            # Extract server-side metrics from prefill response
-            server_metrics = {}
-            pf_params = prefill_output.get("kv_transfer_params", {})
-            if pf_params:
-                for k in ("prefill_time_ms", "kv_total_time_ms",
-                           "kv_exposed_time_ms"):
-                    if k in pf_params:
-                        server_metrics[k] = pf_params[k]
-
-            # t_dec_req_sent: capture the wall-clock instant the proxy
-            # is about to dispatch the decode HTTP POST. Stamped just
-            # before yielding head_chunk (which is itself immediately
-            # followed by the stream_service_response call that writes
-            # the decode request to the wire) — the delta between this
-            # stamp and the actual HTTP send is sub-ms.
-            #
-            # Piggy-backed through head_chunk.server_metrics so the
-            # client (benchmark.py) gets it with chunk 1 and can
-            # compute d_1st_tbt = t_2nd_token_recv - t_dec_req_sent.
-            t_dec_req_sent = time.time()
-            server_metrics["t_dec_req_sent"] = t_dec_req_sent
-
             head_chunk = {
                 "id": prefill_output["id"],
                 "object": "text_completion",
@@ -507,14 +360,11 @@ async def handle_completions(request: Request):
                 ],
                 "usage": None,
             }
-            if server_metrics:
-                head_chunk["server_metrics"] = server_metrics
             yield (
                 "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
             ).encode()
 
             # Wait until decode node signals that kv is ready
-            # NOTE: Commented out for Mooncake Store backend (see LMCache#1342)
             # await wait_decode_kv_ready(req_id, num_tp_rank)
 
             async for chunk in stream_service_response(
@@ -546,8 +396,7 @@ async def handle_chat_completions(request: Request):
     try:
         req_data = await request.json()
 
-        # Pick tokenization, prefill and decode client
-        tokenization_client, prefill_client, decode_client = pick_up_clients(request)
+        tokenization_client = round_robin_pick_client(app.state.total_clients, counter)
 
         # For chat completions, we need to tokenize the messages
         tokenize_output = await send_request_to_service(
@@ -564,16 +413,17 @@ async def handle_chat_completions(request: Request):
             org_max_completion_tokens = req_data["max_completion_tokens"]
             req_data["max_completion_tokens"] = 1
 
+        # Pick decode client
+        decode_client = round_robin_pick_client(app.state.decode_clients, counter)
+
         disagg_spec = {
             "req_id": req_id,
             "receiver_host": decode_client.host,
             "receiver_init_port": decode_client.init_port,
             "receiver_alloc_port": decode_client.alloc_port,
         }
-        if decode_client.rdma_host:
-            disagg_spec["receiver_rdma_host"] = decode_client.rdma_host
 
-        num_tp_rank = len(decode_client.init_port or [])
+        num_tp_rank = len(decode_client.init_port)
 
         req_data["kv_transfer_params"] = {
             "ret_first_tok": True,
@@ -583,7 +433,8 @@ async def handle_chat_completions(request: Request):
         req_data["stream"] = False
         stream_options = req_data.pop("stream_options", None)
 
-        # Send request to prefill service, get the response
+        # Send request to prefill service round robin, get the response
+        prefill_client = round_robin_pick_client(app.state.prefill_clients, counter)
         prefill_output = await send_request_to_service(
             prefill_client.client, "/v1/completions", req_data
         )
@@ -601,12 +452,6 @@ async def handle_chat_completions(request: Request):
         req_data["prompt"].append(prefill_output["kv_transfer_params"]["first_tok"])
 
         req_data.pop("kv_transfer_params")
-        # Inject correlation_id = prefill's completion id so decode's
-        # adapter can write consumer JSONL with the same key as the
-        # client's first-chunk id (matches producer JSONL via prefix).
-        req_data["kv_transfer_params"] = {
-            "correlation_id": prefill_output["id"],
-        }
         req_data["stream"] = True
         if stream_options is not None:
             req_data["stream_options"] = stream_options
@@ -649,7 +494,6 @@ async def handle_chat_completions(request: Request):
                 "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
             ).encode()
 
-            # NOTE: Commented out for Mooncake Store backend (see LMCache#1342)
             # await wait_decode_kv_ready(req_id, num_tp_rank)
 
             # Stream and convert completion format chunks to chat completion format
