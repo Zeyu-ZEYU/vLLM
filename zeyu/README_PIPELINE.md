@@ -241,6 +241,27 @@ reader of `encoder_cache` is preceded by a `wait_event`.
 
 ---
 
+## One-shot helper: `zeyu/pipeline_run.sh`
+
+Instead of remembering all the env vars and the nsys `profile` +
+`stats` + `analyze_profile.py` chain, use:
+
+```bash
+# pipeline off, no nsys
+bash zeyu/pipeline_run.sh --mm-pipeline off --num-prompts 4 --gpu 7
+
+# pipeline on, wrapped in nsys (forces --enforce-eager and
+# VLLM_ENABLE_V1_MULTIPROCESSING=0 for you, runs analyze_profile.py,
+# prints an overlap summary)
+bash zeyu/pipeline_run.sh --mm-pipeline on --num-prompts 4 --gpu 7 --nsys
+```
+
+Output goes to `zeyu/outputs/pipeline_<mode>_<UTC-timestamp>/` and
+includes `iterations.jsonl`, `latency_*.json`, and (with `--nsys`)
+`nsys_report.nsys-rep`, kernel + NVTX CSVs, and
+`consolidated_iterations.jsonl` with `nvtx_overlap_ns` populated.
+`bash zeyu/pipeline_run.sh --help` prints the flag list.
+
 ## Wrapping runs with nsys
 
 To actually populate `nvtx_overlap_ns` and the per-phase kernel
