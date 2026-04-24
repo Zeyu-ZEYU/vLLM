@@ -3895,6 +3895,21 @@ class GPUModelRunner(
                     return make_empty_encoder_model_runner_output(scheduler_output)
 
             if not num_scheduled_tokens:
+                # mono_kernel MM pipeline: this iter has no text tokens,
+                # but it MAY have vision-encoder inputs to prefetch for
+                # deferred-admission multimodal reqs. Run the encoder
+                # (on the side stream) before we return empty.
+                if (
+                    self.supports_mm_inputs
+                    and get_pp_group().is_first_rank
+                    and not self.model_config.is_encoder_decoder
+                    and scheduler_output.scheduled_encoder_inputs
+                ):
+                    with self.maybe_get_ec_connector_output(
+                        scheduler_output,
+                        encoder_cache=self.encoder_cache,
+                    ) as ec_connector_output:  # noqa: F841
+                        self._execute_mm_encoder(scheduler_output)
                 if (
                     self.parallel_config.distributed_executor_backend
                     == "external_launcher"
