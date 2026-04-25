@@ -13,7 +13,11 @@
 # Assumptions:
 #   - The proxy is up and reachable on localhost:9090.
 #   - The tokenizer path is valid locally (used client-side for random tokens).
-#   - --num-prompts=1000 matches the colleague's scale.
+#   - --num-prompts=400 (smaller than colleague's 1000 to keep
+#     each (length × concurrency) point's wall-clock under ~5 min;
+#     1000 prompts × 16K × conc=200 ≈ 19 min per point with our
+#     bf16 setup, total matrix ~3-4 hr per mode, too much for
+#     iterative work).
 #   - --random-output-len=5 keeps the measurement focused on prefill +
 #     KV transfer + first decode step (with output_len=5, ITL gives 4
 #     data points: ITL[0] is the cross-node KV pull dominated one;
@@ -38,7 +42,7 @@ TOKENIZER=/home/zeyu/models/Qwen3-235B-A22B
 HOST=localhost
 PORT=9090
 OUTPUT_LEN=5
-NUM_PROMPTS=1000
+NUM_PROMPTS=400
 OUT_DIR=/home/zeyu/exp_results/fe_rnic/bench_vllm
 
 for C in "${CONCURRENCIES[@]}"; do
