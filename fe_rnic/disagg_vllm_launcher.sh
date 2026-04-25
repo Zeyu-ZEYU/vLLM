@@ -161,6 +161,7 @@ prefill)
         --max-num-seqs 256 \
         --gpu-memory-utilization 0.9 \
         --no-enable-prefix-caching \
+        --compilation-config '{"cudagraph_mode":"PIECEWISE"}' \
         --kv-transfer-config "$KV_CONFIG"
     ;;
 
@@ -222,6 +223,7 @@ decode)
         --max-num-seqs 256 \
         --gpu-memory-utilization 0.9 \
         --no-enable-prefix-caching \
+        --compilation-config '{"cudagraph_mode":"PIECEWISE"}' \
         --kv-transfer-config "$DEC_KV_CONFIG"
     ;;
 
