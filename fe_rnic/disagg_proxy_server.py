@@ -469,28 +469,12 @@ async def handle_completions(request: Request):
 
         # Stream response from decode service
         async def generate_stream():
-            # Extract server-side metrics from prefill response
-            server_metrics = {}
-            pf_params = prefill_output.get("kv_transfer_params", {})
-            if pf_params:
-                for k in ("prefill_time_ms", "kv_total_time_ms",
-                           "kv_exposed_time_ms"):
-                    if k in pf_params:
-                        server_metrics[k] = pf_params[k]
-
-            # t_dec_req_sent: capture the wall-clock instant the proxy
-            # is about to dispatch the decode HTTP POST. Stamped just
-            # before yielding head_chunk (which is itself immediately
-            # followed by the stream_service_response call that writes
-            # the decode request to the wire) — the delta between this
-            # stamp and the actual HTTP send is sub-ms.
-            #
-            # Piggy-backed through head_chunk.server_metrics so the
-            # client (benchmark.py) gets it with chunk 1 and can
-            # compute d_1st_tbt = t_2nd_token_recv - t_dec_req_sent.
-            t_dec_req_sent = time.time()
-            server_metrics["t_dec_req_sent"] = t_dec_req_sent
-
+            # Synthesized first chunk = prefill's sampled token. We don't
+            # piggy-back any extra `server_metrics` field here: the old
+            # benchmark.py read it for d_1st_tbt etc., but we now drive
+            # benchmarks with `vllm bench serve` (which ignores any
+            # non-OpenAI fields), so server-side timings are collected
+            # exclusively via the LMCache adapter's per-request JSONL.
             head_chunk = {
                 "id": prefill_output["id"],
                 "object": "text_completion",
@@ -507,8 +491,6 @@ async def handle_completions(request: Request):
                 ],
                 "usage": None,
             }
-            if server_metrics:
-                head_chunk["server_metrics"] = server_metrics
             yield (
                 "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
             ).encode()
