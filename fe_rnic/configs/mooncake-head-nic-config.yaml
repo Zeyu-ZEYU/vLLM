@@ -19,11 +19,6 @@ remote_serde: "naive"
 local_cpu: False
 max_local_cpu_size: 32
 
-# Same rationale as tail config: auto-detect GPU↔NUMA and bind the
-# Mooncake Client process before setup so its pinned mmaps land on
-# the GPU's NUMA node.
-numa_mode: auto
-
 extra_config:
   local_hostname: "{LOCAL_HEAD_IP}"
   metadata_server: "http://{MASTER_IP}:8081/metadata"

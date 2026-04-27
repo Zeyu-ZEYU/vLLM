@@ -22,15 +22,6 @@ local_cpu: False
 # alone, leaves plenty of headroom.
 max_local_cpu_size: 32
 
-# Auto-detect GPU↔NUMA mapping by reading
-# /sys/bus/pci/devices/<gpu_pci>/numa_node, then call
-# mooncake.store.bind_to_numa_node(numa_id) before Mooncake
-# Client::SetupInternal so the 4 GB local_buffer + 32 GB segment
-# pinned mmaps land on the GPU's NUMA node. Without this LMCache
-# logs "NUMA mapping ... None / unavailable or disabled" three
-# times per worker and the pinned pool may straddle NUMA boundaries.
-numa_mode: auto
-
 extra_config:
   local_hostname: "{LOCAL_RDMA_IP}"
   metadata_server: "http://{MASTER_IP}:8080/metadata"
