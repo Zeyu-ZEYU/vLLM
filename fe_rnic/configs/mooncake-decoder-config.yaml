@@ -18,6 +18,10 @@ local_cpu: False
 # split is enabled).
 max_local_cpu_size: 32
 
+# See prefiller config — auto NUMA detect + bind so pinned pool stays
+# on the GPU's local NUMA node.
+numa_mode: auto
+
 extra_config:
   local_hostname: "{LOCAL_RDMA_IP}"
   metadata_server: "http://{MASTER_IP}:8080/metadata"
