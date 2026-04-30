@@ -1,0 +1,50 @@
+# ============================================================================
+# Mooncake LMCache config — Prefiller 节点
+# 占位符由 disagg_vllm_launcher.sh 启动时 sed 替换，生成到 /tmp/
+#   {MASTER_IP}     — mooncake master IPv4 地址 (eth0 管理网卡)
+#   {LOCAL_RDMA_IP} — 当前节点 IPv6 RDMA 地址 (bond 接口, 如 fd03:4514:80:6240::1)
+#   {IB_DEVICES}    — IB HCA 设备列表 (如 mlx5_bond_0,...,mlx5_bond_3)
+#
+# 网络平面:
+#   IPv4 (eth0/mlx5_0)         → remote_url / metadata_server / master_server_address
+#   IPv6 (bond0~3/mlx5_bond_*) → local_hostname / device_name / protocol (RDMA)
+# ============================================================================
+
+chunk_size: 256
+remote_url: "mooncakestore://{MASTER_IP}:50052/"
+remote_serde: "naive"
+local_cpu: False
+# 32 GB pinned CPU pool (was 100). Shrunk to keep total per-host
+# pinned memory under host RAM (2 TB) once the head-split path is
+# also enabled: 8 DP workers × (tail + head) × (pool + segment +
+# buffer) at 100 GB / 60 GB was OOM'ing on lj1. 32 GB pool per
+# backend × 2 backends × 8 workers = ~640 GB per host for pools
+# alone, leaves plenty of headroom.
+max_local_cpu_size: 32
+
+# Auto-detect GPU↔NUMA mapping by reading
+# /sys/bus/pci/devices/<gpu_pci>/numa_node, then call
+# mooncake.store.bind_to_numa_node(numa_id) before Mooncake
+# Client::SetupInternal so the 4 GB local_buffer + 32 GB segment
+# pinned mmaps land on the GPU's NUMA node. Without this LMCache
+# logs "NUMA mapping ... None / unavailable or disabled" three
+# times per worker and the pinned pool may straddle NUMA boundaries.
+numa_mode: auto
+
+extra_config:
+  local_hostname: "{LOCAL_RDMA_IP}"
+  metadata_server: "http://{MASTER_IP}:8080/metadata"
+  protocol: "rdma"
+  device_name: "{IB_DEVICES}"                      # mlx5_bond_0,...,mlx5_bond_3
+  master_server_address: "{MASTER_IP}:50052"
+  global_segment_size: 34359738368                 # 32 GB (was 60; see comment above)
+  local_buffer_size:    4294967296                  # 4 GB per GPU
+  transfer_timeout: 10
+  save_chunk_meta: False
+  # When KV head-NIC split is enabled, both the tail and head
+  # connectors register segments on the *same* master. Without a
+  # preferred_segment, master can cross-assign a tail put onto a
+  # head segment (registered on mlx5_0) and the tail engine's RDMA
+  # WRITE (mlx5_bond_*) would fail status=6 FAILED. Force local
+  # so the tail client always gets a tail-device segment.
+  mooncake_prefer_local_alloc: true

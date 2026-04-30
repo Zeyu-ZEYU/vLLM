@@ -1,0 +1,53 @@
+# ============================================================================
+# Mooncake LMCache config — Head NIC (管理网 RNIC mlx5_0)
+# 用于 KV 机头分流: 部分 KV chunk 通过机头 RNIC 传输
+#
+# 占位符由 ray_start.sh 启动时 sed 替换
+#   {MASTER_IP}      — mooncake master IPv4
+#   {LOCAL_HEAD_IP}  — 当前节点机头 RNIC 的 IPv4 地址 (eth0)
+# ============================================================================
+
+chunk_size: 256
+# NOTE: head Mooncake Client talks to its own dedicated master
+# (rpc 50053, http 8081) started by `bash master.sh --split`. Tail
+# segments live on master 50052, head segments on 50053 — the two
+# pools are physically isolated so master's PutStart cannot cross-
+# assign a tail client onto a head segment. See master.sh for
+# rationale.
+remote_url: "mooncakestore://{MASTER_IP}:50053/"
+remote_serde: "naive"
+local_cpu: False
+max_local_cpu_size: 32
+
+# Same rationale as tail config: auto-detect GPU↔NUMA and bind the
+# Mooncake Client process before setup so its pinned mmaps land on
+# the GPU's NUMA node.
+numa_mode: auto
+
+extra_config:
+  local_hostname: "{LOCAL_HEAD_IP}"
+  metadata_server: "http://{MASTER_IP}:8081/metadata"
+  protocol: "rdma"
+  device_name: "mlx5_0"
+  master_server_address: "{MASTER_IP}:50053"
+  # Aligned with the tail config (mooncake-prefiller-config.yaml /
+  # mooncake-decoder-config.yaml) so the only remaining asymmetry
+  # between tail and head backends is the physical NIC count
+  # (mlx5_0 = 1 NIC vs mlx5_bond_0..3 = 4 bonded NICs). This lets
+  # us attribute any head-vs-tail performance gap in the "route
+  # all chunks to X" experiments to the physical RNIC topology
+  # rather than config knobs.
+  global_segment_size: 34359738368                   # 32 GB (matches tail)
+  local_buffer_size:    4294967296                    # 4 GB (matches tail)
+  transfer_timeout: 10
+  save_chunk_meta: False
+  # LocalCPUBackend pinned CPU pool for the head side. Without this,
+  # _build_head_remote_backend defaults to 4 GB — much smaller than the
+  # tail's max_local_cpu_size — which would throttle the head path in
+  # any "route 100% to head" experiment. Set equal to the tail's
+  # max_local_cpu_size so the two backends have symmetric staging
+  # capacity.
+  head_local_cpu_size_gb: 32.0
+  # Defense in depth — even with master isolation, prefer local so puts
+  # stay on the issuing node's head segment whenever possible.
+  mooncake_prefer_local_alloc: true
