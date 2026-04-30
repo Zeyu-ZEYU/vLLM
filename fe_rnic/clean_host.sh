@@ -102,7 +102,7 @@ if [[ "${1:-}" == "--all" ]]; then
     for node in lj1.zeyu.tw lj2.zeyu.tw lj3.zeyu.tw; do
         echo "[${node}]"
         ssh -o ConnectTimeout=5 "zeyu@${node}" \
-            "cd /home/zeyu/vllm/fe_rnic/fe_rnic && bash clean_host.sh" 2>/dev/null \
+            "cd /home/zeyu/vLLM/v0.11.0/fe_rnic && bash clean_host.sh" 2>/dev/null \
             || echo "  连接失败: $node"
         echo ""
     done

@@ -158,7 +158,7 @@ if [[ "${1:-}" == "--all" ]]; then
     echo ""
     for node in lj1.zeyu.tw lj2.zeyu.tw lj3.zeyu.tw; do
         echo "[${node}]"
-        ssh -o ConnectTimeout=5 "zeyu@${node}" "docker exec -u zeyu fe_rnic bash -c 'export PATH=/home/zeyu/miniforge3/envs/fe_rnic/bin:\$PATH && cd /home/zeyu/vllm/fe_rnic/fe_rnic && bash clean.sh'" 2>/dev/null || echo "  连接失败: $node"
+        ssh -o ConnectTimeout=5 "zeyu@${node}" "docker exec -u \$(id -u):\$(id -g) fe_rnic bash -c 'export PATH=/home/zeyu/miniforge3/envs/fe_rnic/bin:\$PATH && cd /home/zeyu/vLLM/v0.11.0/fe_rnic && bash clean.sh'" 2>/dev/null || echo "  连接失败: $node"
         echo ""
     done
     echo "========== 全部清理完成 =========="
