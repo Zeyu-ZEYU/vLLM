@@ -57,9 +57,11 @@ _SAMPLER_TICK_S = 0.03
 # When a phase is shorter than the driver's sample period, no sample
 # timestamp falls strictly inside [t_start, t_end]. Fall back to samples
 # whose underlying averaging interval likely overlaps the phase window
-# by widening the lookup by this bound on each side (~100 ms is a
-# conservative upper estimate of NVML's internal sample period).
-_NVML_PERIOD_BOUND_S = 0.10
+# by widening the lookup by this bound on each side. Empirically measured
+# at 200 ms on H20 (driver utilization sampling = fixed 5 Hz cadence,
+# stdev <1 ms). Use 300 ms = dt * 1.5 so the bracketing sample is always
+# inside the lookup range even with small jitter.
+_NVML_PERIOD_BOUND_S = 0.30
 # Bound on each in-memory deque (~10 minutes of headroom at ~33 Hz).
 _NVML_BUFFER_MAX = 60000
 
