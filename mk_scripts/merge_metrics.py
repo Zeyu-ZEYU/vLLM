@@ -21,7 +21,28 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from typing import Any
+
+
+# vLLM v1's engine input processor wraps every externally-supplied request_id
+# as "<server_prefix>-<external_id>-<8hex>" where:
+#   server_prefix = "chatcmpl-" for /v1/chat/completions, "cmpl-" for
+#                   /v1/completions, "" for low-level /v1/responses, etc.
+#   <8hex>        = first 8 chars of a random UUID (input_processor.py:232)
+# The merge needs to recover <external_id> to key by the input JSONL's `id`.
+_RANDOMIZED_SUFFIX_RE = re.compile(r"-[0-9a-f]{8}$")
+_KNOWN_SERVER_PREFIXES = ("chatcmpl-", "cmpl-", "embd-", "rerank-")
+
+
+def _recover_external_req_id(internal: str) -> str:
+    """Best-effort recovery of the user-supplied request_id from vLLM's
+    internal-form id."""
+    s = _RANDOMIZED_SUFFIX_RE.sub("", internal)
+    for prefix in _KNOWN_SERVER_PREFIXES:
+        if s.startswith(prefix):
+            return s[len(prefix):]
+    return s
 
 
 def _load_jsonl(path: str) -> list[dict[str, Any]]:
@@ -73,9 +94,13 @@ def main() -> None:
 
     inputs = _load_jsonl(a.inputs)
     server_records = _load_jsonl(a.server)
-    server_by_id: dict[str, dict[str, Any]] = {
-        str(r.get("vllm_req_id")): r for r in server_records
-    }
+    # Key server records by recovered external id so the input JSONL's `id`
+    # field matches.
+    server_by_id: dict[str, dict[str, Any]] = {}
+    for r in server_records:
+        internal = str(r.get("vllm_req_id", ""))
+        ext = _recover_external_req_id(internal)
+        server_by_id[ext] = r
 
     # Bench-serve --save-detailed parallel arrays (positional, in input order).
     output_lens = client.get("output_lens") or []
