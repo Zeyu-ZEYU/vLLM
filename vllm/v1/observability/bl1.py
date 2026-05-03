@@ -382,6 +382,32 @@ class Bl1Recorder:
         nxt = next((v for t, v in samples if t >= t_end), None)
         return [nxt] if nxt is not None else []
 
+    def _bracketing_diag(self, samples, t_end: float, label: str) -> None:
+        """Diagnostic dump when bracketing fails: deque size, first/last
+        sample timestamps, and how t_end compares. Writes one line to
+        $MONO_KERNEL_BL1_DIAG_PATH if set, else silently returns."""
+        path = os.environ.get("MONO_KERNEL_BL1_DIAG_PATH")
+        if not path:
+            return
+        try:
+            with self._nvml_lock:
+                n = len(samples)
+                first_t = samples[0][0] if n else None
+                last_t = samples[-1][0] if n else None
+            with open(path, "a", buffering=1, encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "kind": label,
+                    "t_end": t_end,
+                    "deque_n": n,
+                    "first_t": first_t,
+                    "last_t": last_t,
+                    "t_end_minus_last_t": (t_end - last_t) if last_t is not None else None,
+                    "anchor_host_t": self._anchor_host_t,
+                    "nvml_offset_s": self._nvml_to_host_offset_s,
+                }) + "\n")
+        except Exception:
+            pass
+
     def _window_mean(self, t_start: float, t_end: float
                      ) -> tuple[Optional[float], Optional[float]]:
         """Estimate phase-window GPU utilization and memory %.
@@ -403,6 +429,10 @@ class Bl1Recorder:
                 gu_vals = self._bracketing_value(self._gu_samples, t_end)
             if not gmu_vals:
                 gmu_vals = self._bracketing_value(self._gmu_samples, t_end)
+        if not gu_vals:
+            self._bracketing_diag(self._gu_samples, t_end, "gu_miss")
+        if not gmu_vals:
+            self._bracketing_diag(self._gmu_samples, t_end, "gmu_miss")
         gu = (sum(gu_vals) / len(gu_vals)) if gu_vals else None
         gmu = (sum(gmu_vals) / len(gmu_vals)) if gmu_vals else None
         return gu, gmu
