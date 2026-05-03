@@ -31,20 +31,20 @@ ARGS_TAG=${ARGS_TAG:-qwen3vl8b_n5_rps2}
 PORT=${PORT:-8000}
 NUM_PROMPTS=${NUM_PROMPTS:-5}
 REQUEST_RATE=${REQUEST_RATE:-2}
+GPUS=${GPUS:-0}
+# Force visible GPUs early so every child inherits the pin.
+export CUDA_VISIBLE_DEVICES="$GPUS"
 
 mkdir -p "$OUTPUTS_DIR" "$LOGS_DIR"
 
-# 1) ensure example inputs exist
+# 1) clean residual processes and free ports.
+PORTS="$PORT" SLEEP_AFTER=${CLEAN_SLEEP:-80} \
+    bash "$WORKTREE/mk_scripts/clean.sh"
+
+# 2) ensure example inputs exist
 if [[ ! -f "$INPUTS_DIR/requests/example.jsonl" ]]; then
     echo "[run_bl1] generating example inputs at $INPUTS_DIR"
     python "$WORKTREE/mk_scripts/make_example_inputs.py" --out-dir "$INPUTS_DIR"
-fi
-
-# 2) free port and clean stale processes; wait for TIME_WAIT
-if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q ":$PORT"; then
-    echo "[run_bl1] port $PORT busy; killing stale vllm processes"
-    pkill -f "vllm.*serve" || true
-    sleep 80
 fi
 
 T=$(date +%Y%m%d_%H%M%S)
@@ -63,7 +63,7 @@ MONO_KERNEL_BL1_METRICS_PATH="$SERVER_SIDE" \
         --tensor-parallel-size 1 \
         --port "$PORT" \
         --max-num-seqs 4 \
-        --enable-mm-processor-stats \
+        --allowed-local-media-path "$INPUTS_DIR/assets" \
         > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
@@ -111,6 +111,7 @@ echo "[run_bl1] running vllm bench serve: log=$CLIENT_LOG"
 vllm bench serve \
     --backend openai-chat \
     --base-url "http://127.0.0.1:$PORT" \
+    --endpoint /v1/chat/completions \
     --model "$MODEL" \
     --dataset-name custom_mm \
     --dataset-path "$INPUTS_DIR/requests/example.jsonl" \
