@@ -2248,21 +2248,27 @@ class CustomDataset(BenchmarkDataset):
 class CustomMMDataset(CustomDataset):
     """
     Implements the Custom MultiModal dataset. Loads data from a JSONL file and generates
-    sample requests based on conversation turns. E.g.,
+    sample requests based on conversation turns. Supports two row schemas:
+
+    Legacy:
     ```
-    {
-        "prompt": "How many red blocks in the given images?",
-        "image_files": ["path/to/image1.png", "path/to/image2.png"],
-    }
-    {
-        "prompt": "Which country has the most pokemons based on the given graphs?",
-        "image_files": ["path/to/image.png"],
-    }
+    {"prompt": "...", "image_files": ["path/to/image.png", ...]}
     ```
 
-    NOTE: Only the first image file in "image_files" is used for each sample request.
+    Mono_kernel BL1 spec (id passthrough + per-row output budget):
+    ```
+    {"id": 0, "prompt": "...", "image": "path/to/image.png",
+     "output": "groundtruth", "output_tokens": 32}
+    ```
 
-    This is used to benchmark multimodal LLMs on arbitrary datasets.
+    NOTE: Only the first image file is used per sample. When `id` is present
+    on a row, it is used directly as the engine `request_id` (sent via the
+    `x-request-id` header) so server-side instrumentation can correlate by
+    the same id. When `output_tokens` is present, it overrides the CLI
+    `--custom-output-len` value for that row.
+
+    Set `--disable-shuffle` to preserve the input file's row order, which the
+    BL1 merge step relies on to reconstruct the per-id metric mapping.
     """
 
     IS_MULTIMODAL = True
@@ -2294,27 +2300,60 @@ class CustomMMDataset(CustomDataset):
             prompt = item["prompt"]
 
             prompt_len = len(tokenizer(prompt).input_ids)
-            images = item["image_files"]
-            if len(images) > 1:
-                logger.warning(
-                    "Multiple image files found for sample %d. "
-                    "Only the first image will be used.",
-                    i,
+
+            # Resolve image source: prefer single `image`, fall back to
+            # legacy `image_files` list. NaN-tolerance: pandas read_json
+            # may produce NaN for missing keys.
+            image_path: str | None = None
+            if "image" in item and isinstance(item["image"], str) and item["image"]:
+                image_path = item["image"]
+            elif "image_files" in item:
+                images = item["image_files"]
+                if isinstance(images, (list, tuple)) and len(images) > 0:
+                    if len(images) > 1:
+                        logger.warning(
+                            "Multiple image files found for sample %d. "
+                            "Only the first image will be used.", i,
+                        )
+                    image_path = images[0]
+            if image_path is None:
+                raise ValueError(
+                    f"Custom MM row {i} has no `image` or `image_files`."
                 )
-            mm_content = process_image(images[0])
+            mm_content = process_image(image_path)
+
             if enable_multimodal_chat:
                 # Note: when chat is enabled the request prompt_len is no longer
                 # accurate and we will be using request output to count the
                 # actual prompt len
                 prompt = self.apply_multimodal_chat_transformation(prompt, mm_content)
 
+            # Per-row output budget overrides the CLI --custom-output-len.
+            row_output_len = output_len
+            if "output_tokens" in item:
+                v = item["output_tokens"]
+                try:
+                    if v is not None and not (isinstance(v, float) and v != v):
+                        row_output_len = int(v)
+                except (ValueError, TypeError):
+                    pass
+
+            # Passthrough `id` as the engine request_id when present.
+            req_id: str
+            if "id" in item and item["id"] is not None and not (
+                isinstance(item["id"], float) and item["id"] != item["id"]
+            ):
+                req_id = str(item["id"])
+            else:
+                req_id = request_id_prefix + str(i)
+
             sampled_requests.append(
                 SampleRequest(
                     prompt=prompt,
                     prompt_len=prompt_len,
-                    expected_output_len=output_len,
+                    expected_output_len=row_output_len,
                     multi_modal_data=mm_content,
-                    request_id=request_id_prefix + str(i),
+                    request_id=req_id,
                 )
             )
         self.maybe_oversample_requests(
