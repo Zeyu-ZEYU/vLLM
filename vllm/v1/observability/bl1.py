@@ -58,16 +58,13 @@ _NVML_BUFFER_MAX = 30000
 @dataclass
 class _PhaseBounds:
     first_start_event: torch.cuda.Event
-    first_start_host: float
     last_end_event: torch.cuda.Event
-    last_end_host: float
 
 
 @dataclass
 class StepCtx:
     """Returned by step_begin / vision_begin; consumed by step_end / vision_end."""
     start_event: torch.cuda.Event
-    start_host: float
     # Map req_id -> phase name for the requests in this step.
     req_phases: dict[str, str] = field(default_factory=dict)
 
@@ -91,6 +88,14 @@ class Bl1Recorder:
         self._sampler_stop = threading.Event()
         self._sampler_thread: Optional[threading.Thread] = None
         self._nvml_handle = None
+
+        # Anchor for converting CUDA-event device time to host wall-clock.
+        # Recorded + synchronized once on first phase begin so that
+        # elapsed_time(anchor, event) gives a relative ms from a known host
+        # wall-time. Used to align phase windows to NVML sample timestamps.
+        self._anchor_event: Optional[torch.cuda.Event] = None
+        self._anchor_host_t: Optional[float] = None
+        self._anchor_lock = threading.Lock()
 
         # Sidecar file (line-buffered append). One writer, no lock needed.
         os.makedirs(os.path.dirname(self._sidecar_path) or ".", exist_ok=True)
@@ -154,9 +159,45 @@ class Bl1Recorder:
 
     # ---- step-level hooks ---------------------------------------------------
 
+    def _ensure_anchor(self) -> None:
+        """Establish a one-time CUDA event whose device time is aligned to
+        host wall-clock. Subsequent phase events compare to this anchor via
+        ``cuda.Event.elapsed_time`` to get device-side timestamps usable for
+        NVML sample windowing."""
+        if self._anchor_event is not None:
+            return
+        with self._anchor_lock:
+            if self._anchor_event is not None:
+                return
+            try:
+                # Drain any pending work so the anchor record-time on the
+                # device closely matches host wall-clock.
+                torch.cuda.synchronize()
+                anchor = torch.cuda.Event(enable_timing=True)
+                anchor.record()
+                anchor.synchronize()
+                self._anchor_host_t = time.time()
+                self._anchor_event = anchor
+            except Exception:
+                # If anchor init fails (e.g. CUDA not ready), leave None;
+                # finalize_request will then skip NVML windowing for this run.
+                pass
+
+    def _device_host_time(self, event: torch.cuda.Event) -> Optional[float]:
+        """Host-wall-clock equivalent of when ``event`` was actually recorded
+        on the device. Caller must have already synchronized ``event``."""
+        if self._anchor_event is None or self._anchor_host_t is None:
+            return None
+        try:
+            delta_ms = self._anchor_event.elapsed_time(event)
+        except Exception:
+            return None
+        return self._anchor_host_t + delta_ms / 1000.0
+
     def step_begin(self, scheduler_output) -> StepCtx:
         """Classify each request in the step into prefill or decode, and
-        record a step-start CUDA event + host timestamp."""
+        record a step-start CUDA event."""
+        self._ensure_anchor()
         req_phases: dict[str, str] = {}
 
         # New requests (this scheduling step is their first appearance) are
@@ -183,26 +224,23 @@ class Bl1Recorder:
         start_event.record()
         return StepCtx(
             start_event=start_event,
-            start_host=time.time(),
             req_phases=req_phases,
         )
 
     def step_end(self, ctx: StepCtx) -> None:
         end_event = torch.cuda.Event(enable_timing=True)
         end_event.record()
-        end_host = time.time()
         for req_id, phase in ctx.req_phases.items():
-            self._update_phase(req_id, phase, ctx.start_event, ctx.start_host,
-                               end_event, end_host)
+            self._update_phase(req_id, phase, ctx.start_event, end_event)
 
     # ---- vision-encoder hooks ----------------------------------------------
 
     def vision_begin(self, req_ids) -> StepCtx:
+        self._ensure_anchor()
         start_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
         return StepCtx(
             start_event=start_event,
-            start_host=time.time(),
             req_phases={rid: PHASE_VISION for rid in req_ids},
         )
 
@@ -239,9 +277,12 @@ class Bl1Recorder:
             except Exception:
                 d_ms = None
             d_s = (d_ms / 1000.0) if d_ms is not None else None
-            gu, gmu = self._window_mean(
-                bounds.first_start_host, bounds.last_end_host
-            )
+            t_start = self._device_host_time(bounds.first_start_event)
+            t_end = self._device_host_time(bounds.last_end_event)
+            if t_start is not None and t_end is not None:
+                gu, gmu = self._window_mean(t_start, t_end)
+            else:
+                gu, gmu = None, None
             ko = (100.0 - gu) if gu is not None else None
             record[f"d_{phase}"] = d_s
             record[f"gu_{phase}"] = gu
@@ -258,19 +299,17 @@ class Bl1Recorder:
 
     def _update_phase(
         self, req_id: str, phase: str,
-        start_event: torch.cuda.Event, start_host: float,
-        end_event: torch.cuda.Event, end_host: float,
+        start_event: torch.cuda.Event, end_event: torch.cuda.Event,
     ) -> None:
         per_req = self._phase_state.setdefault(req_id, {})
         bounds = per_req.get(phase)
         if bounds is None:
             per_req[phase] = _PhaseBounds(
-                first_start_event=start_event, first_start_host=start_host,
-                last_end_event=end_event, last_end_host=end_host,
+                first_start_event=start_event,
+                last_end_event=end_event,
             )
         else:
             bounds.last_end_event = end_event
-            bounds.last_end_host = end_host
 
     def _window_mean(self, t_start: float, t_end: float
                      ) -> tuple[Optional[float], Optional[float]]:
