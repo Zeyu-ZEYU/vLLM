@@ -50,10 +50,11 @@ _PHASES = (PHASE_VISION, PHASE_PREFILL, PHASE_DECODE)
 
 # Sampler tick: how often we drain the driver's GPU-utilization sample
 # buffer and read a memory-usage point. The driver itself produces
-# utilization samples at ~10–100 ms cadence depending on the card; the
-# tick only needs to be short enough to drain before the buffer wraps.
-_SAMPLER_TICK_S = 0.2
-# Bound on each in-memory deque (~10 minutes of headroom).
+# utilization samples at ~10–100 ms cadence depending on the card; we
+# tick faster so we never miss buffer entries and so gmu point samples
+# land inside short phase windows (50–100 ms).
+_SAMPLER_TICK_S = 0.05
+# Bound on each in-memory deque (~10 minutes of headroom at 20 Hz).
 _NVML_BUFFER_MAX = 60000
 
 
