@@ -128,10 +128,17 @@ def main() -> None:
         "model": model_id,
     }
 
+    # Bench-serve only ran the first N input rows (--num-prompts N). The
+    # parallel client arrays have length N; the remaining input rows have
+    # no client metrics. Truncate to those N to avoid emitting placeholder
+    # rows full of None.
+    n_actual = min(len(inputs), len(output_lens) or len(inputs))
+    inputs_truncated = inputs[:n_actual]
+
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     with open(a.out, "w", encoding="utf-8") as out:
         out.write(json.dumps(header, ensure_ascii=False) + "\n")
-        for i, row in enumerate(inputs):
+        for i, row in enumerate(inputs_truncated):
             req_id = str(row.get("id", i))
             ttft = _safe_index(ttfts, i)
             itl = _safe_index(itls, i)
