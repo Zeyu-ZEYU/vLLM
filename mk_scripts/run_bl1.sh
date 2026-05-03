@@ -14,10 +14,14 @@
 #   LOGS_DIR      server/client logs dir,     default $HOME/mono_kernel/outputs/logs
 #   MODEL         model path,                 default $HOME/models/Qwen3-VL-8B-Instruct
 #   WORKLOAD      label,                      default example
+#                 Picks $INPUTS_DIR/requests/<WORKLOAD>.jsonl unless
+#                 DATASET_FILE is overridden.
+#   DATASET_FILE  full path to requests jsonl, default $INPUTS_DIR/requests/<WORKLOAD>.jsonl
 #   ARGS_TAG      label suffix,               default qwen3vl8b_n5_rps2
 #   PORT          server port,                default 8000
 #   NUM_PROMPTS   client prompts,             default 5
 #   REQUEST_RATE  client rate,                default 2
+#   MAX_NUM_SEQS  server concurrency,         default 16
 
 set -euo pipefail
 
@@ -27,10 +31,12 @@ OUTPUTS_DIR=${OUTPUTS_DIR:-$HOME/mono_kernel/outputs/metrics}
 LOGS_DIR=${LOGS_DIR:-$HOME/mono_kernel/outputs/logs}
 MODEL=${MODEL:-$HOME/models/Qwen3-VL-8B-Instruct}
 WORKLOAD=${WORKLOAD:-example}
+DATASET_FILE=${DATASET_FILE:-$INPUTS_DIR/requests/${WORKLOAD}.jsonl}
 ARGS_TAG=${ARGS_TAG:-qwen3vl8b_n5_rps2}
 PORT=${PORT:-8000}
 NUM_PROMPTS=${NUM_PROMPTS:-5}
 REQUEST_RATE=${REQUEST_RATE:-2}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
 GPUS=${GPUS:-0}
 # Force visible GPUs early so every child inherits the pin.
 export CUDA_VISIBLE_DEVICES="$GPUS"
@@ -41,10 +47,17 @@ mkdir -p "$OUTPUTS_DIR" "$LOGS_DIR"
 PORTS="$PORT" SLEEP_AFTER=${CLEAN_SLEEP:-80} \
     bash "$WORKTREE/mk_scripts/clean.sh"
 
-# 2) ensure example inputs exist
-if [[ ! -f "$INPUTS_DIR/requests/example.jsonl" ]]; then
-    echo "[run_bl1] generating example inputs at $INPUTS_DIR"
-    python "$WORKTREE/mk_scripts/make_example_inputs.py" --out-dir "$INPUTS_DIR"
+# 2) ensure dataset jsonl exists; auto-gen only for the bundled "example"
+#    workload — other workloads must be staged in advance (e.g. via
+#    mk_scripts/build_sharegpt4v_inputs.py + rsync).
+if [[ ! -f "$DATASET_FILE" ]]; then
+    if [[ "$WORKLOAD" == "example" ]]; then
+        echo "[run_bl1] generating example inputs at $INPUTS_DIR"
+        python "$WORKTREE/mk_scripts/make_example_inputs.py" --out-dir "$INPUTS_DIR"
+    else
+        echo "[run_bl1] dataset file not found: $DATASET_FILE" >&2
+        exit 2
+    fi
 fi
 
 T=$(date +%Y%m%d_%H%M%S)
@@ -62,7 +75,7 @@ MONO_KERNEL_BL1_METRICS_PATH="$SERVER_SIDE" \
     vllm serve "$MODEL" \
         --tensor-parallel-size 1 \
         --port "$PORT" \
-        --max-num-seqs 4 \
+        --max-num-seqs "$MAX_NUM_SEQS" \
         --allowed-local-media-path "$INPUTS_DIR/assets" \
         > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
@@ -114,7 +127,7 @@ vllm bench serve \
     --endpoint /v1/chat/completions \
     --model "$MODEL" \
     --dataset-name custom_mm \
-    --dataset-path "$INPUTS_DIR/requests/example.jsonl" \
+    --dataset-path "$DATASET_FILE" \
     --num-prompts "$NUM_PROMPTS" \
     --request-rate "$REQUEST_RATE" \
     --disable-shuffle \
@@ -139,7 +152,7 @@ echo "[run_bl1] merging metrics into $OUTPUTS_DIR/$FINAL_FILE"
 python "$WORKTREE/mk_scripts/merge_metrics.py" \
     --client  "$OUTPUTS_DIR/$CLIENT_FILE" \
     --server  "$SERVER_SIDE" \
-    --inputs  "$INPUTS_DIR/requests/example.jsonl" \
+    --inputs  "$DATASET_FILE" \
     --label origin --workload "$WORKLOAD" --args "$ARGS_TAG" --time "$T" \
     --out     "$OUTPUTS_DIR/$FINAL_FILE"
 
