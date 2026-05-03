@@ -52,9 +52,15 @@ _PHASES = (PHASE_VISION, PHASE_PREFILL, PHASE_DECODE)
 # buffer and read a memory-usage point. The driver itself produces
 # utilization samples at ~10–100 ms cadence depending on the card; we
 # tick faster so we never miss buffer entries and so gmu point samples
-# land inside short phase windows (50–100 ms).
-_SAMPLER_TICK_S = 0.05
-# Bound on each in-memory deque (~10 minutes of headroom at 20 Hz).
+# land inside short phase windows.
+_SAMPLER_TICK_S = 0.03
+# When a phase is shorter than the driver's sample period, no sample
+# timestamp falls strictly inside [t_start, t_end]. Fall back to samples
+# whose underlying averaging interval likely overlaps the phase window
+# by widening the lookup by this bound on each side (~100 ms is a
+# conservative upper estimate of NVML's internal sample period).
+_NVML_PERIOD_BOUND_S = 0.10
+# Bound on each in-memory deque (~10 minutes of headroom at ~33 Hz).
 _NVML_BUFFER_MAX = 60000
 
 
@@ -363,11 +369,35 @@ class Bl1Recorder:
 
     def _window_mean(self, t_start: float, t_end: float
                      ) -> tuple[Optional[float], Optional[float]]:
+        """Mean of NVML samples whose underlying interval overlaps the
+        phase window [t_start, t_end].
+
+        First pass: samples with timestamp strictly inside the phase. For
+        phases longer than the driver's sample period, this is sufficient
+        and matches the spec's "average over the phase" semantics.
+
+        Fallback (only when first pass is empty): widen the lookup by
+        ``_NVML_PERIOD_BOUND_S`` on each side. Each NVML sample at
+        timestamp ``t`` represents the GPU's averaged busy-fraction over
+        an interval ``[t - dt, t]`` (driver-internal ``dt``, typically
+        ~10–100 ms). If ``dt`` is larger than the phase, no sample's
+        timestamp lands strictly inside the phase but the bracketing
+        sample's interval still *contains* the phase, so its value is the
+        best available estimate of GPU activity during the phase.
+        """
         if t_end <= t_start:
             return None, None
         with self._nvml_lock:
             gu_vals = [v for t, v in self._gu_samples if t_start <= t <= t_end]
             gmu_vals = [v for t, v in self._gmu_samples if t_start <= t <= t_end]
+            if not gu_vals:
+                lo = t_start - _NVML_PERIOD_BOUND_S
+                hi = t_end + _NVML_PERIOD_BOUND_S
+                gu_vals = [v for t, v in self._gu_samples if lo <= t <= hi]
+            if not gmu_vals:
+                lo = t_start - _NVML_PERIOD_BOUND_S
+                hi = t_end + _NVML_PERIOD_BOUND_S
+                gmu_vals = [v for t, v in self._gmu_samples if lo <= t <= hi]
         gu = (sum(gu_vals) / len(gu_vals)) if gu_vals else None
         gmu = (sum(gmu_vals) / len(gmu_vals)) if gmu_vals else None
         return gu, gmu
