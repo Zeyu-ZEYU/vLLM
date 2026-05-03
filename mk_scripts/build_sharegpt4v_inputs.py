@@ -82,6 +82,11 @@ def main() -> int:
                     help="max output tokens to write into each row")
     ap.add_argument("--workers", type=int, default=16,
                     help="parallel image downloads")
+    ap.add_argument("--image-path-prefix", default=None,
+                    help="Override the directory written into the jsonl's "
+                         "`image` field (default: the local asset dir). Use "
+                         "this when staging inputs for a remote node so the "
+                         "jsonl carries paths that resolve there.")
     args = ap.parse_args()
 
     src = Path(os.path.expanduser(args.instruct_json)).resolve()
@@ -94,6 +99,10 @@ def main() -> int:
     req_dir = out_dir / "requests"
     asset_dir.mkdir(parents=True, exist_ok=True)
     req_dir.mkdir(parents=True, exist_ok=True)
+    # Directory to write into the jsonl `image` field; defaults to the
+    # local on-disk asset directory but can be overridden for remote runs.
+    image_prefix = (Path(os.path.expanduser(args.image_path_prefix)).resolve()
+                    if args.image_path_prefix else asset_dir)
 
     print(f"loading {src}")
     with open(src) as f:
@@ -156,7 +165,7 @@ def main() -> int:
             obj = {
                 "id": next_id,
                 "prompt": prompt,
-                "image": str(dest),
+                "image": str(image_prefix / dest.name),
                 "output": gpt or None,
                 "output_tokens": args.output_tokens,
                 "sg4v_id": coco_id,
