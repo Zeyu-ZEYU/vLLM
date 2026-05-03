@@ -48,11 +48,13 @@ PHASE_DECODE = "decode"
 
 _PHASES = (PHASE_VISION, PHASE_PREFILL, PHASE_DECODE)
 
-# NVML sampling rate.
-_NVML_HZ = 50.0
-_NVML_PERIOD_S = 1.0 / _NVML_HZ
-# Bound the in-memory sample buffer (~10 minutes at 50 Hz).
-_NVML_BUFFER_MAX = 30000
+# Sampler tick: how often we drain the driver's GPU-utilization sample
+# buffer and read a memory-usage point. The driver itself produces
+# utilization samples at ~10–100 ms cadence depending on the card; the
+# tick only needs to be short enough to drain before the buffer wraps.
+_SAMPLER_TICK_S = 0.2
+# Bound on each in-memory deque (~10 minutes of headroom).
+_NVML_BUFFER_MAX = 60000
 
 
 @dataclass
@@ -77,12 +79,23 @@ class Bl1Recorder:
         # Per-request, per-phase bounds. Main-thread access only.
         self._phase_state: dict[str, dict[str, _PhaseBounds]] = {}
 
-        # NVML sample ring buffer + lock. Producer = sampler thread,
-        # consumer = finalize_request on main thread.
-        self._nvml_samples: collections.deque[tuple[float, float, float]] = (
+        # NVML sample ring buffers (separate for util and memory) + lock.
+        # Producer = sampler thread, consumer = finalize_request on main
+        # thread. Util samples come from nvmlDeviceGetSamples (driver's
+        # internal buffer, ~10-100 ms native cadence). Memory % is a point
+        # value sampled once per tick.
+        self._gu_samples: collections.deque[tuple[float, float]] = (
+            collections.deque(maxlen=_NVML_BUFFER_MAX)
+        )
+        self._gmu_samples: collections.deque[tuple[float, float]] = (
             collections.deque(maxlen=_NVML_BUFFER_MAX)
         )
         self._nvml_lock = threading.Lock()
+        # Offset to convert driver-side sample microseconds to host wall-
+        # clock. Initialized on first non-empty drain.
+        self._nvml_to_host_offset_s: Optional[float] = None
+        # Last seen NVML sample timestamp (microseconds), advanced each tick.
+        self._gu_last_seen_us: int = 0
 
         # Sampler thread.
         self._sampler_stop = threading.Event()
@@ -138,24 +151,60 @@ class Bl1Recorder:
 
     def _sampler_loop(self) -> None:
         while not self._sampler_stop.is_set():
-            t = time.time()
-            gu, gmu = self._read_nvml()
-            if gu is not None and gmu is not None:
-                self._nvml_samples.append((t, gu, gmu))
-            # Sleep until next tick; if we lag, just continue immediately.
-            self._sampler_stop.wait(_NVML_PERIOD_S)
+            self._drain_gu_samples()
+            self._poll_gmu_point()
+            self._sampler_stop.wait(_SAMPLER_TICK_S)
 
-    def _read_nvml(self) -> tuple[Optional[float], Optional[float]]:
+    def _drain_gu_samples(self) -> None:
+        """Pull all new GPU utilization samples from the driver's internal
+        buffer since the last drain, convert their microsecond timestamps
+        to host wall-clock, and push into the gu deque."""
         if self._nvml_handle is None:
-            return None, None
+            return
         try:
-            util = pynvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
-            mem = pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
-            gu_pct = float(util.gpu)
-            gmu_pct = (float(mem.used) / float(mem.total)) * 100.0 if mem.total else 0.0
-            return gu_pct, gmu_pct
+            _, samples = pynvml.nvmlDeviceGetSamples(
+                self._nvml_handle,
+                pynvml.NVML_GPU_UTILIZATION_SAMPLES,
+                self._gu_last_seen_us,
+            )
         except Exception:
-            return None, None
+            return
+        if not samples:
+            return
+        host_now = time.time()
+        # On first drain, anchor driver-µs to host wall-clock using the
+        # latest sample (smallest extrapolation error).
+        if self._nvml_to_host_offset_s is None:
+            latest_us = int(samples[-1].timeStamp)
+            self._nvml_to_host_offset_s = host_now - latest_us / 1e6
+        offset = self._nvml_to_host_offset_s
+        max_us = self._gu_last_seen_us
+        with self._nvml_lock:
+            for s in samples:
+                ts_us = int(s.timeStamp)
+                try:
+                    val = float(s.sampleValue.uiVal)
+                except Exception:
+                    continue
+                ts_host = offset + ts_us / 1e6
+                self._gu_samples.append((ts_host, val))
+                if ts_us > max_us:
+                    max_us = ts_us
+        self._gu_last_seen_us = max_us
+
+    def _poll_gmu_point(self) -> None:
+        if self._nvml_handle is None:
+            return
+        try:
+            mem = pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
+        except Exception:
+            return
+        try:
+            gmu_pct = (float(mem.used) / float(mem.total)) * 100.0 if mem.total else 0.0
+        except Exception:
+            return
+        with self._nvml_lock:
+            self._gmu_samples.append((time.time(), gmu_pct))
 
     # ---- step-level hooks ---------------------------------------------------
 
@@ -315,19 +364,12 @@ class Bl1Recorder:
                      ) -> tuple[Optional[float], Optional[float]]:
         if t_end <= t_start:
             return None, None
-        gu_sum = 0.0
-        gmu_sum = 0.0
-        n = 0
         with self._nvml_lock:
-            # Snapshot the relevant samples (deque is short — O(N) is fine).
-            for t, gu, gmu in self._nvml_samples:
-                if t_start <= t <= t_end:
-                    gu_sum += gu
-                    gmu_sum += gmu
-                    n += 1
-        if n == 0:
-            return None, None
-        return gu_sum / n, gmu_sum / n
+            gu_vals = [v for t, v in self._gu_samples if t_start <= t <= t_end]
+            gmu_vals = [v for t, v in self._gmu_samples if t_start <= t <= t_end]
+        gu = (sum(gu_vals) / len(gu_vals)) if gu_vals else None
+        gmu = (sum(gmu_vals) / len(gmu_vals)) if gmu_vals else None
+        return gu, gmu
 
 
 # Module-level singleton slot (set by Worker.init_device, cleared by shutdown).
