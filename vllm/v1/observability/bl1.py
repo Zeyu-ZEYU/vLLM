@@ -373,33 +373,26 @@ class Bl1Recorder:
 
     @staticmethod
     def _bracketing_value(samples, t_end: float) -> list[float]:
-        """Return a single-element list with the value of the bracketing
-        sample for a phase ending at ``t_end``: the first sample emitted
-        at or after ``t_end`` (its averaging interval [t-dt, t] is the
-        best representation of the phase when dt > phase length). If no
-        such sample exists yet, fall back to the most recent sample
-        emitted before ``t_end``."""
+        """Return a single-element list with the value of the first
+        sample emitted at or after ``t_end``. Its averaging interval
+        [t-dt, t] brackets the phase when dt > phase length and is the
+        best single-sample estimate. If no such sample exists yet (phase
+        finalized before driver could emit), return [] — caller treats
+        that as None."""
         nxt = next((v for t, v in samples if t >= t_end), None)
-        if nxt is not None:
-            return [nxt]
-        prev = next((v for t, v in reversed(samples) if t < t_end), None)
-        return [prev] if prev is not None else []
+        return [nxt] if nxt is not None else []
 
     def _window_mean(self, t_start: float, t_end: float
                      ) -> tuple[Optional[float], Optional[float]]:
-        """Estimate phase-window mean GPU utilization and memory %.
+        """Estimate phase-window GPU utilization and memory %.
 
-        First pass: average all samples whose timestamp falls strictly
-        inside [t_start, t_end]. For phases longer than the driver's
-        sample period, this matches the spec's "average over the phase"
-        semantics directly.
-
-        Fallback: when the first pass is empty (phase shorter than dt),
-        pick the SINGLE bracketing sample — the first one emitted at or
-        after ``t_end`` — and report its value. That sample's averaging
-        interval contains the phase, so its value is the best available
-        single-sample estimate of GPU activity during the phase. No
-        magic-width constant needed.
+        Rule (per spec):
+          - 0 samples in [t_start, t_end]: use the first sample emitted
+            at or after t_end (its averaging interval brackets the phase
+            when phase < driver dt).
+          - 1 sample in window: use that value.
+          - >=2 samples in window: arithmetic mean.
+          - No bracketing sample available either: None.
         """
         if t_end <= t_start:
             return None, None
