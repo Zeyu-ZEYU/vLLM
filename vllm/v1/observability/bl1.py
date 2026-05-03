@@ -58,10 +58,14 @@ _SAMPLER_TICK_S = 0.03
 # timestamp falls strictly inside [t_start, t_end]. Fall back to samples
 # whose underlying averaging interval likely overlaps the phase window
 # by widening the lookup by this bound on each side. Empirically measured
-# at 200 ms on H20 (driver utilization sampling = fixed 5 Hz cadence,
-# stdev <1 ms). Use 300 ms = dt * 1.5 so the bracketing sample is always
-# inside the lookup range even with small jitter.
-_NVML_PERIOD_BOUND_S = 0.30
+# on H20 (NVIDIA driver 570.133.20 inside the mono_kernel container):
+# inter-sample delta locks at 200.0 ms, stdev <1 ms (driver utilization
+# sampling = fixed 5 Hz cadence). dt itself is the strict minimum width
+# needed to catch the sample whose averaging window brackets a sub-dt
+# phase, so 200 ms matches the driver. If the driver dt changes (different
+# card / driver version), retune this constant — it is the single most
+# important knob for short-phase gu/ko coverage on this metric path.
+_NVML_PERIOD_BOUND_S = 0.20
 # Bound on each in-memory deque (~10 minutes of headroom at ~33 Hz).
 _NVML_BUFFER_MAX = 60000
 
