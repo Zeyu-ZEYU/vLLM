@@ -54,18 +54,16 @@ _PHASES = (PHASE_VISION, PHASE_PREFILL, PHASE_DECODE)
 # tick faster so we never miss buffer entries and so gmu point samples
 # land inside short phase windows.
 _SAMPLER_TICK_S = 0.03
-# When a phase is shorter than the driver's sample period, no sample
-# timestamp falls strictly inside [t_start, t_end]. Fall back to samples
-# whose underlying averaging interval likely overlaps the phase window
-# by widening the lookup by this bound on each side. Empirically measured
-# on H20 (NVIDIA driver 570.133.20 inside the mono_kernel container):
-# inter-sample delta locks at 200.0 ms, stdev <1 ms (driver utilization
-# sampling = fixed 5 Hz cadence). dt itself is the strict minimum width
-# needed to catch the sample whose averaging window brackets a sub-dt
-# phase, so 200 ms matches the driver. If the driver dt changes (different
-# card / driver version), retune this constant — it is the single most
-# important knob for short-phase gu/ko coverage on this metric path.
-_NVML_PERIOD_BOUND_S = 0.20
+# Bracketing-sample fallback: when a phase is shorter than the driver's
+# sample period (H20: dt = 200 ms fixed 5 Hz cadence), no sample
+# timestamp falls strictly inside [t_start, t_end]. Instead of widening
+# the window by some magic dt-bound, we pick a SINGLE sample: the next
+# sample emitted at or after t_end. Each NVML utilization sample at
+# timestamp t represents the GPU's averaged busy-fraction over
+# [t - dt, t]; when t ≥ t_end and the phase is shorter than dt, that
+# interval brackets the phase end-to-end, so the value is the best
+# available estimate of GPU activity during the phase. No magic width
+# constant needed — the rule is dt-agnostic.
 # Bound on each in-memory deque (~10 minutes of headroom at ~33 Hz).
 _NVML_BUFFER_MAX = 60000
 
@@ -373,23 +371,35 @@ class Bl1Recorder:
         else:
             bounds.last_end_event = end_event
 
+    @staticmethod
+    def _bracketing_value(samples, t_end: float) -> list[float]:
+        """Return a single-element list with the value of the bracketing
+        sample for a phase ending at ``t_end``: the first sample emitted
+        at or after ``t_end`` (its averaging interval [t-dt, t] is the
+        best representation of the phase when dt > phase length). If no
+        such sample exists yet, fall back to the most recent sample
+        emitted before ``t_end``."""
+        nxt = next((v for t, v in samples if t >= t_end), None)
+        if nxt is not None:
+            return [nxt]
+        prev = next((v for t, v in reversed(samples) if t < t_end), None)
+        return [prev] if prev is not None else []
+
     def _window_mean(self, t_start: float, t_end: float
                      ) -> tuple[Optional[float], Optional[float]]:
-        """Mean of NVML samples whose underlying interval overlaps the
-        phase window [t_start, t_end].
+        """Estimate phase-window mean GPU utilization and memory %.
 
-        First pass: samples with timestamp strictly inside the phase. For
-        phases longer than the driver's sample period, this is sufficient
-        and matches the spec's "average over the phase" semantics.
+        First pass: average all samples whose timestamp falls strictly
+        inside [t_start, t_end]. For phases longer than the driver's
+        sample period, this matches the spec's "average over the phase"
+        semantics directly.
 
-        Fallback (only when first pass is empty): widen the lookup by
-        ``_NVML_PERIOD_BOUND_S`` on each side. Each NVML sample at
-        timestamp ``t`` represents the GPU's averaged busy-fraction over
-        an interval ``[t - dt, t]`` (driver-internal ``dt``, typically
-        ~10–100 ms). If ``dt`` is larger than the phase, no sample's
-        timestamp lands strictly inside the phase but the bracketing
-        sample's interval still *contains* the phase, so its value is the
-        best available estimate of GPU activity during the phase.
+        Fallback: when the first pass is empty (phase shorter than dt),
+        pick the SINGLE bracketing sample — the first one emitted at or
+        after ``t_end`` — and report its value. That sample's averaging
+        interval contains the phase, so its value is the best available
+        single-sample estimate of GPU activity during the phase. No
+        magic-width constant needed.
         """
         if t_end <= t_start:
             return None, None
@@ -397,13 +407,9 @@ class Bl1Recorder:
             gu_vals = [v for t, v in self._gu_samples if t_start <= t <= t_end]
             gmu_vals = [v for t, v in self._gmu_samples if t_start <= t <= t_end]
             if not gu_vals:
-                lo = t_start - _NVML_PERIOD_BOUND_S
-                hi = t_end + _NVML_PERIOD_BOUND_S
-                gu_vals = [v for t, v in self._gu_samples if lo <= t <= hi]
+                gu_vals = self._bracketing_value(self._gu_samples, t_end)
             if not gmu_vals:
-                lo = t_start - _NVML_PERIOD_BOUND_S
-                hi = t_end + _NVML_PERIOD_BOUND_S
-                gmu_vals = [v for t, v in self._gmu_samples if lo <= t <= hi]
+                gmu_vals = self._bracketing_value(self._gmu_samples, t_end)
         gu = (sum(gu_vals) / len(gu_vals)) if gu_vals else None
         gmu = (sum(gmu_vals) / len(gmu_vals)) if gmu_vals else None
         return gu, gmu
