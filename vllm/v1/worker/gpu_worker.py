@@ -327,6 +327,13 @@ class Worker(WorkerBase):
 
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
 
+        # BL1: spawn the per-request, per-phase metrics recorder if the env
+        # var MONO_KERNEL_BL1_METRICS_PATH is set. Otherwise this is a no-op.
+        from vllm.v1.observability.bl1 import create_recorder as _bl1_create
+        _bl1_recorder = _bl1_create(self.local_rank)
+        if _bl1_recorder is not None:
+            _bl1_recorder.start_sampler()
+
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
@@ -1039,6 +1046,13 @@ class Worker(WorkerBase):
         # can be reclaimed when running in-process
         if model_runner := getattr(self, "model_runner", None):
             model_runner.shutdown()
+
+        # BL1: stop the metrics recorder (joins NVML sampler, closes sidecar).
+        try:
+            from vllm.v1.observability.bl1 import stop_recorder as _bl1_stop
+            _bl1_stop()
+        except Exception:
+            pass
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)

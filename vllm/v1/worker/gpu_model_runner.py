@@ -180,6 +180,7 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
+from vllm.v1.observability.bl1 import get_recorder as _bl1_get_recorder
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.cp_utils import (
@@ -1073,9 +1074,12 @@ class GPUModelRunner(
         new/resumed/paused/finished request in the batch.
         """
         # Remove finished requests from the cached states.
+        _bl1_recorder = _bl1_get_recorder()
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            if _bl1_recorder is not None:
+                _bl1_recorder.finalize_request(req_id)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -2778,6 +2782,15 @@ class GPUModelRunner(
             if not mm_kwargs:
                 return []  # nothing left to encode after filtering out `prompt_embeds`
 
+        # BL1: capture vision-phase span start. vision_end is called before
+        # the function returns; on exception, the worker tears down so the
+        # incomplete recorder state is dropped.
+        _bl1_recorder = _bl1_get_recorder()
+        _bl1_ctx = (
+            _bl1_recorder.vision_begin({rid for rid, _ in mm_lora_refs})
+            if _bl1_recorder is not None else None
+        )
+
         should_time = bool(
             self.observability_config
             and self.observability_config.enable_mm_processor_stats
@@ -2949,6 +2962,10 @@ class GPUModelRunner(
             self.encoder_cache[mm_hash] = output
             logger.debug("Finish execute for mm hash %s", mm_hash)
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
+
+        # BL1: close vision-phase span.
+        if _bl1_ctx is not None and _bl1_recorder is not None:
+            _bl1_recorder.vision_end(_bl1_ctx)
 
         return encoder_outputs
 
@@ -4068,6 +4085,14 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        # BL1: span the language-model forward step. We classify each
+        # request in the step as prefill or decode based on scheduler_output
+        # and record a CUDA event pair around the forward.
+        _bl1_recorder = _bl1_get_recorder()
+        _bl1_step_ctx = (
+            _bl1_recorder.step_begin(scheduler_output)
+            if _bl1_recorder is not None else None
+        )
         with (
             set_forward_context(
                 attn_metadata,
@@ -4093,6 +4118,8 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        if _bl1_step_ctx is not None and _bl1_recorder is not None:
+            _bl1_recorder.step_end(_bl1_step_ctx)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
