@@ -2790,15 +2790,21 @@ class GPUModelRunner(
 
         # BL1: capture vision-phase span start. vision_end is called before
         # the function returns; on exception, the worker tears down so the
-        # incomplete recorder state is dropped.
+        # incomplete recorder state is dropped. We also pass each request's
+        # mm_hashes so BL2's cross-node merge can map d_vemb_transfer events
+        # back to the request that consumed them.
+        _bl1_req_ids = {rid for rid, _ in mm_lora_refs}
+        _bl1_req_to_mm: dict[str, set[str]] = {}
+        for (rid, _), mm_hash in zip(mm_lora_refs, mm_hashes):
+            _bl1_req_to_mm.setdefault(rid, set()).add(mm_hash)
         _bl1_recorder = _bl1_get_recorder()
         _bl1_ctx = (
-            _bl1_recorder.vision_begin({rid for rid, _ in mm_lora_refs})
+            _bl1_recorder.vision_begin(_bl1_req_ids, _bl1_req_to_mm)
             if _bl1_recorder is not None else None
         )
         _bl1_sm_recorder = _bl1_sm_get_recorder()
         _bl1_sm_ctx = (
-            _bl1_sm_recorder.vision_begin({rid for rid, _ in mm_lora_refs})
+            _bl1_sm_recorder.vision_begin(_bl1_req_ids)
             if _bl1_sm_recorder is not None else None
         )
 

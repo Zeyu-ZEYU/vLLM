@@ -72,6 +72,10 @@ _NVML_BUFFER_MAX = 60000
 class _PhaseBounds:
     first_start_event: torch.cuda.Event
     last_end_event: torch.cuda.Event
+    # Vision phase only: mm_hashes that this request consumed in the encoder.
+    # Used by BL2 to associate per-request metrics with cross-node embedding
+    # transfer events.
+    mm_hashes: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -80,6 +84,8 @@ class StepCtx:
     start_event: torch.cuda.Event
     # Map req_id -> phase name for the requests in this step.
     req_phases: dict[str, str] = field(default_factory=dict)
+    # Vision-only: req_id -> set of mm_hashes encoded in this step.
+    req_mm_hashes: dict[str, set[str]] = field(default_factory=dict)
 
 
 class Bl1Recorder:
@@ -295,18 +301,39 @@ class Bl1Recorder:
 
     # ---- vision-encoder hooks ----------------------------------------------
 
-    def vision_begin(self, req_ids) -> StepCtx:
+    def vision_begin(self, req_ids, req_mm_hashes=None) -> StepCtx:
+        """Begin a vision-encoder span.
+
+        Args:
+            req_ids: iterable of vllm req_ids in this encode call.
+            req_mm_hashes: optional dict[req_id, iterable[mm_hash]] linking
+                each request to the multimodal hashes it consumed. Stored
+                so finalize_request can emit them; consumed by BL2's
+                cross-node merge to map d_vemb_transfer per-request.
+        """
         self._ensure_anchor()
         start_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
+        mm_hash_map: dict[str, set[str]] = {}
+        if req_mm_hashes:
+            for rid, hashes in req_mm_hashes.items():
+                mm_hash_map[rid] = set(hashes)
         return StepCtx(
             start_event=start_event,
             req_phases={rid: PHASE_VISION for rid in req_ids},
+            req_mm_hashes=mm_hash_map,
         )
 
     def vision_end(self, ctx: StepCtx) -> None:
-        # Same as step_end — vision is just another phase.
-        self.step_end(ctx)
+        # Same as step_end — vision is just another phase. mm_hashes from
+        # the ctx propagate into the per-request _PhaseBounds.
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record()
+        for req_id, phase in ctx.req_phases.items():
+            self._update_phase(req_id, phase, ctx.start_event, end_event)
+            extra = ctx.req_mm_hashes.get(req_id)
+            if extra:
+                self._phase_state[req_id][phase].mm_hashes.update(extra)
 
     # ---- per-request finalize ----------------------------------------------
 
@@ -323,6 +350,11 @@ class Bl1Recorder:
                 bounds.last_end_event.synchronize()
             except Exception:
                 pass
+
+        vision_bounds = phase_map.get(PHASE_VISION)
+        record["mm_hashes"] = (
+            sorted(vision_bounds.mm_hashes) if vision_bounds else []
+        )
 
         for phase in _PHASES:
             bounds = phase_map.get(phase)
