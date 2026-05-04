@@ -188,12 +188,46 @@ cleanup_all() {
     pkill -KILL -u "$(id -u)" -f "python.*disagg_epd_proxy" 2>/dev/null || true
     pkill -KILL -u "$(id -u)" -f "python.*vllm" 2>/dev/null || true
     pkill -KILL -u "$(id -u)" -f "VLLM::EngineCore" 2>/dev/null || true
-    ssh -o BatchMode=yes "$NODE1_HOST" "docker exec -u $NODE1_USER_UID mono_kernel \
-        bash -lc 'pkill -KILL -u \$(id -u) -f \"python.*vllm\" 2>/dev/null || true ; \
-                  pkill -KILL -u \$(id -u) -f \"VLLM::EngineCore\" 2>/dev/null || true'" || true
+    pkill -KILL -u "$(id -u)" -f "vllm serve" 2>/dev/null || true
+    # Node 1 cleanup. We escalate to root inside the container because the
+    # orchestrator's user-level pkill has been observed to leave a 130 GiB
+    # EngineCore zombie that blocks the next run's GPU allocation.
+    ssh -o BatchMode=yes "$NODE1_HOST" "docker exec -u 0 mono_kernel \
+        bash -lc 'pkill -KILL -f \"python.*vllm\" 2>/dev/null || true ;
+                  pkill -KILL -f \"VLLM::EngineCore\" 2>/dev/null || true ;
+                  pkill -KILL -f \"vllm serve\" 2>/dev/null || true ;
+                  for pid in \$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do
+                      kill -KILL \"\$pid\" 2>/dev/null || true ;
+                  done'" || true
     sleep 5
 }
 trap cleanup_all EXIT INT TERM
+
+# Pre-flight: wait for both GPUs to be free (memory < 1 GiB used). Stale
+# EngineCore can survive previous runs' SIGINT and hold model weights;
+# without this, the next vllm serve fails with "Free memory < desired
+# utilization".
+wait_gpu_free() {
+    local label="$1"
+    local cmd="$2"
+    local deadline=$((SECONDS + 60))
+    while (( SECONDS < deadline )); do
+        local used
+        used=$(eval "$cmd" 2>/dev/null | tr -d ' ')
+        if [[ -n "$used" && "$used" -lt 2000 ]]; then
+            echo "[run_bl2] $label GPU free (${used} MiB used)"
+            return 0
+        fi
+        sleep 2
+    done
+    echo "[run_bl2] $label GPU still busy after 60s; proceeding anyway" >&2
+    return 0
+}
+wait_gpu_free "node 0" \
+    "nvidia-smi --id=0 --query-gpu=memory.used --format=csv,noheader,nounits"
+wait_gpu_free "node 1" \
+    "ssh -o BatchMode=yes $NODE1_HOST 'docker exec -u 0 mono_kernel \
+        nvidia-smi --id=0 --query-gpu=memory.used --format=csv,noheader,nounits'"
 
 if (( DRY_RUN == 1 )); then
     echo "[run_bl2] DRY_RUN=1 — printing what would run, not invoking."
