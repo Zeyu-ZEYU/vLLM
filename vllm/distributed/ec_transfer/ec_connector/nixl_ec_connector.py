@@ -46,7 +46,7 @@ import struct
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -145,15 +145,19 @@ class _NixlEndpoint:
         self._engine_id = str(uuid.uuid4())
         self._wrapper = NixlWrapper(self._engine_id, config)
 
-        # Pre-allocate a fixed scratch buffer on the device and register it
-        # with NIXL ONCE. NIXL only knows about memory that was registered
+        # Pre-allocate a ring of scratch slots on the device and register them
+        # all with NIXL ONCE. NIXL only knows about memory that was registered
         # before `get_agent_metadata()` returned the bytes the peer
-        # `add_remote_agent`'d. Per-transfer registration would require
-        # re-handshaking the metadata each time, which is fragile and slow.
-        # 128 MiB covers typical Qwen3-VL embeddings (~1-3 MB each, deep-
-        # stacked up to ~10 MB) with room for batching of up to ~12 items.
-        self._scratch_n_bytes = int(extra_cfg.get(
-            "scratch_bytes", 128 * 1024 * 1024))
+        # `add_remote_agent`'d. With multiple slots, save_caches doesn't have
+        # to block on the consumer's ACK before returning — the next save
+        # claims a different slot, the consumer reads them in any order, and
+        # the notif drain thread releases each slot when its ACK arrives.
+        #
+        # Each slot is sized for one encoder output. Default 24 MiB
+        # comfortably covers Qwen3-VL deep-stacked embeddings (~10 MB).
+        self._slot_size = int(extra_cfg.get("slot_bytes", 24 * 1024 * 1024))
+        self._n_slots = int(extra_cfg.get("n_slots", 16))
+        self._scratch_n_bytes = self._slot_size * self._n_slots
         self._scratch = torch.empty(
             self._scratch_n_bytes,
             dtype=torch.uint8,
@@ -167,10 +171,15 @@ class _NixlEndpoint:
         )
         self._wrapper.register_memory(
             self._scratch_descs, backends=self._nixl_backends)
-        # Lock serializes scratch use across save_caches / start_load_caches
-        # so concurrent calls don't overwrite each other's bytes before the
-        # remote READ completes.
-        self._scratch_lock = threading.Lock()
+        # Producer ring management: free queue + per-mm_hash slot map. Notif
+        # drain thread auto-releases a slot when its matching ACK arrives.
+        self._free_slots: deque[int] = deque(range(self._n_slots))
+        self._slots_cv = threading.Condition()
+        self._inflight_slots: dict[str, int] = {}
+        # Consumer-side serialization: only one transfer at a time uses the
+        # local scratch slot 0 (consumers only need one because READs are
+        # serialized within a single start_load_caches call).
+        self._consumer_lock = threading.Lock()
 
         # Bootstrap endpoint (peer's host:port). Producer binds; consumer
         # dials. Format: "host:port".
@@ -356,6 +365,7 @@ class _NixlEndpoint:
                 time.sleep(_POLL_INTERVAL_S)
                 continue
             if pending:
+                ack_hashes: list[str] = []
                 with self._notif_lock:
                     for _agent, msgs in pending.items():
                         for raw in msgs:
@@ -367,6 +377,12 @@ class _NixlEndpoint:
                             parts = msg.split("|")
                             if len(parts) >= 2:
                                 self._notif_q[parts[1]].append(msg)
+                                if parts[0] == "ACK" and self._is_producer:
+                                    ack_hashes.append(parts[1])
+                # Release outside the notif lock to avoid lock-order issues
+                # with _slots_cv.
+                for mh in ack_hashes:
+                    self._release_slot(mh)
             time.sleep(_POLL_INTERVAL_S)
 
     def wait_for_notif(
@@ -390,57 +406,72 @@ class _NixlEndpoint:
     # ---- transfer primitives -----------------------------------------------
 
     def producer_advertise(self, mm_hash: str, tensor: torch.Tensor) -> int:
-        """Producer-side: copy tensor into the pre-registered scratch buffer
+        """Producer-side: claim a free scratch slot, copy the tensor into it,
         and send a PUSH notif advertising offset+length+shape+dtype.
 
-        Caller is expected to subsequently `wait_for_notif(mm_hash, "ACK")`
-        before releasing the scratch lock — the scratch is shared, and
-        another save_caches must not overwrite it before the consumer's
-        NIXL READ has completed.
+        Returns immediately after the PUSH is sent (does NOT wait for ACK).
+        The slot remains claimed until the consumer's auto-ACK arrives at
+        the producer's notif drain thread, which calls _release_slot to
+        return the slot to the free queue.
 
-        Returns the number of bytes copied (used by the BL2 sidecar).
+        Returns the number of bytes copied.
         """
         if not tensor.is_cuda:
             raise RuntimeError("BL2 NIXL: tensor must be on CUDA device")
         t = tensor.contiguous()
         n_bytes = int(t.numel() * t.element_size())
-        if n_bytes > self._scratch_n_bytes:
+        if n_bytes > self._slot_size:
             raise RuntimeError(
                 f"BL2 NIXL: tensor for {mm_hash} ({n_bytes} bytes) exceeds "
-                f"scratch_n_bytes={self._scratch_n_bytes}; raise scratch_bytes "
-                f"in ec_connector_extra_config"
+                f"slot_size={self._slot_size}; raise slot_bytes in "
+                f"ec_connector_extra_config"
             )
 
-        # The scratch lock guards the buffer for the entire send round-trip
-        # (advertise → consumer reads → ACK). Acquired here, released by
-        # the connector after wait_for_notif("ACK").
-        self._scratch_lock.acquire()
+        # Wait for a free slot.
+        with self._slots_cv:
+            while not self._free_slots:
+                self._slots_cv.wait(timeout=30.0)
+                if not self._free_slots:
+                    raise RuntimeError(
+                        f"BL2 NIXL: no free scratch slot for {mm_hash} "
+                        f"after 30s (n_slots={self._n_slots})"
+                    )
+            slot = self._free_slots.popleft()
+            self._inflight_slots[mm_hash] = slot
+
         try:
-            # Copy bytes into the front of scratch.
+            offset = slot * self._slot_size
             flat = t.view(torch.uint8).flatten()
-            self._scratch[: n_bytes].copy_(flat)
-            # Make sure the device-side copy lands before peer reads.
+            self._scratch[offset:offset + n_bytes].copy_(flat)
             torch.cuda.synchronize()
 
             shape = ",".join(str(x) for x in t.shape)
             dtype = str(t.dtype).replace("torch.", "")
-            offset = 0
             msg = (
                 f"PUSH|{mm_hash}|{offset}|{n_bytes}|{shape}|{dtype}"
             )
             self._wrapper.send_notif(self.remote_agent, notif_msg=msg)
-            return n_bytes
         except Exception:
-            self._scratch_lock.release()
+            # Slot wasn't successfully published; reclaim it.
+            with self._slots_cv:
+                self._inflight_slots.pop(mm_hash, None)
+                self._free_slots.append(slot)
+                self._slots_cv.notify()
             raise
+        return n_bytes
 
-    def producer_release(self) -> None:
-        """Release the scratch lock acquired in producer_advertise."""
-        try:
-            self._scratch_lock.release()
-        except RuntimeError:
-            # Lock not held; ignore.
-            pass
+    def _release_slot(self, mm_hash: str) -> None:
+        """Return the slot held by mm_hash back to the free queue.
+
+        Called by the notif drain thread when an ACK|<mm_hash> notif
+        arrives.
+        """
+        with self._slots_cv:
+            slot = self._inflight_slots.pop(mm_hash, None)
+            if slot is None:
+                return
+            self._free_slots.append(slot)
+            self._slots_cv.notify()
 
     def consumer_pull(
         self,
@@ -467,13 +498,16 @@ class _NixlEndpoint:
             raise RuntimeError(
                 "BL2 NIXL: remote scratch addr not yet bootstrapped"
             )
-        if n_bytes > self._scratch_n_bytes:
+        if n_bytes > self._slot_size:
             raise RuntimeError(
                 f"BL2 NIXL: incoming tensor for {mm_hash} ({n_bytes} bytes) "
-                f"exceeds local scratch ({self._scratch_n_bytes})"
+                f"exceeds slot_size={self._slot_size}"
             )
 
-        with self._scratch_lock:
+        # Consumer uses slot 0 of its own scratch as the receive buffer for
+        # one transfer at a time; the actual remote offset comes from the
+        # PUSH notif (producer's slot index).
+        with self._consumer_lock:
             local_xfer = self._wrapper.get_xfer_descs(
                 [(self._scratch_addr, n_bytes, self._device_id)], "VRAM"
             )
@@ -664,22 +698,17 @@ class NixlECConnector(ECConnectorBase):
         if tensor is None:
             return
         try:
+            # Returns as soon as the PUSH notif is sent. The slot stays
+            # claimed in the endpoint's ring until ACK arrives (auto-
+            # released by the notif drain thread). save_caches doesn't
+            # block, which lets the encoder pipeline keep flowing
+            # independently of the consumer's read latency.
             n_bytes = self._endpoint.producer_advertise(mm_hash, tensor)
         except Exception:
             logger.exception(
                 "BL2 NIXL producer_advertise failed for mm_hash=%s", mm_hash
             )
             return
-        try:
-            # Block until the consumer has READ our scratch buffer (NIXL
-            # auto-emits the ACK notif on transfer completion).
-            self._endpoint.wait_for_notif(mm_hash, "ACK")
-        except Exception:
-            logger.exception(
-                "BL2 NIXL: ACK wait failed for mm_hash=%s", mm_hash
-            )
-        finally:
-            self._endpoint.producer_release()
         self._known_hashes.add(mm_hash)
         if self._bl2 is not None:
             self._bl2.record_send_done(
