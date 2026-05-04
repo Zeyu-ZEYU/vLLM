@@ -318,7 +318,6 @@ class _NixlEndpoint:
                                 msg = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
                             except Exception:
                                 continue
-                            head, _, _ = msg.partition("|")
                             # Key by mm_hash: ACK|<hash> or PUSH|<hash>|...
                             parts = msg.split("|")
                             if len(parts) >= 2:
@@ -519,17 +518,24 @@ class NixlECConnector(ECConnectorBase):
         # Device id: prefer extra_cfg override; else first CUDA visible.
         device_id = int(extra.get("device_id", 0))
 
-        self._endpoint = _NixlEndpoint(
-            role=role,
-            is_producer=self.is_producer,
-            extra_cfg=extra,
-            device_id=device_id,
-        )
-        # BL2 sidecar recorder. Only emits when MONO_KERNEL_BL2_VEMB_PATH is
-        # set in the worker process; harmless otherwise.
-        self._bl2 = _bl2.create_recorder(
-            "producer" if self.is_producer else "consumer"
-        )
+        # Only the worker-side connector instantiates the NIXL agent and
+        # opens the bootstrap TCP listener / dial. The scheduler-side
+        # connector lives in a different process; it doesn't move data and
+        # would conflict on the bind port if it tried to start the listener.
+        self._endpoint: _NixlEndpoint | None = None
+        self._bl2 = None
+        if role == ECConnectorRole.WORKER:
+            self._endpoint = _NixlEndpoint(
+                role=role,
+                is_producer=self.is_producer,
+                extra_cfg=extra,
+                device_id=device_id,
+            )
+            # BL2 sidecar recorder. Only emits when MONO_KERNEL_BL2_VEMB_PATH
+            # is set in the worker process; harmless otherwise.
+            self._bl2 = _bl2.create_recorder(
+                "producer" if self.is_producer else "consumer"
+            )
 
         # Scheduler-side state: mm_hash -> num_token, populated by
         # update_state_after_alloc and drained by build_connector_meta.
@@ -545,7 +551,7 @@ class NixlECConnector(ECConnectorBase):
     def start_load_caches(
         self, encoder_cache: dict[str, torch.Tensor], **kwargs
     ) -> None:
-        if not self.is_consumer:
+        if not self.is_consumer or self._endpoint is None:
             return
         meta = self._get_connector_metadata()
         assert isinstance(meta, NixlECConnectorMetadata)
@@ -572,7 +578,7 @@ class NixlECConnector(ECConnectorBase):
     def save_caches(
         self, encoder_cache: dict[str, torch.Tensor], mm_hash: str, **kwargs
     ) -> None:
-        if not self.is_producer:
+        if not self.is_producer or self._endpoint is None:
             return
         tensor = encoder_cache.get(mm_hash)
         if tensor is None:
