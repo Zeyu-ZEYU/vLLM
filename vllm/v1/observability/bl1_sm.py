@@ -338,12 +338,20 @@ class Bl1SmRecorder:
                     self._sm_occ_samples, t_start, t_end)
 
             if sm_active is not None:
-                record[f"smu_{phase}"] = sm_active * 100.0
+                smu_pct = sm_active * 100.0
+                record[f"smu_{phase}"] = smu_pct
                 record[f"nsm_{phase}"] = (
                     self._total_sm * sm_active if self._total_sm else None)
+                # ko = "fraction of phase time SMs are NOT running kernel
+                # warps" per spec. SM_ACTIVE measures "warp resident on
+                # SM"; its complement is the closest aggregate proxy for
+                # SM-level kernel-inactive time. Satisfies ko + smu = 100
+                # by construction.
+                record[f"ko_{phase}"] = 100.0 - smu_pct
             else:
                 record[f"smu_{phase}"] = None
                 record[f"nsm_{phase}"] = None
+                record[f"ko_{phase}"] = None
             record[f"sm_occ_{phase}"] = (
                 sm_occ * 100.0 if sm_occ is not None else None)
 
