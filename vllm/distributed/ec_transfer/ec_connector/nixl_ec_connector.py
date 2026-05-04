@@ -145,6 +145,33 @@ class _NixlEndpoint:
         self._engine_id = str(uuid.uuid4())
         self._wrapper = NixlWrapper(self._engine_id, config)
 
+        # Pre-allocate a fixed scratch buffer on the device and register it
+        # with NIXL ONCE. NIXL only knows about memory that was registered
+        # before `get_agent_metadata()` returned the bytes the peer
+        # `add_remote_agent`'d. Per-transfer registration would require
+        # re-handshaking the metadata each time, which is fragile and slow.
+        # 128 MiB covers typical Qwen3-VL embeddings (~1-3 MB each, deep-
+        # stacked up to ~10 MB) with room for batching of up to ~12 items.
+        self._scratch_n_bytes = int(extra_cfg.get(
+            "scratch_bytes", 128 * 1024 * 1024))
+        self._scratch = torch.empty(
+            self._scratch_n_bytes,
+            dtype=torch.uint8,
+            device=f"cuda:{self._device_id}",
+        )
+        self._scratch_addr = int(self._scratch.data_ptr())
+        self._scratch_descs = self._wrapper.get_reg_descs(
+            [(self._scratch_addr, self._scratch_n_bytes,
+              self._device_id, "")],
+            "VRAM",
+        )
+        self._wrapper.register_memory(
+            self._scratch_descs, backends=self._nixl_backends)
+        # Lock serializes scratch use across save_caches / start_load_caches
+        # so concurrent calls don't overwrite each other's bytes before the
+        # remote READ completes.
+        self._scratch_lock = threading.Lock()
+
         # Bootstrap endpoint (peer's host:port). Producer binds; consumer
         # dials. Format: "host:port".
         peer = extra_cfg.get("peer_endpoint")
@@ -162,8 +189,10 @@ class _NixlEndpoint:
         self._notif_lock = threading.Lock()
         self._stop = threading.Event()
 
-        # Remote agent name (consumer-side only, populated at bootstrap).
+        # Remote agent name + remote scratch addr (populated at bootstrap).
         self._remote_agent: str | None = None
+        self._remote_scratch_addr: int | None = None
+        self._remote_scratch_size: int | None = None
 
         if self._is_producer:
             self._start_producer_listener()
@@ -206,6 +235,11 @@ class _NixlEndpoint:
             bind_host or "0.0.0.0", self._peer_port, self._engine_id,
         )
 
+        # Pack our scratch addr/size so the consumer can target it for READ.
+        scratch_payload = struct.pack(
+            ">QQ", self._scratch_addr, self._scratch_n_bytes
+        )
+
         def accept_loop():
             while not self._stop.is_set():
                 try:
@@ -217,6 +251,7 @@ class _NixlEndpoint:
                 try:
                     payload = _LEN_PREFIX.pack(len(agent_name_bytes)) + agent_name_bytes
                     payload += _LEN_PREFIX.pack(len(meta_bytes)) + meta_bytes
+                    payload += scratch_payload
                     conn.sendall(payload)
                     # Read the consumer's agent_name bytes so we can address it.
                     n = _LEN_PREFIX.unpack(_recv_n(conn, 4))[0]
@@ -226,6 +261,10 @@ class _NixlEndpoint:
                     consumer_name = _recv_n(conn, n).decode("utf-8")
                     n2 = _LEN_PREFIX.unpack(_recv_n(conn, 4))[0]
                     consumer_meta = _recv_n(conn, n2)
+                    cons_scratch = _recv_n(conn, 16)
+                    cons_addr, cons_size = struct.unpack(">QQ", cons_scratch)
+                    self._remote_scratch_addr = cons_addr
+                    self._remote_scratch_size = cons_size
                     # Register the consumer as a remote agent so we can
                     # send_notif to it (notifs are keyed by the recipient).
                     name = self._wrapper.add_remote_agent(consumer_meta)
@@ -281,6 +320,10 @@ class _NixlEndpoint:
             producer_name = _recv_n(sock, n).decode("utf-8")
             n2 = _LEN_PREFIX.unpack(_recv_n(sock, 4))[0]
             producer_meta = _recv_n(sock, n2)
+            prod_scratch = _recv_n(sock, 16)
+            prod_addr, prod_size = struct.unpack(">QQ", prod_scratch)
+            self._remote_scratch_addr = prod_addr
+            self._remote_scratch_size = prod_size
             self._remote_agent = self._wrapper.add_remote_agent(producer_meta)
             if self._remote_agent != producer_name:
                 logger.warning(
@@ -294,9 +337,11 @@ class _NixlEndpoint:
             our_meta = self._wrapper.get_agent_metadata()
             sock.sendall(_LEN_PREFIX.pack(len(our_name)) + our_name)
             sock.sendall(_LEN_PREFIX.pack(len(our_meta)) + our_meta)
+            sock.sendall(struct.pack(
+                ">QQ", self._scratch_addr, self._scratch_n_bytes))
             logger.info(
-                "BL2 NIXL consumer bootstrap done; producer=%s",
-                self._remote_agent,
+                "BL2 NIXL consumer bootstrap done; producer=%s remote_scratch=0x%x/%d",
+                self._remote_agent, prod_addr, prod_size,
             )
         finally:
             sock.close()
@@ -344,120 +389,151 @@ class _NixlEndpoint:
 
     # ---- transfer primitives -----------------------------------------------
 
-    def producer_advertise(self, mm_hash: str, tensor: torch.Tensor) -> tuple[Any, int, int]:
-        """Producer-side: register tensor memory, send PUSH notif.
+    def producer_advertise(self, mm_hash: str, tensor: torch.Tensor) -> int:
+        """Producer-side: copy tensor into the pre-registered scratch buffer
+        and send a PUSH notif advertising offset+length+shape+dtype.
 
-        Returns (registered_descs, addr, n_bytes) for later deregistration.
-        Caller must call ``producer_release(...)`` after the consumer ACKs.
+        Caller is expected to subsequently `wait_for_notif(mm_hash, "ACK")`
+        before releasing the scratch lock — the scratch is shared, and
+        another save_caches must not overwrite it before the consumer's
+        NIXL READ has completed.
+
+        Returns the number of bytes copied (used by the BL2 sidecar).
         """
         if not tensor.is_cuda:
             raise RuntimeError("BL2 NIXL: tensor must be on CUDA device")
         t = tensor.contiguous()
-        addr = int(t.data_ptr())
         n_bytes = int(t.numel() * t.element_size())
-        descs = self._wrapper.get_reg_descs([(addr, n_bytes, self._device_id, "")], "VRAM")
-        self._wrapper.register_memory(descs, backends=self._nixl_backends)
+        if n_bytes > self._scratch_n_bytes:
+            raise RuntimeError(
+                f"BL2 NIXL: tensor for {mm_hash} ({n_bytes} bytes) exceeds "
+                f"scratch_n_bytes={self._scratch_n_bytes}; raise scratch_bytes "
+                f"in ec_connector_extra_config"
+            )
 
-        shape = ",".join(str(x) for x in t.shape)
-        dtype = str(t.dtype).replace("torch.", "")
-        msg = f"PUSH|{mm_hash}|{addr}|{n_bytes}|{shape}|{dtype}"
-        self._wrapper.send_notif(self.remote_agent, notif_msg=msg)
-        return descs, addr, n_bytes
-
-    def producer_release(self, descs: Any) -> None:
+        # The scratch lock guards the buffer for the entire send round-trip
+        # (advertise → consumer reads → ACK). Acquired here, released by
+        # the connector after wait_for_notif("ACK").
+        self._scratch_lock.acquire()
         try:
-            self._wrapper.deregister_memory(descs)
+            # Copy bytes into the front of scratch.
+            flat = t.view(torch.uint8).flatten()
+            self._scratch[: n_bytes].copy_(flat)
+            # Make sure the device-side copy lands before peer reads.
+            torch.cuda.synchronize()
+
+            shape = ",".join(str(x) for x in t.shape)
+            dtype = str(t.dtype).replace("torch.", "")
+            offset = 0
+            msg = (
+                f"PUSH|{mm_hash}|{offset}|{n_bytes}|{shape}|{dtype}"
+            )
+            self._wrapper.send_notif(self.remote_agent, notif_msg=msg)
+            return n_bytes
         except Exception:
-            logger.exception("BL2 NIXL: deregister_memory failed; leaking")
+            self._scratch_lock.release()
+            raise
+
+    def producer_release(self) -> None:
+        """Release the scratch lock acquired in producer_advertise."""
+        try:
+            self._scratch_lock.release()
+        except RuntimeError:
+            # Lock not held; ignore.
+            pass
 
     def consumer_pull(
         self,
         mm_hash: str,
         push_msg: str,
     ) -> torch.Tensor:
-        """Consumer-side: parse a PUSH msg, allocate local tensor, NIXL-READ
-        from the producer's pointer, return the populated tensor. The READ's
-        notif_msg is set so the producer can unblock its `save_caches`."""
-        # PUSH|<mm_hash>|<addr>|<n_bytes>|<shape>|<dtype>
+        """Consumer-side: parse the PUSH msg, NIXL-READ from the producer's
+        scratch into our scratch, copy out to a fresh tensor, return it.
+
+        The READ's notif_msg is set so the producer's save_caches unblocks
+        on the implicit ACK that NIXL sends when the READ completes.
+        """
+        # PUSH|<mm_hash>|<offset>|<n_bytes>|<shape>|<dtype>
         parts = push_msg.split("|")
         if len(parts) < 6 or parts[0] != "PUSH" or parts[1] != mm_hash:
             raise RuntimeError(f"BL2 NIXL: malformed PUSH notif {push_msg!r}")
-        remote_addr = int(parts[2])
+        remote_offset = int(parts[2])
         n_bytes = int(parts[3])
         shape = [int(x) for x in parts[4].split(",")] if parts[4] else []
         dtype_name = parts[5]
         dtype = _parse_dtype(dtype_name)
 
-        local = torch.empty(shape, dtype=dtype, device=f"cuda:{self._device_id}")
-        local_addr = int(local.data_ptr())
-        local_n = int(local.numel() * local.element_size())
-        if local_n != n_bytes:
+        if self._remote_scratch_addr is None:
             raise RuntimeError(
-                f"BL2 NIXL: size mismatch for {mm_hash}: producer={n_bytes} "
-                f"consumer={local_n} (shape={shape}, dtype={dtype})"
+                "BL2 NIXL: remote scratch addr not yet bootstrapped"
+            )
+        if n_bytes > self._scratch_n_bytes:
+            raise RuntimeError(
+                f"BL2 NIXL: incoming tensor for {mm_hash} ({n_bytes} bytes) "
+                f"exceeds local scratch ({self._scratch_n_bytes})"
             )
 
-        local_reg = self._wrapper.get_reg_descs(
-            [(local_addr, local_n, self._device_id, "")], "VRAM"
-        )
-        self._wrapper.register_memory(local_reg, backends=self._nixl_backends)
-        local_handle = None
-        remote_handle = None
-        try:
-            # NIXL 1.0.1 API: get_xfer_descs takes 3-tuples, but
-            # get_reg_descs takes 4-tuples (with metadata string).
+        with self._scratch_lock:
             local_xfer = self._wrapper.get_xfer_descs(
-                [(local_addr, local_n, self._device_id)], "VRAM"
+                [(self._scratch_addr, n_bytes, self._device_id)], "VRAM"
             )
-            local_handle = self._wrapper.prep_xfer_dlist(_NIXL_INIT_AGENT, local_xfer)
+            local_handle = self._wrapper.prep_xfer_dlist(
+                _NIXL_INIT_AGENT, local_xfer
+            )
             remote_xfer = self._wrapper.get_xfer_descs(
-                [(remote_addr, n_bytes, self._device_id)], "VRAM"
+                [(self._remote_scratch_addr + remote_offset, n_bytes,
+                  self._device_id)],
+                "VRAM",
             )
-            remote_handle = self._wrapper.prep_xfer_dlist(self.remote_agent, remote_xfer)
-
-            ack_msg = f"ACK|{mm_hash}"
-            xfer_handle = self._wrapper.make_prepped_xfer(
-                "READ",
-                local_handle,
-                [0],
-                remote_handle,
-                [0],
-                notif_msg=ack_msg,
+            remote_handle = self._wrapper.prep_xfer_dlist(
+                self.remote_agent, remote_xfer
             )
-            self._wrapper.transfer(xfer_handle)
-
-            # Spin until the transfer reports DONE (NIXL state strings vary
-            # across versions; treat anything containing "DONE" or matching
-            # boolean True as completion).
-            deadline = time.time() + 30.0
-            while time.time() < deadline:
-                state = self._wrapper.check_xfer_state(xfer_handle)
-                if state in ("DONE", "ERR"):
-                    break
-                if isinstance(state, str) and "DONE" in state.upper():
-                    state = "DONE"
-                    break
-                time.sleep(_POLL_INTERVAL_S)
-            else:
-                state = "TIMEOUT"
-            self._wrapper.release_xfer_handle(xfer_handle)
             try:
-                self._wrapper.release_dlist_handle(local_handle)
-                self._wrapper.release_dlist_handle(remote_handle)
-            except Exception:
-                pass
-            if state != "DONE":
-                raise RuntimeError(
-                    f"BL2 NIXL: READ transfer for {mm_hash} ended in "
-                    f"state={state}"
+                ack_msg = f"ACK|{mm_hash}"
+                xfer_handle = self._wrapper.make_prepped_xfer(
+                    "READ",
+                    local_handle, [0],
+                    remote_handle, [0],
+                    notif_msg=ack_msg,
                 )
-        finally:
-            try:
-                self._wrapper.deregister_memory(local_reg)
-            except Exception:
-                logger.exception("BL2 NIXL: consumer deregister_memory failed")
+                self._wrapper.transfer(xfer_handle)
+                deadline = time.time() + 30.0
+                state = "PROC"
+                while time.time() < deadline:
+                    state = self._wrapper.check_xfer_state(xfer_handle)
+                    if state in ("DONE", "ERR"):
+                        break
+                    if isinstance(state, str) and "DONE" in state.upper():
+                        state = "DONE"
+                        break
+                    time.sleep(_POLL_INTERVAL_S)
+                else:
+                    state = "TIMEOUT"
+                self._wrapper.release_xfer_handle(xfer_handle)
+                if state != "DONE":
+                    raise RuntimeError(
+                        f"BL2 NIXL: READ transfer for {mm_hash} ended "
+                        f"in state={state}"
+                    )
+            finally:
+                try:
+                    self._wrapper.release_dlist_handle(local_handle)
+                except Exception:
+                    pass
+                try:
+                    self._wrapper.release_dlist_handle(remote_handle)
+                except Exception:
+                    pass
 
-        return local
+            # Copy bytes out of scratch into a fresh tensor that survives the
+            # next transfer (which would overwrite scratch).
+            tensor = torch.empty(
+                shape, dtype=dtype, device=f"cuda:{self._device_id}"
+            )
+            tensor.view(torch.uint8).flatten()[:n_bytes].copy_(
+                self._scratch[:n_bytes]
+            )
+        return tensor
 
     def stop(self) -> None:
         self._stop.set()
@@ -588,23 +664,22 @@ class NixlECConnector(ECConnectorBase):
         if tensor is None:
             return
         try:
-            descs, _addr, n_bytes = self._endpoint.producer_advertise(
-                mm_hash, tensor
-            )
+            n_bytes = self._endpoint.producer_advertise(mm_hash, tensor)
         except Exception:
             logger.exception(
                 "BL2 NIXL producer_advertise failed for mm_hash=%s", mm_hash
             )
             return
         try:
-            # Block until the consumer has READ our memory.
+            # Block until the consumer has READ our scratch buffer (NIXL
+            # auto-emits the ACK notif on transfer completion).
             self._endpoint.wait_for_notif(mm_hash, "ACK")
         except Exception:
             logger.exception(
                 "BL2 NIXL: ACK wait failed for mm_hash=%s", mm_hash
             )
         finally:
-            self._endpoint.producer_release(descs)
+            self._endpoint.producer_release()
         self._known_hashes.add(mm_hash)
         if self._bl2 is not None:
             self._bl2.record_send_done(
