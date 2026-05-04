@@ -355,7 +355,7 @@ class _NixlEndpoint:
         t = tensor.contiguous()
         addr = int(t.data_ptr())
         n_bytes = int(t.numel() * t.element_size())
-        descs = self._wrapper.get_reg_descs([(addr, n_bytes, self._device_id)], "VRAM")
+        descs = self._wrapper.get_reg_descs([(addr, n_bytes, self._device_id, "")], "VRAM")
         self._wrapper.register_memory(descs, backends=self._nixl_backends)
 
         shape = ",".join(str(x) for x in t.shape)
@@ -398,16 +398,18 @@ class _NixlEndpoint:
             )
 
         local_reg = self._wrapper.get_reg_descs(
-            [(local_addr, local_n, self._device_id)], "VRAM"
+            [(local_addr, local_n, self._device_id, "")], "VRAM"
         )
         self._wrapper.register_memory(local_reg, backends=self._nixl_backends)
+        local_handle = None
+        remote_handle = None
         try:
             local_xfer = self._wrapper.get_xfer_descs(
-                [(local_addr, local_n, self._device_id)], "VRAM"
+                [(local_addr, local_n, self._device_id, "")], "VRAM"
             )
             local_handle = self._wrapper.prep_xfer_dlist(_NIXL_INIT_AGENT, local_xfer)
             remote_xfer = self._wrapper.get_xfer_descs(
-                [(remote_addr, n_bytes, self._device_id)], "VRAM"
+                [(remote_addr, n_bytes, self._device_id, "")], "VRAM"
             )
             remote_handle = self._wrapper.prep_xfer_dlist(self.remote_agent, remote_xfer)
 
