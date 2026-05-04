@@ -48,11 +48,23 @@ _KNOWN_SERVER_PREFIXES = ("chatcmpl-", "cmpl-", "embd-", "rerank-")
 
 def _recover_external_req_id(internal: str) -> str:
     """Best-effort recovery of the user-supplied request_id from vLLM's
-    internal-form id."""
+    internal-form id.
+
+    Also unwinds the proxy-fanout id shape introduced by
+    `examples/online_serving/disaggregated_encoder/disagg_epd_proxy.py`,
+    where each per-MM-item child request gets `<parent>:<idx>:<rand6>`
+    appended before vLLM's own randomization. After stripping the
+    `-<8hex>` and the `chatcmpl-` prefix, we additionally split on `:`
+    and keep the leading parent id, which matches the input JSONL's
+    `id` field.
+    """
     s = _RANDOMIZED_SUFFIX_RE.sub("", internal)
     for prefix in _KNOWN_SERVER_PREFIXES:
         if s.startswith(prefix):
-            return s[len(prefix):]
+            s = s[len(prefix):]
+            break
+    if ":" in s:
+        s = s.split(":", 1)[0]
     return s
 
 
@@ -179,11 +191,20 @@ def main() -> None:
         text_by_id = _index_by_external_id(_load_jsonl(a.server_text))
         vis_sm_by_id = _index_by_external_id(_load_jsonl(a.server_vis_sm))
         text_sm_by_id = _index_by_external_id(_load_jsonl(a.server_text_sm))
-        # vemb sidecars are keyed by mm_hash → time, no req_id recovery needed.
+        # vemb sidecars are keyed by mm_hash → time.
+        text_vemb_records = _load_jsonl(a.server_text_vemb)
         d_vemb_by_hash = _build_vemb_index(
-            _load_jsonl(a.server_vis_vemb),
-            _load_jsonl(a.server_text_vemb),
+            _load_jsonl(a.server_vis_vemb), text_vemb_records,
         )
+        # Build a req_id → list[mm_hash] map from the text-side consumer
+        # vemb events (these include the request that triggered the load,
+        # which the producer side cannot know on its own).
+        req_to_mm_hashes: dict[str, list[str]] = defaultdict(list)
+        for rec in text_vemb_records:
+            mh = str(rec.get("mm_hash", ""))
+            for rid in rec.get("req_ids", []) or []:
+                ext = _recover_external_req_id(str(rid))
+                req_to_mm_hashes[ext].append(mh)
     else:
         server_by_id = _index_by_external_id(_load_jsonl(a.server))
         server_sm_by_id = _index_by_external_id(_load_jsonl(a.server_sm))
@@ -272,8 +293,17 @@ def main() -> None:
                 # mm_hash this request consumed (multiple images per req
                 # would all need to land before the LLM forward starts, so
                 # the bottleneck is max).
-                mm_hashes = (vis_rec or {}).get("mm_hashes") or \
-                            (text_rec or {}).get("mm_hashes") or []
+                #
+                # Source of truth for "which mm_hashes this request used"
+                # is the text-side vemb sidecar (consumer events), which
+                # records req_id alongside mm_hash. The vision NVML
+                # sidecar's mm_hashes can also be used as a fallback,
+                # though the proxy fanout gives that side a different
+                # req_id shape.
+                mm_hashes = req_to_mm_hashes.get(req_id) or []
+                if not mm_hashes:
+                    mm_hashes = (vis_rec or {}).get("mm_hashes") or \
+                                (text_rec or {}).get("mm_hashes") or []
                 d_vemb = None
                 for mh in mm_hashes:
                     v = d_vemb_by_hash.get(str(mh))

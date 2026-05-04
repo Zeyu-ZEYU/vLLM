@@ -2975,16 +2975,22 @@ class GPUModelRunner(
             current_item_idx += num_items
 
         # Cache the encoder outputs by mm_hash
+        # Cache the encoder outputs by mm_hash.
         for mm_hash, output in zip(mm_hashes, encoder_outputs):
             self.encoder_cache[mm_hash] = output
             logger.debug("Finish execute for mm hash %s", mm_hash)
-            self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
-        # BL1: close vision-phase span.
+        # BL1: close vision-phase span BEFORE the EC connector save. In BL2
+        # the save synchronously ships the embedding to the consumer node
+        # over NIXL and blocks until the consumer's ACK; that latency
+        # belongs to d_vemb_transfer, not d_vision.
         if _bl1_ctx is not None and _bl1_recorder is not None:
             _bl1_recorder.vision_end(_bl1_ctx)
         if _bl1_sm_ctx is not None and _bl1_sm_recorder is not None:
             _bl1_sm_recorder.vision_end(_bl1_sm_ctx)
+
+        for mm_hash, _output in zip(mm_hashes, encoder_outputs):
+            self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
         return encoder_outputs
 
