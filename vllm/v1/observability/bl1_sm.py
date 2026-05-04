@@ -178,8 +178,15 @@ class Bl1SmRecorder:
 
     # ---- sampler thread ----
     def _sampler_loop(self) -> None:
+        # Defense in depth: swallow any per-tick exception so the daemon
+        # thread can never die mid-experiment and never spam the server
+        # log with tracebacks (which the run_bl1.sh monitor would
+        # mistakenly flag as fatal).
         while not self._sampler_stop.is_set():
-            self._drain()
+            try:
+                self._drain()
+            except Exception:
+                pass
             self._sampler_stop.wait(_SAMPLER_TICK_S)
 
     def _drain(self) -> None:
@@ -208,11 +215,23 @@ class Bl1SmRecorder:
 
         with self._lock:
             for s in sm_active:
+                if s.value is None:
+                    continue  # DCGM emits None for stale/uninitialized
+                try:
+                    val = float(s.value)
+                except (TypeError, ValueError):
+                    continue
                 ts_host = offset + s.ts / 1e6
-                self._sm_active_samples.append((ts_host, float(s.value)))
+                self._sm_active_samples.append((ts_host, val))
             for s in sm_occ:
+                if s.value is None:
+                    continue
+                try:
+                    val = float(s.value)
+                except (TypeError, ValueError):
+                    continue
                 ts_host = offset + s.ts / 1e6
-                self._sm_occ_samples.append((ts_host, float(s.value)))
+                self._sm_occ_samples.append((ts_host, val))
 
         # Clear so the next GetAllSinceLastCall returns a fresh delta.
         self._dcgm_dfvc.values.clear()
