@@ -181,6 +181,9 @@ from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.observability.bl1 import get_recorder as _bl1_get_recorder
+from vllm.v1.observability.bl1_sm import (
+    get_sm_recorder as _bl1_sm_get_recorder,
+)
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.cp_utils import (
@@ -1075,11 +1078,14 @@ class GPUModelRunner(
         """
         # Remove finished requests from the cached states.
         _bl1_recorder = _bl1_get_recorder()
+        _bl1_sm_recorder = _bl1_sm_get_recorder()
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
             if _bl1_recorder is not None:
                 _bl1_recorder.finalize_request(req_id)
+            if _bl1_sm_recorder is not None:
+                _bl1_sm_recorder.finalize_request(req_id)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -2790,6 +2796,11 @@ class GPUModelRunner(
             _bl1_recorder.vision_begin({rid for rid, _ in mm_lora_refs})
             if _bl1_recorder is not None else None
         )
+        _bl1_sm_recorder = _bl1_sm_get_recorder()
+        _bl1_sm_ctx = (
+            _bl1_sm_recorder.vision_begin({rid for rid, _ in mm_lora_refs})
+            if _bl1_sm_recorder is not None else None
+        )
 
         should_time = bool(
             self.observability_config
@@ -2966,6 +2977,8 @@ class GPUModelRunner(
         # BL1: close vision-phase span.
         if _bl1_ctx is not None and _bl1_recorder is not None:
             _bl1_recorder.vision_end(_bl1_ctx)
+        if _bl1_sm_ctx is not None and _bl1_sm_recorder is not None:
+            _bl1_sm_recorder.vision_end(_bl1_sm_ctx)
 
         return encoder_outputs
 
@@ -4093,6 +4106,11 @@ class GPUModelRunner(
             _bl1_recorder.step_begin(scheduler_output)
             if _bl1_recorder is not None else None
         )
+        _bl1_sm_recorder = _bl1_sm_get_recorder()
+        _bl1_sm_step_ctx = (
+            _bl1_sm_recorder.step_begin(scheduler_output)
+            if _bl1_sm_recorder is not None else None
+        )
         with (
             set_forward_context(
                 attn_metadata,
@@ -4120,6 +4138,8 @@ class GPUModelRunner(
             )
         if _bl1_step_ctx is not None and _bl1_recorder is not None:
             _bl1_recorder.step_end(_bl1_step_ctx)
+        if _bl1_sm_step_ctx is not None and _bl1_sm_recorder is not None:
+            _bl1_sm_recorder.step_end(_bl1_sm_step_ctx)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

@@ -79,6 +79,10 @@ def main() -> None:
     ap.add_argument("--client", required=True, help="vllm bench serve JSON dump")
     ap.add_argument("--server", required=True,
                     help="BL1 server-side sidecar JSONL")
+    ap.add_argument("--server-sm", default=None,
+                    help="BL1 SM-pass sidecar JSONL (DCGM nsm/smu). "
+                         "Optional; when present, fields override the "
+                         "default null values for nsm_* / smu_*.")
     ap.add_argument("--inputs", required=True,
                     help="Original requests JSONL (one row per line)")
     ap.add_argument("--label", required=True,
@@ -101,6 +105,13 @@ def main() -> None:
         internal = str(r.get("vllm_req_id", ""))
         ext = _recover_external_req_id(internal)
         server_by_id[ext] = r
+    # SM-pass sidecar (optional). Same id-recovery rule.
+    server_sm_by_id: dict[str, dict[str, Any]] = {}
+    if a.server_sm:
+        for r in _load_jsonl(a.server_sm):
+            internal = str(r.get("vllm_req_id", ""))
+            ext = _recover_external_req_id(internal)
+            server_sm_by_id[ext] = r
 
     # Bench-serve --save-detailed parallel arrays (positional, in input order).
     output_lens = client.get("output_lens") or []
@@ -163,8 +174,11 @@ def main() -> None:
                 tpot = (e2el - ttft) / max(num_otokens - 1, 1)
 
             srec = server_by_id.get(req_id)
+            sm_rec = server_sm_by_id.get(req_id)
             def _g(name):
                 return srec.get(name) if srec else None
+            def _sm(name):
+                return sm_rec.get(name) if sm_rec else None
 
             out_row = {
                 "id": row.get("id", i),
@@ -188,13 +202,20 @@ def main() -> None:
                 "ko_vision": _g("ko_vision"),
                 "ko_prefill": _g("ko_prefill"),
                 "ko_decode": _g("ko_decode"),
-                # SM-level metrics not collected in BL1 default run.
-                "nsm_vision": None,
-                "nsm_prefill": None,
-                "nsm_decode": None,
-                "smu_vision": None,
-                "smu_prefill": None,
-                "smu_decode": None,
+                # SM-level metrics: filled from SM-pass sidecar when
+                # provided (--server-sm); else null.
+                "nsm_vision": _sm("nsm_vision"),
+                "nsm_prefill": _sm("nsm_prefill"),
+                "nsm_decode": _sm("nsm_decode"),
+                "smu_vision": _sm("smu_vision"),
+                "smu_prefill": _sm("smu_prefill"),
+                "smu_decode": _sm("smu_decode"),
+                # Auxiliary: averaged SM occupancy (warps resident /
+                # peak), kept separate from smu so the strict
+                # "fraction-of-active-time" semantic is unambiguous.
+                "sm_occ_vision": _sm("sm_occ_vision"),
+                "sm_occ_prefill": _sm("sm_occ_prefill"),
+                "sm_occ_decode": _sm("sm_occ_decode"),
                 "error": err,
             }
             out.write(json.dumps(out_row, ensure_ascii=False) + "\n")

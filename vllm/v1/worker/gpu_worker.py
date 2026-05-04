@@ -334,6 +334,17 @@ class Worker(WorkerBase):
         if _bl1_recorder is not None:
             _bl1_recorder.start_sampler()
 
+        # BL1 SM-pass: spawn the DCGM-based SM recorder if env var is
+        # set. Independent of the NVML recorder above. nv-hostengine
+        # must already be running on $MONO_KERNEL_BL1_DCGM_HOST (default
+        # 127.0.0.1:5556) — see project README for setup.
+        from vllm.v1.observability.bl1_sm import (
+            create_sm_recorder as _bl1_sm_create,
+        )
+        _bl1_sm_recorder = _bl1_sm_create(self.local_rank)
+        if _bl1_sm_recorder is not None:
+            _bl1_sm_recorder.start_sampler()
+
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
@@ -1051,6 +1062,13 @@ class Worker(WorkerBase):
         try:
             from vllm.v1.observability.bl1 import stop_recorder as _bl1_stop
             _bl1_stop()
+        except Exception:
+            pass
+        try:
+            from vllm.v1.observability.bl1_sm import (
+                stop_sm_recorder as _bl1_sm_stop,
+            )
+            _bl1_sm_stop()
         except Exception:
             pass
 
