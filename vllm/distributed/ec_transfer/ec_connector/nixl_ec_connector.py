@@ -325,7 +325,7 @@ class _NixlEndpoint:
             time.sleep(_POLL_INTERVAL_S)
 
     def wait_for_notif(
-        self, mm_hash: str, prefix: str, timeout_s: float = 600.0
+        self, mm_hash: str, prefix: str, timeout_s: float = 30.0
     ) -> str:
         """Block until a notif starting with ``prefix`` arrives for mm_hash.
         Returns the full message string."""
@@ -404,12 +404,14 @@ class _NixlEndpoint:
         local_handle = None
         remote_handle = None
         try:
+            # NIXL 1.0.1 API: get_xfer_descs takes 3-tuples, but
+            # get_reg_descs takes 4-tuples (with metadata string).
             local_xfer = self._wrapper.get_xfer_descs(
-                [(local_addr, local_n, self._device_id, "")], "VRAM"
+                [(local_addr, local_n, self._device_id)], "VRAM"
             )
             local_handle = self._wrapper.prep_xfer_dlist(_NIXL_INIT_AGENT, local_xfer)
             remote_xfer = self._wrapper.get_xfer_descs(
-                [(remote_addr, n_bytes, self._device_id, "")], "VRAM"
+                [(remote_addr, n_bytes, self._device_id)], "VRAM"
             )
             remote_handle = self._wrapper.prep_xfer_dlist(self.remote_agent, remote_xfer)
 
@@ -427,7 +429,7 @@ class _NixlEndpoint:
             # Spin until the transfer reports DONE (NIXL state strings vary
             # across versions; treat anything containing "DONE" or matching
             # boolean True as completion).
-            deadline = time.time() + 600.0
+            deadline = time.time() + 30.0
             while time.time() < deadline:
                 state = self._wrapper.check_xfer_state(xfer_handle)
                 if state in ("DONE", "ERR"):
