@@ -97,6 +97,24 @@ run_pass() {
     PORTS="$PORT" SLEEP_AFTER=${CLEAN_SLEEP:-80} \
         bash "$WORKTREE/mk_scripts/clean.sh"
 
+    # Wait for GPU 0 memory to actually drop (CUDA driver memory release
+    # can lag the kill of the holding process by several seconds; pass 2
+    # vllm-serve will fail to start if the previous pass's KV cache is
+    # still resident).
+    echo "[run_bl1] waiting for GPU 0 to be free"
+    local GPU_DEADLINE=$((SECONDS + 120))
+    while (( SECONDS < GPU_DEADLINE )); do
+        local used
+        used=$(nvidia-smi --id=0 --query-gpu=memory.used \
+                          --format=csv,noheader,nounits 2>/dev/null \
+               | tr -d ' ')
+        if [[ -n "$used" && "$used" -lt 1000 ]]; then
+            echo "[run_bl1] GPU 0 free (${used} MiB used)"
+            break
+        fi
+        sleep 2
+    done
+
     echo "[run_bl1] launching server: log=$server_log sidecar=$sidecar_path"
     env "$sidecar_var=$sidecar_path" \
         MONO_KERNEL_BL1_DCGM_HOST="$DCGM_HOST" \
@@ -122,6 +140,12 @@ run_pass() {
             kill -KILL "$SERVER_PID" 2>/dev/null || true
             wait "$SERVER_PID" 2>/dev/null || true
         fi
+        # Reap any orphaned vLLM EngineCore subprocesses still holding the
+        # GPU. The parent vllm-serve dies but the engine_core child can
+        # outlive it; without this they keep the model + KV cache resident
+        # and the next pass cannot allocate.
+        pkill -KILL -u "$(id -u)" -f "python.*vllm" 2>/dev/null || true
+        pkill -KILL -u "$(id -u)" -f "VLLM::EngineCore" 2>/dev/null || true
     }
     trap cleanup_pass EXIT INT TERM
 
