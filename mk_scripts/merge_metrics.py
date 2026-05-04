@@ -199,9 +199,10 @@ def main() -> None:
                 "gmu_vision": _g("gmu_vision"),
                 "gmu_prefill": _g("gmu_prefill"),
                 "gmu_decode": _g("gmu_decode"),
-                "ko_vision": _g("ko_vision"),
-                "ko_prefill": _g("ko_prefill"),
-                "ko_decode": _g("ko_decode"),
+                # ko comes from the SM pass: ko = 100 - smu (per spec).
+                "ko_vision": _sm("ko_vision"),
+                "ko_prefill": _sm("ko_prefill"),
+                "ko_decode": _sm("ko_decode"),
                 # SM-level metrics: filled from SM-pass sidecar when
                 # provided (--server-sm); else null.
                 "nsm_vision": _sm("nsm_vision"),

@@ -330,7 +330,6 @@ class Bl1Recorder:
                 record[f"d_{phase}"] = None
                 record[f"gu_{phase}"] = None
                 record[f"gmu_{phase}"] = None
-                record[f"ko_{phase}"] = None
                 continue
             try:
                 d_ms = bounds.first_start_event.elapsed_time(bounds.last_end_event)
@@ -343,11 +342,12 @@ class Bl1Recorder:
                 gu, gmu = self._window_mean(t_start, t_end)
             else:
                 gu, gmu = None, None
-            ko = (100.0 - gu) if gu is not None else None
             record[f"d_{phase}"] = d_s
             record[f"gu_{phase}"] = gu
             record[f"gmu_{phase}"] = gmu
-            record[f"ko_{phase}"] = ko
+            # ko is computed in bl1_sm.py from DCGM SM_ACTIVE (ko + smu
+            # = 100). 100 - gu is broader than the spec's "SM not
+            # running warp" definition, so we no longer emit ko here.
 
         try:
             self._sidecar.write(json.dumps(record) + "\n")
