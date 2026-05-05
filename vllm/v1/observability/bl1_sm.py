@@ -221,6 +221,13 @@ class Bl1SmRecorder:
                     val = float(s.value)
                 except (TypeError, ValueError):
                     continue
+                # DCGM blank/error sentinels for FP64 fields are
+                # ~1.4e14 (DCGM_FP64_BLANK) and similarly for
+                # NOT_FOUND/NOT_SUPPORTED/NOT_PERMISSIONED. Real
+                # SM_ACTIVE / SM_OCCUPANCY values are in [0, 1].
+                # Reject anything outside [0, 1] as a sentinel leak.
+                if not (0.0 <= val <= 1.0):
+                    continue
                 ts_host = offset + s.ts / 1e6
                 self._sm_active_samples.append((ts_host, val))
             for s in sm_occ:
@@ -229,6 +236,8 @@ class Bl1SmRecorder:
                 try:
                     val = float(s.value)
                 except (TypeError, ValueError):
+                    continue
+                if not (0.0 <= val <= 1.0):
                     continue
                 ts_host = offset + s.ts / 1e6
                 self._sm_occ_samples.append((ts_host, val))
