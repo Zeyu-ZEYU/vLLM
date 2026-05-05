@@ -2248,24 +2248,33 @@ class CustomDataset(BenchmarkDataset):
 class CustomMMDataset(CustomDataset):
     """
     Implements the Custom MultiModal dataset. Loads data from a JSONL file and generates
-    sample requests based on conversation turns. Supports two row schemas:
+    sample requests based on conversation turns. Supports three row schemas:
 
-    Legacy:
+    Legacy (single image, multi-image truncated):
     ```
     {"prompt": "...", "image_files": ["path/to/image.png", ...]}
     ```
 
-    Mono_kernel BL1 spec (id passthrough + per-row output budget):
+    Mono_kernel BL1 spec (single image, id passthrough + per-row output budget):
     ```
     {"id": 0, "prompt": "...", "image": "path/to/image.png",
      "output": "groundtruth", "output_tokens": 32}
     ```
 
-    NOTE: Only the first image file is used per sample. When `id` is present
-    on a row, it is used directly as the engine `request_id` (sent via the
-    `x-request-id` header) so server-side instrumentation can correlate by
-    the same id. When `output_tokens` is present, it overrides the CLI
-    `--custom-output-len` value for that row.
+    Multi-image spec (multiple images per request, all forwarded to vision
+    encoder):
+    ```
+    {"id": 0, "prompt": "...", "images": ["path/a.png", "path/b.png", ...],
+     "output": "groundtruth", "output_tokens": 32}
+    ```
+
+    NOTE: With `image` (single string) or legacy `image_files`, only one image
+    is sent. With `images` (list) every entry is forwarded as a list[dict] of
+    `multi_modal_data`. When `id` is present on a row, it is used directly as
+    the engine `request_id` (sent via the `x-request-id` header) so
+    server-side instrumentation can correlate by the same id. When
+    `output_tokens` is present, it overrides the CLI `--custom-output-len`
+    value for that row.
 
     Set `--disable-shuffle` to preserve the input file's row order, which the
     BL1 merge step relies on to reconstruct the per-id metric mapping.
@@ -2301,12 +2310,19 @@ class CustomMMDataset(CustomDataset):
 
             prompt_len = len(tokenizer(prompt).input_ids)
 
-            # Resolve image source: prefer single `image`, fall back to
-            # legacy `image_files` list. NaN-tolerance: pandas read_json
-            # may produce NaN for missing keys.
-            image_path: str | None = None
-            if "image" in item and isinstance(item["image"], str) and item["image"]:
-                image_path = item["image"]
+            # Resolve image source: prefer multi-image `images`, then single
+            # `image`, then legacy `image_files` (first only).
+            image_paths: list[str] | None = None
+            if (
+                "images" in item
+                and isinstance(item["images"], (list, tuple))
+                and len(item["images"]) > 0
+            ):
+                image_paths = [
+                    str(p) for p in item["images"] if isinstance(p, str) and p
+                ]
+            elif "image" in item and isinstance(item["image"], str) and item["image"]:
+                image_paths = [item["image"]]
             elif "image_files" in item:
                 images = item["image_files"]
                 if isinstance(images, (list, tuple)) and len(images) > 0:
@@ -2315,12 +2331,15 @@ class CustomMMDataset(CustomDataset):
                             "Multiple image files found for sample %d. "
                             "Only the first image will be used.", i,
                         )
-                    image_path = images[0]
-            if image_path is None:
+                    image_paths = [images[0]]
+            if not image_paths:
                 raise ValueError(
-                    f"Custom MM row {i} has no `image` or `image_files`."
+                    f"Custom MM row {i} has no `images`, `image`, or `image_files`."
                 )
-            mm_content = process_image(image_path)
+            if len(image_paths) == 1:
+                mm_content = process_image(image_paths[0])
+            else:
+                mm_content = [process_image(p) for p in image_paths]
 
             if enable_multimodal_chat:
                 # Note: when chat is enabled the request prompt_len is no longer
