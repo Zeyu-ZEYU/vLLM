@@ -134,11 +134,16 @@ PEER_ENDPOINT="${BOND_IP_N0}:${NIXL_PORT}"
 echo "[run_bl2] PEER_ENDPOINT=$PEER_ENDPOINT"
 
 # Build EC connector configs (single-line JSON).
-ec_extra_n0='"peer_endpoint":"'${PEER_ENDPOINT}'"'
+# slot_bytes default in connector is 24 MiB; for large multi-image inputs
+# (e.g., milebench 1920x1280 native-res images) one encoder output can be
+# ~66 MiB. Sized to 128 MiB by default; override via SLOT_BYTES env.
+SLOT_BYTES=${SLOT_BYTES:-134217728}
+N_SLOTS=${N_SLOTS:-16}
+ec_extra_n0='"peer_endpoint":"'${PEER_ENDPOINT}'","slot_bytes":'${SLOT_BYTES}',"n_slots":'${N_SLOTS}
 [[ -n "${BOND_DEV_N0:-}" ]] && ec_extra_n0+=',"nixl_dev":"'${BOND_DEV_N0}'"'
 EC_CFG_PRODUCER='{"ec_connector":"NixlECConnector","ec_role":"ec_producer","ec_connector_extra_config":{'${ec_extra_n0}'}}'
 
-ec_extra_n1='"peer_endpoint":"'${PEER_ENDPOINT}'"'
+ec_extra_n1='"peer_endpoint":"'${PEER_ENDPOINT}'","slot_bytes":'${SLOT_BYTES}',"n_slots":'${N_SLOTS}
 [[ -n "${BOND_DEV_N1:-}" ]] && ec_extra_n1+=',"nixl_dev":"'${BOND_DEV_N1}'"'
 EC_CFG_CONSUMER='{"ec_connector":"NixlECConnector","ec_role":"ec_consumer","ec_connector_extra_config":{'${ec_extra_n1}'}}'
 
