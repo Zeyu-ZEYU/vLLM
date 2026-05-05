@@ -1,24 +1,24 @@
 """BL1 (single-GPU origin baseline) per-request, per-phase metrics recorder.
 
 The recorder is a process-singleton inside the GPU worker. When the env var
-MONO_KERNEL_BL1_METRICS_PATH is set, it records per-request CUDA-event spans
-across the three phases (vision / prefill / decode) plus an in-process NVML
-sampler thread that captures GPU utilization and memory %. On request finish
-it computes per-phase durations from the CUDA events, windows the NVML
-samples to each phase, and appends one JSON line to the sidecar file.
+MONO_KERNEL_BL1_METRICS_PATH is set, it records, for every request and every
+phase (vision / prefill / decode), the CUDA-event-bracketed span of EACH
+individual execution forward (one entry per call to _execute_mm_encoder for
+vision; one entry per _model_forward for prefill/decode). A background NVML
+sampler thread captures GPU utilization (driver-side ring buffer) and GPU
+memory usage (point query). On request finalize, per-phase metrics are
+aggregated:
+
+  d_{phase}            = sum of each execution forward's elapsed_time
+  d_{phase}_span       = first execution start to last execution end
+  n_executions_{phase} = number of execution forwards
+  gu_{phase}, gmu_{phase} = pooled mean of all in-window samples (with
+                            per-execution post-end-bracketing fallback)
+                            across every execution of the phase. Empty pool
+                            → null. Units are fractions in [0, 1].
 
 When the env var is unset, every public method returns immediately so the
 hook sites in the model runner / worker pay zero overhead.
-
-Phase semantics (decided with stakeholder):
-  - d_phase = elapsed time from the START of the FIRST forward step where the
-    request is in this phase to the END of the LAST forward step where it is
-    in this phase. Wall-clock span. No per-step apportionment when batches
-    mix phases. d_decode includes sampling time only if the wrap site is
-    placed after _sample; in BL1 we wrap before _sample so d_decode is
-    forward-only.
-  - gu_phase = mean of NVML utilization samples whose host timestamp falls in
-    the (first_start_host, last_end_host) window. ko_phase = 100 - gu_phase.
 """
 
 from __future__ import annotations
@@ -48,30 +48,35 @@ PHASE_DECODE = "decode"
 
 _PHASES = (PHASE_VISION, PHASE_PREFILL, PHASE_DECODE)
 
-# Sampler tick: how often we drain the driver's GPU-utilization sample
-# buffer and read a memory-usage point. The driver itself produces
-# utilization samples at ~10–100 ms cadence depending on the card; we
-# tick faster so we never miss buffer entries and so gmu point samples
-# land inside short phase windows.
-_SAMPLER_TICK_S = 0.03
-# Bracketing-sample fallback: when a phase is shorter than the driver's
-# sample period (H20: dt = 200 ms fixed 5 Hz cadence), no sample
-# timestamp falls strictly inside [t_start, t_end]. Instead of widening
-# the window by some magic dt-bound, we pick a SINGLE sample: the next
-# sample emitted at or after t_end. Each NVML utilization sample at
-# timestamp t represents the GPU's averaged busy-fraction over
-# [t - dt, t]; when t ≥ t_end and the phase is shorter than dt, that
-# interval brackets the phase end-to-end, so the value is the best
-# available estimate of GPU activity during the phase. No magic width
-# constant needed — the rule is dt-agnostic.
-# Bound on each in-memory deque (~10 minutes of headroom at ~33 Hz).
+# Sampler tick: how often we run the inner sampler loop body. Memory is
+# point-queried every tick (10 ms); GPU utilization is drained every
+# `_UTIL_DRAIN_EVERY` ticks (effective ~30 ms; matches NVML driver
+# capability — H20 emits util samples at fixed 5 Hz / 200 ms cadence, so
+# 30 ms drain rate guarantees no buffered samples are missed).
+_SAMPLER_TICK_S = 0.01
+_UTIL_DRAIN_EVERY = 3
+# Bracketing-sample fallback: when an execution forward is shorter than
+# the underlying driver sample period (e.g., NVML util dt = 200 ms on H20;
+# memory point query interval 10 ms here), no sample timestamp falls
+# strictly inside [t_start, t_end] for that execution. Fallback rule (per
+# spec): pick a SINGLE sample, the one emitted at or after t_end. Its
+# implicit averaging interval [t - dt, t] brackets the short execution
+# end-to-end, so the value is the best available single-sample estimate
+# of GPU activity during the execution. If no such sample exists yet,
+# this execution contributes nothing to the pool.
 _NVML_BUFFER_MAX = 60000
 
 
 @dataclass
-class _PhaseBounds:
-    first_start_event: torch.cuda.Event
-    last_end_event: torch.cuda.Event
+class _ExecutionBounds:
+    """One execution forward's CUDA-event pair for a (req_id, phase).
+
+    A single physical (start_event, end_event) pair is shared by reference
+    across all requests classified into this execution forward — that's
+    correct (the device-side timestamps describe the same kernel range).
+    """
+    start_event: torch.cuda.Event
+    end_event: torch.cuda.Event
 
 
 @dataclass
@@ -87,8 +92,11 @@ class Bl1Recorder:
         self._sidecar_path = sidecar_path
         self._device_index = device_index
 
-        # Per-request, per-phase bounds. Main-thread access only.
-        self._phase_state: dict[str, dict[str, _PhaseBounds]] = {}
+        # Per-request, per-phase list of execution-forward bounds.
+        # Main-thread access only.
+        self._phase_state: dict[
+            str, dict[str, list[_ExecutionBounds]]
+        ] = {}
 
         # NVML sample ring buffers (separate for util and memory) + lock.
         # Producer = sampler thread, consumer = finalize_request on main
@@ -161,15 +169,19 @@ class Bl1Recorder:
             pass
 
     def _sampler_loop(self) -> None:
+        i = 0
         while not self._sampler_stop.is_set():
-            self._drain_gu_samples()
             self._poll_gmu_point()
+            if i % _UTIL_DRAIN_EVERY == 0:
+                self._drain_gu_samples()
+            i += 1
             self._sampler_stop.wait(_SAMPLER_TICK_S)
 
     def _drain_gu_samples(self) -> None:
         """Pull all new GPU utilization samples from the driver's internal
         buffer since the last drain, convert their microsecond timestamps
-        to host wall-clock, and push into the gu deque."""
+        to host wall-clock, and push into the gu deque (as fractions in
+        [0, 1])."""
         if self._nvml_handle is None:
             return
         try:
@@ -194,7 +206,8 @@ class Bl1Recorder:
             for s in samples:
                 ts_us = int(s.timeStamp)
                 try:
-                    val = float(s.sampleValue.uiVal)
+                    # NVML returns 0-100 percent; convert to fraction.
+                    val = float(s.sampleValue.uiVal) / 100.0
                 except Exception:
                     continue
                 ts_host = offset + ts_us / 1e6
@@ -204,6 +217,7 @@ class Bl1Recorder:
         self._gu_last_seen_us = max_us
 
     def _poll_gmu_point(self) -> None:
+        """Single point query of GPU memory used / total (fraction in [0, 1])."""
         if self._nvml_handle is None:
             return
         try:
@@ -211,11 +225,11 @@ class Bl1Recorder:
         except Exception:
             return
         try:
-            gmu_pct = (float(mem.used) / float(mem.total)) * 100.0 if mem.total else 0.0
+            gmu = (float(mem.used) / float(mem.total)) if mem.total else 0.0
         except Exception:
             return
         with self._nvml_lock:
-            self._gmu_samples.append((time.time(), gmu_pct))
+            self._gmu_samples.append((time.time(), gmu))
 
     # ---- step-level hooks ---------------------------------------------------
 
@@ -291,7 +305,7 @@ class Bl1Recorder:
         end_event = torch.cuda.Event(enable_timing=True)
         end_event.record()
         for req_id, phase in ctx.req_phases.items():
-            self._update_phase(req_id, phase, ctx.start_event, end_event)
+            self._append_execution(req_id, phase, ctx.start_event, end_event)
 
     # ---- vision-encoder hooks ----------------------------------------------
 
@@ -317,37 +331,60 @@ class Bl1Recorder:
 
         record: dict[str, object] = {"vllm_req_id": req_id}
 
-        # Synchronize once over all events for this request.
-        for bounds in phase_map.values():
+        # Synchronize on the very last end_event of each phase once. This
+        # guarantees all earlier events for this request have completed
+        # (CUDA stream order), so subsequent elapsed_time() and
+        # _device_host_time() calls are safe.
+        for executions in phase_map.values():
+            if not executions:
+                continue
             try:
-                bounds.last_end_event.synchronize()
+                executions[-1].end_event.synchronize()
             except Exception:
                 pass
 
         for phase in _PHASES:
-            bounds = phase_map.get(phase)
-            if bounds is None:
+            executions = phase_map.get(phase) or []
+            n_exec = len(executions)
+            record[f"n_executions_{phase}"] = n_exec
+            if n_exec == 0:
                 record[f"d_{phase}"] = None
+                record[f"d_{phase}_span"] = None
                 record[f"gu_{phase}"] = None
                 record[f"gmu_{phase}"] = None
                 continue
+
+            # d_phase = sum of each execution's elapsed_time.
+            # d_phase_span = elapsed_time(first.start, last.end).
+            d_sum_ms = 0.0
+            d_span_ms = None
             try:
-                d_ms = bounds.first_start_event.elapsed_time(bounds.last_end_event)
+                for ex in executions:
+                    d_sum_ms += ex.start_event.elapsed_time(ex.end_event)
+                d_span_ms = executions[0].start_event.elapsed_time(
+                    executions[-1].end_event
+                )
             except Exception:
-                d_ms = None
-            d_s = (d_ms / 1000.0) if d_ms is not None else None
-            t_start = self._device_host_time(bounds.first_start_event)
-            t_end = self._device_host_time(bounds.last_end_event)
-            if t_start is not None and t_end is not None:
-                gu, gmu = self._window_mean(t_start, t_end)
-            else:
-                gu, gmu = None, None
-            record[f"d_{phase}"] = d_s
+                d_sum_ms = None
+                d_span_ms = None
+
+            record[f"d_{phase}"] = (d_sum_ms / 1000.0) if d_sum_ms is not None else None
+            record[f"d_{phase}_span"] = (
+                d_span_ms / 1000.0 if d_span_ms is not None else None
+            )
+
+            # Build per-execution host time windows for sample pooling.
+            windows: list[tuple[float, float]] = []
+            for ex in executions:
+                ts = self._device_host_time(ex.start_event)
+                te = self._device_host_time(ex.end_event)
+                if ts is not None and te is not None and te >= ts:
+                    windows.append((ts, te))
+
+            gu = self._aggregate_phase(self._gu_samples, windows)
+            gmu = self._aggregate_phase(self._gmu_samples, windows)
             record[f"gu_{phase}"] = gu
             record[f"gmu_{phase}"] = gmu
-            # ko is computed in bl1_sm.py from DCGM SM_ACTIVE (ko + smu
-            # = 100). 100 - gu is broader than the spec's "SM not
-            # running warp" definition, so we no longer emit ko here.
 
         try:
             self._sidecar.write(json.dumps(record) + "\n")
@@ -357,85 +394,49 @@ class Bl1Recorder:
 
     # ---- internals ---------------------------------------------------------
 
-    def _update_phase(
+    def _append_execution(
         self, req_id: str, phase: str,
         start_event: torch.cuda.Event, end_event: torch.cuda.Event,
     ) -> None:
         per_req = self._phase_state.setdefault(req_id, {})
-        bounds = per_req.get(phase)
-        if bounds is None:
-            per_req[phase] = _PhaseBounds(
-                first_start_event=start_event,
-                last_end_event=end_event,
-            )
-        else:
-            bounds.last_end_event = end_event
+        per_req.setdefault(phase, []).append(
+            _ExecutionBounds(start_event=start_event, end_event=end_event)
+        )
 
-    @staticmethod
-    def _bracketing_value(samples, t_end: float) -> list[float]:
-        """Return a single-element list with the value of the first
-        sample emitted at or after ``t_end``. Its averaging interval
-        [t-dt, t] brackets the phase when dt > phase length and is the
-        best single-sample estimate. If no such sample exists yet (phase
-        finalized before driver could emit), return [] — caller treats
-        that as None."""
-        nxt = next((v for t, v in samples if t >= t_end), None)
-        return [nxt] if nxt is not None else []
+    def _aggregate_phase(
+        self,
+        ring: collections.deque,
+        windows: list[tuple[float, float]],
+    ) -> Optional[float]:
+        """Pool samples across all execution windows for one phase.
 
-    def _bracketing_diag(self, samples, t_end: float, label: str) -> None:
-        """Diagnostic dump when bracketing fails: deque size, first/last
-        sample timestamps, and how t_end compares. Writes one line to
-        $MONO_KERNEL_BL1_DIAG_PATH if set, else silently returns."""
-        path = os.environ.get("MONO_KERNEL_BL1_DIAG_PATH")
-        if not path:
-            return
-        try:
-            with self._nvml_lock:
-                n = len(samples)
-                first_t = samples[0][0] if n else None
-                last_t = samples[-1][0] if n else None
-            with open(path, "a", buffering=1, encoding="utf-8") as f:
-                f.write(json.dumps({
-                    "kind": label,
-                    "t_end": t_end,
-                    "deque_n": n,
-                    "first_t": first_t,
-                    "last_t": last_t,
-                    "t_end_minus_last_t": (t_end - last_t) if last_t is not None else None,
-                    "anchor_host_t": self._anchor_host_t,
-                    "nvml_offset_s": self._nvml_to_host_offset_s,
-                }) + "\n")
-        except Exception:
-            pass
+        For each (t_start, t_end) window:
+          - Collect samples whose timestamp t lies in [t_start, t_end].
+          - If empty: try post-end fallback — the first sample with t > t_end
+            (its averaging interval [t - dt, t] brackets the short execution).
+          - If still empty: this execution contributes nothing.
 
-    def _window_mean(self, t_start: float, t_end: float
-                     ) -> tuple[Optional[float], Optional[float]]:
-        """Estimate phase-window GPU utilization and memory %.
-
-        Rule (per spec):
-          - 0 samples in [t_start, t_end]: use the first sample emitted
-            at or after t_end (its averaging interval brackets the phase
-            when phase < driver dt).
-          - 1 sample in window: use that value.
-          - >=2 samples in window: arithmetic mean.
-          - No bracketing sample available either: None.
+        Phase value = arithmetic mean of the pooled samples, or None if empty.
         """
-        if t_end <= t_start:
-            return None, None
+        if not windows:
+            return None
+        pool: list[float] = []
         with self._nvml_lock:
-            gu_vals = [v for t, v in self._gu_samples if t_start <= t <= t_end]
-            gmu_vals = [v for t, v in self._gmu_samples if t_start <= t <= t_end]
-            if not gu_vals:
-                gu_vals = self._bracketing_value(self._gu_samples, t_end)
-            if not gmu_vals:
-                gmu_vals = self._bracketing_value(self._gmu_samples, t_end)
-        if not gu_vals:
-            self._bracketing_diag(self._gu_samples, t_end, "gu_miss")
-        if not gmu_vals:
-            self._bracketing_diag(self._gmu_samples, t_end, "gmu_miss")
-        gu = (sum(gu_vals) / len(gu_vals)) if gu_vals else None
-        gmu = (sum(gmu_vals) / len(gmu_vals)) if gmu_vals else None
-        return gu, gmu
+            # Snapshot to avoid holding lock through Python aggregation.
+            snapshot = list(ring)
+        if not snapshot:
+            return None
+        for t_start, t_end in windows:
+            in_window = [v for t, v in snapshot if t_start <= t <= t_end]
+            if not in_window:
+                post = next((v for t, v in snapshot if t > t_end), None)
+                if post is not None:
+                    in_window = [post]
+            if in_window:
+                pool.extend(in_window)
+        if not pool:
+            return None
+        return sum(pool) / len(pool)
 
 
 # Module-level singleton slot (set by Worker.init_device, cleared by shutdown).

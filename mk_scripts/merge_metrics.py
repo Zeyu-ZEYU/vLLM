@@ -186,34 +186,40 @@ def main() -> None:
                 "start_time": start_time,
                 "end_time": end_time,
                 "output": _safe_index(generated_texts, i),
+                # Per-phase durations: d_phase = sum of each execution
+                # forward's elapsed_time; d_phase_span = first execution
+                # start to last execution end. Both seconds.
                 "d_vision": _g("d_vision"),
                 "d_prefill": _g("d_prefill"),
                 "d_decode": _g("d_decode"),
+                "d_vision_span": _g("d_vision_span"),
+                "d_prefill_span": _g("d_prefill_span"),
+                "d_decode_span": _g("d_decode_span"),
+                "n_executions_vision": _g("n_executions_vision"),
+                "n_executions_prefill": _g("n_executions_prefill"),
+                "n_executions_decode": _g("n_executions_decode"),
                 "num_otokens": num_otokens,
                 "tpot": tpot,
                 "ttft": ttft,
                 "jct": e2el,
+                # gu/gmu/smu/ko/sm_occ are fractions in [0, 1] from the
+                # recorder; merger passes through unchanged. ko + smu = 1
+                # by construction.
                 "gu_vision": _g("gu_vision"),
                 "gu_prefill": _g("gu_prefill"),
                 "gu_decode": _g("gu_decode"),
                 "gmu_vision": _g("gmu_vision"),
                 "gmu_prefill": _g("gmu_prefill"),
                 "gmu_decode": _g("gmu_decode"),
-                # ko comes from the SM pass: ko = 100 - smu (per spec).
                 "ko_vision": _sm("ko_vision"),
                 "ko_prefill": _sm("ko_prefill"),
                 "ko_decode": _sm("ko_decode"),
-                # SM-level metrics: filled from SM-pass sidecar when
-                # provided (--server-sm); else null.
                 "nsm_vision": _sm("nsm_vision"),
                 "nsm_prefill": _sm("nsm_prefill"),
                 "nsm_decode": _sm("nsm_decode"),
                 "smu_vision": _sm("smu_vision"),
                 "smu_prefill": _sm("smu_prefill"),
                 "smu_decode": _sm("smu_decode"),
-                # Auxiliary: averaged SM occupancy (warps resident /
-                # peak), kept separate from smu so the strict
-                # "fraction-of-active-time" semantic is unambiguous.
                 "sm_occ_vision": _sm("sm_occ_vision"),
                 "sm_occ_prefill": _sm("sm_occ_prefill"),
                 "sm_occ_decode": _sm("sm_occ_decode"),
