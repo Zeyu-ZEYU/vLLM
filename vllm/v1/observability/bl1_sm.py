@@ -1,21 +1,23 @@
 """BL1 SM-level metrics recorder via DCGM (separate pass).
 
-Same phase-tracking architecture as ``bl1.py`` but the sampler reads
-``DCGM_FI_PROF_SM_ACTIVE`` and ``DCGM_FI_PROF_SM_OCCUPANCY`` from a
+Same per-execution-forward phase tracking as ``bl1.py`` but the sampler
+reads ``DCGM_FI_PROF_SM_ACTIVE`` and ``DCGM_FI_PROF_SM_OCCUPANCY`` from a
 running ``nv-hostengine``.
 
-Per-request, per-phase computation (relaxed Definition A — DCGM
-aggregates across SMs, see project README):
-  ``smu_phase = mean(SM_ACTIVE within phase) * 100``       (%)
-  ``nsm_phase = total_SM_count * mean(SM_ACTIVE within phase)``
-                                                         (equiv. SM count)
+Per-request, per-phase outputs (fractions in [0, 1] for smu / sm_occ;
+counts in [0, total_sm] for nsm; ko + smu == 1 by construction):
+  ``smu_phase``  = mean of per-execution-pooled SM_ACTIVE samples.
+  ``ko_phase``   = 1 - smu_phase.
+  ``nsm_phase``  = total_sm * smu_phase.
+  ``sm_occ_phase`` = mean of per-execution-pooled SM_OCCUPANCY samples.
 
 Phase boundaries map to host wall-clock via the same CUDA-event anchor
 mechanism as ``bl1.py``: bounds reflect device-actual GPU execution
 time, not host enqueue time.
 
-The bracketing-sample fallback is identical to ``bl1.py`` (single
-sample at first ``t >= t_end`` when window is empty).
+The bracketing fallback is per-execution (single sample at first
+``t > t_end`` when an execution's window is empty), and the phase value
+is the pooled mean across all of R's execution forwards in that phase.
 
 Env vars:
   ``MONO_KERNEL_BL1_SM_METRICS_PATH``   sidecar path; unset → no-op.
@@ -54,24 +56,27 @@ PHASE_PREFILL = "prefill"
 PHASE_DECODE = "decode"
 _PHASES = (PHASE_VISION, PHASE_PREFILL, PHASE_DECODE)
 
-# Sampler tick: how often to drain DCGM's buffer. The driver emits
-# profiling samples on its own cadence (typically ~100 ms internally);
-# faster ticks just guarantee we do not lose buffer entries.
-_SAMPLER_TICK_S = 0.05
-# Bound each in-memory deque (~10 minutes at the driver cadence).
+# Sampler tick: drain DCGM's buffer every 10 ms. Coupled with
+# updateFreq=10_000 µs (10 ms emit cadence) so we observe each new
+# sample within one tick of its emission.
+_SAMPLER_TICK_S = 0.01
+# DCGM updateFreq (µs). 10 ms; PerfWorks honors this down to 10 ms on H20.
+_DCGM_UPDATE_FREQ_US = 10_000
+# Bound each in-memory deque (~10 minutes at 100 Hz cadence).
 _BUFFER_MAX = 60000
 
 
 @dataclass
-class _PhaseBounds:
-    first_start_event: torch.cuda.Event
-    last_end_event: torch.cuda.Event
+class _ExecutionBounds:
+    """One execution forward's CUDA-event pair for a (req_id, phase)."""
+    start_event: torch.cuda.Event
+    end_event: torch.cuda.Event
 
 
 @dataclass
 class StepCtx:
     """Returned by step_begin / vision_begin; consumed by step_end /
-    vision_end. Mirrors the StepCtx in bl1.py."""
+    vision_end."""
     start_event: torch.cuda.Event
     req_phases: dict[str, str] = field(default_factory=dict)
 
@@ -83,8 +88,10 @@ class Bl1SmRecorder:
         self._device_index = device_index
         self._dcgm_host = dcgm_host
 
-        # Phase state — main-thread access only.
-        self._phase_state: dict[str, dict[str, _PhaseBounds]] = {}
+        # Per-request, per-phase list of execution-forward bounds.
+        self._phase_state: dict[
+            str, dict[str, list[_ExecutionBounds]]
+        ] = {}
 
         # Sample buffers. Producer = sampler thread, consumer =
         # finalize_request on the main thread.
@@ -152,7 +159,7 @@ class Bl1SmRecorder:
             )
             self._dcgm_group.samples.WatchFields(
                 self._dcgm_fg,
-                updateFreq=100_000,   # 100 ms; driver decides actual emit rate
+                updateFreq=_DCGM_UPDATE_FREQ_US,
                 maxKeepAge=600.0,
                 maxKeepSamples=0,
             )
@@ -294,7 +301,7 @@ class Bl1SmRecorder:
         end_event = torch.cuda.Event(enable_timing=True)
         end_event.record()
         for rid, phase in ctx.req_phases.items():
-            self._update_phase(rid, phase, ctx.start_event, end_event)
+            self._append_execution(rid, phase, ctx.start_event, end_event)
 
     def vision_begin(self, req_ids) -> StepCtx:
         self._ensure_anchor()
@@ -307,14 +314,11 @@ class Bl1SmRecorder:
     def vision_end(self, ctx: StepCtx) -> None:
         self.step_end(ctx)
 
-    def _update_phase(self, req_id, phase, start_event, end_event):
+    def _append_execution(self, req_id, phase, start_event, end_event):
         per_req = self._phase_state.setdefault(req_id, {})
-        bounds = per_req.get(phase)
-        if bounds is None:
-            per_req[phase] = _PhaseBounds(
-                first_start_event=start_event, last_end_event=end_event)
-        else:
-            bounds.last_end_event = end_event
+        per_req.setdefault(phase, []).append(
+            _ExecutionBounds(start_event=start_event, end_event=end_event)
+        )
 
     # ---- finalize ----
     def finalize_request(self, req_id: str) -> None:
@@ -322,70 +326,107 @@ class Bl1SmRecorder:
         if not phase_map:
             return
 
-        for bounds in phase_map.values():
+        # Synchronize the last end_event of each phase. CUDA stream order
+        # guarantees earlier events for this request are complete.
+        for executions in phase_map.values():
+            if not executions:
+                continue
             try:
-                bounds.last_end_event.synchronize()
+                executions[-1].end_event.synchronize()
             except Exception:
                 pass
 
         record: dict[str, object] = {"vllm_req_id": req_id}
         for phase in _PHASES:
-            bounds = phase_map.get(phase)
-            if bounds is None:
-                record[f"nsm_{phase}"] = None
+            executions = phase_map.get(phase) or []
+            n_exec = len(executions)
+            record[f"n_executions_{phase}"] = n_exec
+            if n_exec == 0:
+                record[f"d_{phase}"] = None
+                record[f"d_{phase}_span"] = None
                 record[f"smu_{phase}"] = None
                 record[f"sm_occ_{phase}"] = None
-                continue
-
-            t_start = self._device_host_time(bounds.first_start_event)
-            t_end = self._device_host_time(bounds.last_end_event)
-            sm_active = sm_occ = None
-            if t_start is not None and t_end is not None:
-                sm_active = self._window_value(
-                    self._sm_active_samples, t_start, t_end)
-                sm_occ = self._window_value(
-                    self._sm_occ_samples, t_start, t_end)
-
-            if sm_active is not None:
-                smu_pct = sm_active * 100.0
-                record[f"smu_{phase}"] = smu_pct
-                record[f"nsm_{phase}"] = (
-                    self._total_sm * sm_active if self._total_sm else None)
-                # ko = "fraction of phase time SMs are NOT running kernel
-                # warps" per spec. SM_ACTIVE measures "warp resident on
-                # SM"; its complement is the closest aggregate proxy for
-                # SM-level kernel-inactive time. Satisfies ko + smu = 100
-                # by construction.
-                record[f"ko_{phase}"] = 100.0 - smu_pct
-            else:
-                record[f"smu_{phase}"] = None
                 record[f"nsm_{phase}"] = None
                 record[f"ko_{phase}"] = None
-            record[f"sm_occ_{phase}"] = (
-                sm_occ * 100.0 if sm_occ is not None else None)
+                continue
+
+            # d_phase = sum of execution durations; d_phase_span = first
+            # start to last end.
+            d_sum_ms = 0.0
+            d_span_ms = None
+            try:
+                for ex in executions:
+                    d_sum_ms += ex.start_event.elapsed_time(ex.end_event)
+                d_span_ms = executions[0].start_event.elapsed_time(
+                    executions[-1].end_event)
+            except Exception:
+                d_sum_ms = None
+                d_span_ms = None
+            record[f"d_{phase}"] = (
+                d_sum_ms / 1000.0 if d_sum_ms is not None else None)
+            record[f"d_{phase}_span"] = (
+                d_span_ms / 1000.0 if d_span_ms is not None else None)
+
+            # Build per-execution host-time windows for sample pooling.
+            windows: list[tuple[float, float]] = []
+            for ex in executions:
+                ts = self._device_host_time(ex.start_event)
+                te = self._device_host_time(ex.end_event)
+                if ts is not None and te is not None and te >= ts:
+                    windows.append((ts, te))
+
+            smu = self._aggregate_phase(self._sm_active_samples, windows)
+            sm_occ = self._aggregate_phase(self._sm_occ_samples, windows)
+
+            record[f"smu_{phase}"] = smu  # fraction in [0, 1] or None
+            record[f"sm_occ_{phase}"] = sm_occ
+            if smu is not None:
+                record[f"nsm_{phase}"] = (
+                    self._total_sm * smu if self._total_sm else None)
+                # ko = 1 - smu; smu + ko == 1 by construction.
+                record[f"ko_{phase}"] = 1.0 - smu
+            else:
+                record[f"nsm_{phase}"] = None
+                record[f"ko_{phase}"] = None
 
         try:
             self._sidecar.write(json.dumps(record) + "\n")
         except Exception:
             pass
 
-    @staticmethod
-    def _bracketing_value(samples, t_end: float) -> list[float]:
-        """First sample emitted at or after t_end, or [] if none."""
-        nxt = next((v for t, v in samples if t >= t_end), None)
-        return [nxt] if nxt is not None else []
+    def _aggregate_phase(
+        self,
+        ring: collections.deque,
+        windows: list[tuple[float, float]],
+    ) -> Optional[float]:
+        """Pool samples across all execution windows for one phase.
 
-    def _window_value(self, samples, t_start: float, t_end: float
-                      ) -> Optional[float]:
-        if t_end <= t_start:
+        Per execution window:
+          - Collect samples whose timestamp lies in [t_start, t_end].
+          - If empty: post-end fallback — first sample with t > t_end.
+          - If still empty: this execution contributes nothing.
+
+        Phase value = arithmetic mean of pooled samples (fraction in
+        [0, 1]) or None if pool is empty.
+        """
+        if not windows:
             return None
         with self._lock:
-            in_window = [v for t, v in samples if t_start <= t <= t_end]
-            if not in_window:
-                in_window = self._bracketing_value(samples, t_end)
-        if not in_window:
+            snapshot = list(ring)
+        if not snapshot:
             return None
-        return sum(in_window) / len(in_window)
+        pool: list[float] = []
+        for t_start, t_end in windows:
+            in_window = [v for t, v in snapshot if t_start <= t <= t_end]
+            if not in_window:
+                post = next((v for t, v in snapshot if t > t_end), None)
+                if post is not None:
+                    in_window = [post]
+            if in_window:
+                pool.extend(in_window)
+        if not pool:
+            return None
+        return sum(pool) / len(pool)
 
 
 # Module-level singleton (mirror bl1.py pattern).

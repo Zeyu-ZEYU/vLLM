@@ -317,14 +317,25 @@ def main() -> None:
                     "start_time": start_time,
                     "end_time": end_time,
                     "output": _safe_index(generated_texts, i),
+                    # Per-phase durations: d_phase = sum of execution
+                    # forwards' elapsed_time; d_phase_span = first execution
+                    # start to last execution end. Both seconds.
                     "d_vision": _vis("d_vision"),
                     "d_prefill": _text("d_prefill"),
                     "d_decode": _text("d_decode"),
+                    "d_vision_span": _vis("d_vision_span"),
+                    "d_prefill_span": _text("d_prefill_span"),
+                    "d_decode_span": _text("d_decode_span"),
+                    "n_executions_vision": _vis("n_executions_vision"),
+                    "n_executions_prefill": _text("n_executions_prefill"),
+                    "n_executions_decode": _text("n_executions_decode"),
                     "d_vemb_transfer": d_vemb,
                     "num_otokens": num_otokens,
                     "tpot": tpot,
                     "ttft": ttft,
                     "jct": e2el,
+                    # gu/gmu/smu/ko/sm_occ are fractions in [0, 1] from the
+                    # recorder; merger passes through unchanged.
                     "gu_vision": _vis("gu_vision"),
                     "gu_prefill": _text("gu_prefill"),
                     "gu_decode": _text("gu_decode"),
@@ -365,6 +376,12 @@ def main() -> None:
                     "d_vision": _g("d_vision"),
                     "d_prefill": _g("d_prefill"),
                     "d_decode": _g("d_decode"),
+                    "d_vision_span": _g("d_vision_span"),
+                    "d_prefill_span": _g("d_prefill_span"),
+                    "d_decode_span": _g("d_decode_span"),
+                    "n_executions_vision": _g("n_executions_vision"),
+                    "n_executions_prefill": _g("n_executions_prefill"),
+                    "n_executions_decode": _g("n_executions_decode"),
                     "num_otokens": num_otokens,
                     "tpot": tpot,
                     "ttft": ttft,
