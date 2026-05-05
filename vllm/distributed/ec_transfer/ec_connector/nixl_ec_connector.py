@@ -386,7 +386,7 @@ class _NixlEndpoint:
             time.sleep(_POLL_INTERVAL_S)
 
     def wait_for_notif(
-        self, mm_hash: str, prefix: str, timeout_s: float = 30.0
+        self, mm_hash: str, prefix: str, timeout_s: float = 600.0
     ) -> str:
         """Block until a notif starting with ``prefix`` arrives for mm_hash.
         Returns the full message string."""
@@ -427,14 +427,17 @@ class _NixlEndpoint:
                 f"ec_connector_extra_config"
             )
 
-        # Wait for a free slot.
+        # Wait for a free slot. Producer blocks here when consumer is
+        # behind (slots can't free until consumer pulls + ACKs). For
+        # multi-image requests under contention, raise n_slots in
+        # ec_connector_extra_config to avoid sustained back-pressure.
         with self._slots_cv:
             while not self._free_slots:
-                self._slots_cv.wait(timeout=30.0)
+                self._slots_cv.wait(timeout=600.0)
                 if not self._free_slots:
                     raise RuntimeError(
                         f"BL2 NIXL: no free scratch slot for {mm_hash} "
-                        f"after 30s (n_slots={self._n_slots})"
+                        f"after 600s (n_slots={self._n_slots})"
                     )
             slot = self._free_slots.popleft()
             self._inflight_slots[mm_hash] = slot

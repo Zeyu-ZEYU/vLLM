@@ -138,7 +138,11 @@ echo "[run_bl2] PEER_ENDPOINT=$PEER_ENDPOINT"
 # (e.g., milebench 1920x1280 native-res images) one encoder output can be
 # ~66 MiB. Sized to 128 MiB by default; override via SLOT_BYTES env.
 SLOT_BYTES=${SLOT_BYTES:-134217728}
-N_SLOTS=${N_SLOTS:-16}
+# n_slots default 64 for multi-image throughput. Each slot holds one
+# encoder output (~66 MiB for 1920x1280 native-res image). 64 slots ×
+# 128 MiB = 8 GiB scratch — fits H20 96 GiB easily and supports several
+# concurrent multi-image requests in flight before producer back-pressure.
+N_SLOTS=${N_SLOTS:-64}
 ec_extra_n0='"peer_endpoint":"'${PEER_ENDPOINT}'","slot_bytes":'${SLOT_BYTES}',"n_slots":'${N_SLOTS}
 [[ -n "${BOND_DEV_N0:-}" ]] && ec_extra_n0+=',"nixl_dev":"'${BOND_DEV_N0}'"'
 EC_CFG_PRODUCER='{"ec_connector":"NixlECConnector","ec_role":"ec_producer","ec_connector_extra_config":{'${ec_extra_n0}'}}'
