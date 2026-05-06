@@ -302,6 +302,9 @@ $vemb_export
 exec vllm serve "$MODEL" \\
     --port $TEXT_PORT \\
     --tensor-parallel-size 1 \\
+    --enforce-eager \\
+    --no-enable-prefix-caching \\
+    --mm-processor-cache-gb 0 \\
     --max-num-seqs $MAX_NUM_SEQS \\
     --enable-request-id-headers \\
     --allowed-local-media-path "$INPUTS_DIR/assets" \\
@@ -328,8 +331,8 @@ EOF
             --tensor-parallel-size 1 \
             --enforce-eager \
             --no-enable-prefix-caching \
+            --mm-processor-cache-gb 0 \
             --enable-request-id-headers \
-            --max-num-batched-tokens 114688 \
             --max-num-seqs "$MAX_NUM_SEQS" \
             --allowed-local-media-path "$INPUTS_DIR/assets" \
             --mm-encoder-only \
