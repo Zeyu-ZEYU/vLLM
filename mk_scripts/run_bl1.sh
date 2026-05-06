@@ -122,6 +122,10 @@ run_pass() {
             --tensor-parallel-size 1 \
             --port "$PORT" \
             --max-num-seqs "$MAX_NUM_SEQS" \
+            --enforce-eager \
+            --no-enable-prefix-caching \
+            --mm-processor-cache-gb 0 \
+            --enable-request-id-headers \
             --allowed-local-media-path "$INPUTS_DIR/assets" \
             > "$server_log" 2>&1 &
     local SERVER_PID=$!
