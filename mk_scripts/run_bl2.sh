@@ -266,10 +266,9 @@ run_pass() {
     cat > "$remote_launcher_local" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-if command -v mamba >/dev/null 2>&1; then
-    eval "\$(mamba shell hook --shell bash 2>/dev/null || true)" || true
-    mamba activate mono_kernel || true
-fi
+# Activate the per-worktree uv venv on node 1.
+[ -f \$HOME/.local/bin/env ] && source \$HOME/.local/bin/env
+[ -f $WORKTREE/.venv/bin/activate ] && source $WORKTREE/.venv/bin/activate
 mkdir -p "$NODE1_OUTPUTS_DIR" "$NODE1_LOGS_DIR"
 cd "$WORKTREE"
 export CUDA_VISIBLE_DEVICES=0
