@@ -114,12 +114,18 @@ echo "[run_bl2] PEER_ENDPOINT=$PEER_ENDPOINT"
 # slot_bytes default in connector is 24 MiB; for large multi-image inputs
 # (e.g., milebench 1920x1280 native-res images) one encoder output can be
 # ~66 MiB. Sized to 128 MiB by default; override via SLOT_BYTES env.
-SLOT_BYTES=${SLOT_BYTES:-134217728}
-# n_slots default 64 for multi-image throughput. Each slot holds one
-# encoder output (~66 MiB for 1920x1280 native-res image). 64 slots ×
-# 128 MiB = 8 GiB scratch — fits H20 96 GiB easily and supports several
-# concurrent multi-image requests in flight before producer back-pressure.
-N_SLOTS=${N_SLOTS:-64}
+SLOT_BYTES=${SLOT_BYTES:-83886080}    # 80 MiB. Empirically observed max
+                                       # encoded tensor was ~64 MiB, so 80 MiB
+                                       # gives ~25% safety margin.
+# n_slots default 192 for 1000-prompt rps=0.2 burst absorption. 192 ×
+# 80 MiB = 15 GiB scratch. Vision side has ~80 GiB free (encoder-only,
+# no KV cache); text side requires --gpu-memory-utilization 0.80
+# (instead of default 0.9) to make room for the scratch buffer.
+N_SLOTS=${N_SLOTS:-192}
+# Both instances will get --gpu-memory-utilization $GPU_MEM_UTIL. 0.80
+# leaves ~19 GiB on H20 96 GiB for our scratch buffer (15 GiB) +
+# driver overhead (~2-3 GiB). Override per-experiment via env if needed.
+GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.80}
 ec_extra_n0='"peer_endpoint":"'${PEER_ENDPOINT}'","slot_bytes":'${SLOT_BYTES}',"n_slots":'${N_SLOTS}
 [[ -n "${BOND_DEV_N0:-}" ]] && ec_extra_n0+=',"nixl_dev":"'${BOND_DEV_N0}'"'
 EC_CFG_PRODUCER='{"ec_connector":"NixlECConnector","ec_role":"ec_producer","ec_connector_extra_config":{'${ec_extra_n0}'}}'
@@ -280,6 +286,7 @@ exec vllm serve "$MODEL" \\
     --tensor-parallel-size 1 \\
     --enforce-eager \\
     --no-enable-prefix-caching \\
+    --gpu-memory-utilization $GPU_MEM_UTIL \\
     --max-num-seqs $MAX_NUM_SEQS \\
     --enable-request-id-headers \\
     --allowed-local-media-path "$INPUTS_DIR/assets" \\
@@ -306,6 +313,7 @@ EOF
             --tensor-parallel-size 1 \
             --enforce-eager \
             --no-enable-prefix-caching \
+            --gpu-memory-utilization "$GPU_MEM_UTIL" \
             --enable-request-id-headers \
             --max-num-seqs "$MAX_NUM_SEQS" \
             --allowed-local-media-path "$INPUTS_DIR/assets" \
