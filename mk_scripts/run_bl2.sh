@@ -86,44 +86,21 @@ DRY_RUN=${DRY_RUN:-0}
 mkdir -p "$OUTPUTS_DIR" "$LOGS_DIR"
 
 # ---- bond RNIC discovery ---------------------------------------------------
-detect_bond_from() {
-    # Stdin = `nvidia-smi topo -m` output. Print the mlx5_* with closest PCIe
-    # affinity to GPU0 (PIX > PXB > PHB > NODE > SYS).
-    python3 - <<'PY'
-import sys, re
-txt = sys.stdin.read()
-lines = [l for l in txt.splitlines() if l.strip()]
-if not lines:
-    sys.exit(0)
-hdr = re.split(r"\s{2,}", lines[0].strip())
-for l in lines[1:]:
-    cells = l.split()
-    if not cells or cells[0] != "GPU0":
-        continue
-    row = re.split(r"\s{2,}", l.strip())
-    rank = {"PIX":0,"PXB":1,"PHB":2,"NODE":3,"SYS":4}
-    best = None
-    for c, v in zip(hdr, row[1:]):
-        if not c.startswith("mlx"):
-            continue
-        r = rank.get(v.strip(), 99)
-        if best is None or r < best[1]:
-            best = (c, r)
-    if best:
-        print(best[0])
-    break
-PY
-}
+# Auto-detect mlx5_bond_* closest to GPU 0 via PCIe topology.
+# (The legacy nvidia-smi-topo parser failed because the topo header lists
+# devices as NIC0/NIC1/.../NICN — not their mlx5_* names — and additionally
+# would happily pick mlx5_0, the 机头 management RNIC. The new path uses
+# /sys/class/infiniband/ directly and filters to mlx5_bond_* only.)
+DETECT_BOND_SCRIPT="$WORKTREE/mk_scripts/detect_closest_bond.py"
 
 if [[ -z "${BOND_DEV_N0:-}" ]]; then
-    BOND_DEV_N0=$(nvidia-smi topo -m 2>/dev/null | detect_bond_from || true)
+    BOND_DEV_N0=$(python3 "$DETECT_BOND_SCRIPT" 2>/dev/null || true)
     echo "[run_bl2] auto-detected BOND_DEV_N0=${BOND_DEV_N0:-<unset>}"
 fi
 if [[ -z "${BOND_DEV_N1:-}" ]]; then
-    if topo_n1=$(ssh -o BatchMode=yes "$NODE1_HOST" \
-            "docker exec -u $NODE1_USER_UID mono_kernel nvidia-smi topo -m" 2>/dev/null); then
-        BOND_DEV_N1=$(echo "$topo_n1" | detect_bond_from || true)
-    fi
+    BOND_DEV_N1=$(ssh -o BatchMode=yes "$NODE1_HOST" \
+        "docker exec -u $NODE1_USER_UID mono_kernel python3 ~/vLLM/mono_kernel_disaggregation/mk_scripts/detect_closest_bond.py" \
+        2>/dev/null || true)
     echo "[run_bl2] auto-detected BOND_DEV_N1=${BOND_DEV_N1:-<unset>}"
 fi
 
