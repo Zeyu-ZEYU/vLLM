@@ -114,18 +114,18 @@ echo "[run_bl2] PEER_ENDPOINT=$PEER_ENDPOINT"
 # slot_bytes default in connector is 24 MiB; for large multi-image inputs
 # (e.g., milebench 1920x1280 native-res images) one encoder output can be
 # ~66 MiB. Sized to 128 MiB by default; override via SLOT_BYTES env.
-SLOT_BYTES=${SLOT_BYTES:-83886080}    # 80 MiB. Empirically observed max
-                                       # encoded tensor was ~64 MiB, so 80 MiB
-                                       # gives ~25% safety margin.
-# n_slots default 192 for 1000-prompt rps=0.2 burst absorption. 192 ×
-# 80 MiB = 15 GiB scratch. Vision side has ~80 GiB free (encoder-only,
-# no KV cache); text side requires --gpu-memory-utilization 0.80
-# (instead of default 0.9) to make room for the scratch buffer.
+SLOT_BYTES=${SLOT_BYTES:-134217728}    # 128 MiB. Empirically observed max
+                                        # encoded tensor for milebench was
+                                        # 117.5 MiB; 80 MiB had run-time
+                                        # outliers. 128 MiB gives 9% margin.
+# n_slots default 192 for 1000-prompt rps=0.2 burst absorption.
+# 192 × 128 MiB = 24 GiB scratch on each side. Vision side fits easily
+# (encoder-only, ~10 GiB live). Text side needs --gpu-memory-utilization
+# 0.70 to make 28.8 GiB non-vLLM space (24 GiB scratch + 3-4 GiB driver).
 N_SLOTS=${N_SLOTS:-192}
-# Both instances will get --gpu-memory-utilization $GPU_MEM_UTIL. 0.80
-# leaves ~19 GiB on H20 96 GiB for our scratch buffer (15 GiB) +
-# driver overhead (~2-3 GiB). Override per-experiment via env if needed.
-GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.80}
+# Both instances get --gpu-memory-utilization $GPU_MEM_UTIL. 0.70
+# leaves ~28.8 GiB on H20 96 GiB for our scratch buffer + driver.
+GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.70}
 ec_extra_n0='"peer_endpoint":"'${PEER_ENDPOINT}'","slot_bytes":'${SLOT_BYTES}',"n_slots":'${N_SLOTS}
 [[ -n "${BOND_DEV_N0:-}" ]] && ec_extra_n0+=',"nixl_dev":"'${BOND_DEV_N0}'"'
 EC_CFG_PRODUCER='{"ec_connector":"NixlECConnector","ec_role":"ec_producer","ec_connector_extra_config":{'${ec_extra_n0}'}}'
