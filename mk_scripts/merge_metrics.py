@@ -13,7 +13,8 @@ Two modes, picked by which flags are present:
 Output format (per ~/zeyu/mono_kernel/tasks/Motivation实验.md):
 - Line 1: a header object with `rps`, `duration_s`, `num_completed`, etc.
 - Lines 2..N+1: one object per input row (in input file order) with all
-  per-request metrics defined in the spec. BL2 adds `d_vemb_transfer`.
+  per-request metrics defined in the spec. BL2 adds three vemb metrics:
+  d_vemb_total, d_vemb_wait, d_vemb_pull (see _build_vemb_index docstring).
 
 Per-request metric origin in BL2:
 - d_vision, gu_vision, gmu_vision     ← vision-instance NVML sidecar
@@ -108,17 +109,37 @@ def _safe_sum(itl):
 def _build_vemb_index(
     producer_records: list[dict[str, Any]],
     consumer_records: list[dict[str, Any]],
-) -> dict[str, float]:
-    """Pair producer/consumer events by mm_hash → d_vemb_transfer (seconds).
+) -> tuple[
+    dict[str, float], dict[str, float], dict[str, float]
+]:
+    """Pair producer/consumer events by mm_hash → three per-mm_hash metrics.
 
-    For each mm_hash with at least one producer event AND one consumer event,
-    take min(producer t_event) and max(consumer t_event) and return the
-    difference. Negative deltas (clock skew or out-of-order events) are
-    clamped to 0.0 with a warning in the comment field; effectively-bad
-    measurements remain in the file for debugging.
+    Returns a tuple of three dicts, all keyed by mm_hash:
+
+      total_by_hash[mh] = max(0, consumer.t_event - producer.t_event)
+        cross-node, NTP-bound. Reflects user-perceived end-to-end latency
+        for this image (from PUSH-sent to cache-populated).
+
+      wait_by_hash[mh]  = consumer.d_wait
+        single-clock perf_counter on consumer; time blocked in wait_for_notif
+        for this mm_hash's PUSH to arrive.
+
+      pull_by_hash[mh]  = consumer.d_pull
+        single-clock perf_counter on consumer; time spent in consumer_pull
+        (NIXL READ + scratch copy-out).
+
+    For mm_hashes that appear in multiple events (rare; same hash consumed
+    by multiple requests on this consumer instance), we use:
+      - producer.t_event:   min  (earliest send finish)
+      - consumer.t_event:   max  (latest receive finish)
+      - consumer.d_wait:    max  (worst-case wait among events)
+      - consumer.d_pull:    max  (worst-case pull among events)
+    so total_by_hash captures the worst-case bound.
     """
     p_min: dict[str, float] = {}
     c_max: dict[str, float] = {}
+    wait_max: dict[str, float] = {}
+    pull_max: dict[str, float] = {}
     for r in producer_records:
         mh = str(r.get("mm_hash", ""))
         if not mh:
@@ -133,12 +154,22 @@ def _build_vemb_index(
         t = float(r.get("t_event", 0.0))
         if mh not in c_max or t > c_max[mh]:
             c_max[mh] = t
+        d_wait = r.get("d_wait")
+        if d_wait is not None:
+            d_wait = float(d_wait)
+            if mh not in wait_max or d_wait > wait_max[mh]:
+                wait_max[mh] = d_wait
+        d_pull = r.get("d_pull")
+        if d_pull is not None:
+            d_pull = float(d_pull)
+            if mh not in pull_max or d_pull > pull_max[mh]:
+                pull_max[mh] = d_pull
 
-    out: dict[str, float] = {}
+    total_by_hash: dict[str, float] = {}
     for mh, t_recv in c_max.items():
         if mh in p_min:
-            out[mh] = max(0.0, t_recv - p_min[mh])
-    return out
+            total_by_hash[mh] = max(0.0, t_recv - p_min[mh])
+    return total_by_hash, wait_max, pull_max
 
 
 def main() -> None:
@@ -193,8 +224,10 @@ def main() -> None:
         text_sm_by_id = _index_by_external_id(_load_jsonl(a.server_text_sm))
         # vemb sidecars are keyed by mm_hash → time.
         text_vemb_records = _load_jsonl(a.server_text_vemb)
-        d_vemb_by_hash = _build_vemb_index(
-            _load_jsonl(a.server_vis_vemb), text_vemb_records,
+        vemb_total_by_hash, vemb_wait_by_hash, vemb_pull_by_hash = (
+            _build_vemb_index(
+                _load_jsonl(a.server_vis_vemb), text_vemb_records,
+            )
         )
         # Build a req_id → list[mm_hash] map from the text-side consumer
         # vemb events (these include the request that triggered the load,
@@ -235,7 +268,7 @@ def main() -> None:
         "model": model_id,
     }
     if is_bl2:
-        header["bl2_n_pairs"] = len(d_vemb_by_hash)
+        header["bl2_n_pairs"] = len(vemb_total_by_hash)
 
     # Bench-serve only ran the first N input rows (--num-prompts N). The
     # parallel client arrays have length N; the remaining input rows have
@@ -289,11 +322,6 @@ def main() -> None:
                 def _text_sm(name):
                     return text_sm_rec.get(name) if text_sm_rec else None
 
-                # Compute d_vemb_transfer per request: take the slowest
-                # mm_hash this request consumed (multiple images per req
-                # would all need to land before the LLM forward starts, so
-                # the bottleneck is max).
-                #
                 # Source of truth for "which mm_hashes this request used"
                 # is the text-side vemb sidecar (consumer events), which
                 # records req_id alongside mm_hash. The vision NVML
@@ -304,12 +332,37 @@ def main() -> None:
                 if not mm_hashes:
                     mm_hashes = (vis_rec or {}).get("mm_hashes") or \
                                 (text_rec or {}).get("mm_hashes") or []
-                d_vemb = None
+                # Per-request vemb metrics:
+                # - d_vemb_total: max over mm_hashes of cross-node end-to-end
+                #   (PUSH-sent on producer to cache-populated on consumer).
+                #   The slowest image bounds when prefill can start.
+                # - d_vemb_wait: sum over mm_hashes of consumer.d_wait. The
+                #   consumer iterates mm_hashes serially in start_load_caches,
+                #   so summing gives total wall-clock blocked on PUSH-arrival.
+                # - d_vemb_pull: sum over mm_hashes of consumer.d_pull. Same
+                #   serial reasoning, gives total wall-clock for NIXL READs.
+                d_vemb_total = None
+                d_vemb_wait_sum = 0.0
+                d_vemb_pull_sum = 0.0
+                wait_count = 0
+                pull_count = 0
                 for mh in mm_hashes:
-                    v = d_vemb_by_hash.get(str(mh))
-                    if v is None:
-                        continue
-                    d_vemb = v if d_vemb is None else max(d_vemb, v)
+                    mh_s = str(mh)
+                    t = vemb_total_by_hash.get(mh_s)
+                    if t is not None:
+                        d_vemb_total = (
+                            t if d_vemb_total is None else max(d_vemb_total, t)
+                        )
+                    w = vemb_wait_by_hash.get(mh_s)
+                    if w is not None:
+                        d_vemb_wait_sum += w
+                        wait_count += 1
+                    p = vemb_pull_by_hash.get(mh_s)
+                    if p is not None:
+                        d_vemb_pull_sum += p
+                        pull_count += 1
+                d_vemb_wait = d_vemb_wait_sum if wait_count > 0 else None
+                d_vemb_pull = d_vemb_pull_sum if pull_count > 0 else None
 
                 out_row = {
                     "id": row.get("id", i),
@@ -329,7 +382,9 @@ def main() -> None:
                     "n_executions_vision": _vis("n_executions_vision"),
                     "n_executions_prefill": _text("n_executions_prefill"),
                     "n_executions_decode": _text("n_executions_decode"),
-                    "d_vemb_transfer": d_vemb,
+                    "d_vemb_total": d_vemb_total,
+                    "d_vemb_wait": d_vemb_wait,
+                    "d_vemb_pull": d_vemb_pull,
                     "num_otokens": num_otokens,
                     "tpot": tpot,
                     "ttft": ttft,

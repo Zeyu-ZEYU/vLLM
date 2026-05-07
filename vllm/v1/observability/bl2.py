@@ -6,14 +6,38 @@ embedding (keyed by mm_hash) crosses the wire, both producer and consumer
 emit one event into a sidecar JSONL.
 
 Sidecar schema (one JSON object per line):
-    {"mm_hash": "<hex>", "req_ids": ["<vllm_req_id>", ...],
-     "role": "producer" | "consumer",
-     "t_event": <float-host-time>, "n_bytes": <int>}
 
-Cross-node merge (in mk_scripts/merge_metrics.py) reconciles producer's
-t_event with consumer's t_event for the same mm_hash to compute
-d_vemb_transfer = t_event_consumer - t_event_producer. Cross-node clocks are
-assumed to be NTP-synced; sub-ms drift is acceptable for ms-scale transfers.
+  Producer:
+    {"mm_hash": "<hex>", "req_ids": [...], "role": "producer",
+     "t_event": <float host-time>, "n_bytes": <int>}
+
+  Consumer:
+    {"mm_hash": "<hex>", "req_ids": [...], "role": "consumer",
+     "t_event": <float host-time>,
+     "d_wait":  <float seconds>,    # single-clock perf_counter
+     "d_pull":  <float seconds>,    # single-clock perf_counter
+     "n_bytes": <int>}
+
+Cross-node merge (mk_scripts/merge_metrics.py) computes three per-request
+metrics from these events:
+  - d_vemb_total: max over mm_hashes of (consumer.t_event - producer.t_event).
+    Cross-node, depends on NTP sync. Reflects user-perceived end-to-end
+    latency for the slowest image.
+  - d_vemb_wait:  sum over mm_hashes of consumer.d_wait. Single-clock; the
+    consumer side processes mm_hashes serially in start_load_caches, so
+    summing gives the total wall-clock the request was blocked on PUSH-arrival
+    waits.
+  - d_vemb_pull:  sum over mm_hashes of consumer.d_pull. Single-clock; same
+    serial reasoning, gives total wall-clock spent in NIXL READ + scratch
+    copy-out for this request.
+
+The d_wait / d_pull split exists because the cross-node `time.time()` diff
+that defines d_vemb_total is bounded below by NTP precision (~ms on a LAN,
+worse during clock corrections) and so cannot reliably resolve the pure
+data-plane RDMA transfer time (~ms for a typical 66 MiB encoded tensor).
+The two single-clock perf_counter metrics decompose the consumer-visible
+latency into "waiting for producer's PUSH notif" and "executing NIXL READ
++ buffer copy-out" without any cross-node drift.
 
 Activation: env var MONO_KERNEL_BL2_VEMB_PATH must be set to a writable path.
 When unset, the singleton stays None and every public method is a no-op.
@@ -54,17 +78,10 @@ class Bl2VembRecorder:
         self, mm_hash: str, req_ids, n_bytes: int
     ) -> None:
         """Producer side: NIXL push for this mm_hash has finished (DMA fence
-        reached). Captures host wall-clock at the moment of return."""
-        self._emit(mm_hash, req_ids, n_bytes)
-
-    def record_recv_done(
-        self, mm_hash: str, req_ids, n_bytes: int
-    ) -> None:
-        """Consumer side: NIXL pull for this mm_hash has finished and the
-        encoder cache slot has been populated locally."""
-        self._emit(mm_hash, req_ids, n_bytes)
-
-    def _emit(self, mm_hash: str, req_ids, n_bytes: int) -> None:
+        reached + PUSH notif emitted). Captures host wall-clock at the moment
+        of return — used by the merger as the cross-node anchor for
+        d_vemb_total.
+        """
         rec = {
             "mm_hash": str(mm_hash),
             "req_ids": list(req_ids) if req_ids else [],
@@ -72,6 +89,33 @@ class Bl2VembRecorder:
             "t_event": time.time(),
             "n_bytes": int(n_bytes),
         }
+        self._write(rec)
+
+    def record_recv_done(
+        self, mm_hash: str, req_ids, n_bytes: int,
+        d_wait: float, d_pull: float,
+    ) -> None:
+        """Consumer side: NIXL pull for this mm_hash has finished and the
+        encoder cache slot has been populated locally. Records:
+
+        - t_event (host wall-clock): cross-node anchor for d_vemb_total.
+        - d_wait (seconds, perf_counter): time blocked in `wait_for_notif`
+          for this mm_hash's PUSH to arrive (single-clock, no NTP).
+        - d_pull (seconds, perf_counter): time spent inside `consumer_pull`
+          (NIXL READ + scratch -> tensor copy) for this mm_hash (single-clock).
+        """
+        rec = {
+            "mm_hash": str(mm_hash),
+            "req_ids": list(req_ids) if req_ids else [],
+            "role": self._role,
+            "t_event": time.time(),
+            "d_wait": float(d_wait),
+            "d_pull": float(d_pull),
+            "n_bytes": int(n_bytes),
+        }
+        self._write(rec)
+
+    def _write(self, rec: dict) -> None:
         try:
             line = json.dumps(rec, ensure_ascii=False) + "\n"
             with self._write_lock:

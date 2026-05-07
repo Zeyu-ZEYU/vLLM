@@ -675,14 +675,29 @@ class NixlECConnector(ECConnectorBase):
         for mm in meta.mm_datas:
             if mm.mm_hash in encoder_cache:
                 continue
+            # Single-clock instrumentation around the two phases the consumer
+            # executes serially: wait_for_notif (block until PUSH arrives) and
+            # consumer_pull (NIXL READ + scratch copy-out). perf_counter is
+            # monotonic and high-resolution; using it on the consumer side
+            # alone avoids NTP-dependent cross-node clock subtraction.
+            t0 = time.perf_counter()
             try:
                 push = self._endpoint.wait_for_notif(mm.mm_hash, "PUSH")
+            except Exception:
+                logger.exception(
+                    "BL2 NIXL wait_for_notif failed for mm_hash=%s",
+                    mm.mm_hash,
+                )
+                continue
+            t1 = time.perf_counter()
+            try:
                 tensor = self._endpoint.consumer_pull(mm.mm_hash, push)
             except Exception:
                 logger.exception(
                     "BL2 NIXL consumer_pull failed for mm_hash=%s", mm.mm_hash
                 )
                 continue
+            t2 = time.perf_counter()
             encoder_cache[mm.mm_hash] = tensor
             self._known_hashes.add(mm.mm_hash)
             if self._bl2 is not None:
@@ -690,6 +705,8 @@ class NixlECConnector(ECConnectorBase):
                     mm.mm_hash,
                     meta.req_ids_by_hash.get(mm.mm_hash, []),
                     int(tensor.numel() * tensor.element_size()),
+                    d_wait=t1 - t0,
+                    d_pull=t2 - t1,
                 )
 
     def save_caches(
