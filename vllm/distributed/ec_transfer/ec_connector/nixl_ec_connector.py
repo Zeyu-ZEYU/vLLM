@@ -176,6 +176,12 @@ class _NixlEndpoint:
         self._free_slots: deque[int] = deque(range(self._n_slots))
         self._slots_cv = threading.Condition()
         self._inflight_slots: dict[str, int] = {}
+        # Producer-only: per-mm_hash PUSH msg, kept until ACK so the periodic
+        # resender thread can retransmit if NIXL/UCX dropped the original.
+        # Empirically, after ~5–10 k advertises the AM control-plane drops
+        # individual notifs; without resend, the consumer's wait_for_notif
+        # times out and the engine asserts on cache miss.
+        self._inflight_msgs: dict[str, str] = {}
         # Consumer-side serialization: only one transfer at a time uses the
         # local scratch slot 0 (consumers only need one because READs are
         # serialized within a single start_load_caches call).
@@ -213,6 +219,15 @@ class _NixlEndpoint:
             target=self._drain_notifs, name="bl2-nixl-notif", daemon=True
         )
         self._notif_thread.start()
+
+        # Producer-only: periodic resender for unACK'd PUSH msgs.
+        if self._is_producer:
+            self._resender_thread = threading.Thread(
+                target=self._resend_pushes,
+                name="bl2-nixl-resend",
+                daemon=True,
+            )
+            self._resender_thread.start()
 
     @property
     def remote_agent(self) -> str:
@@ -454,10 +469,13 @@ class _NixlEndpoint:
                 f"PUSH|{mm_hash}|{offset}|{n_bytes}|{shape}|{dtype}"
             )
             self._wrapper.send_notif(self.remote_agent, notif_msg=msg)
+            with self._slots_cv:
+                self._inflight_msgs[mm_hash] = msg
         except Exception:
             # Slot wasn't successfully published; reclaim it.
             with self._slots_cv:
                 self._inflight_slots.pop(mm_hash, None)
+                self._inflight_msgs.pop(mm_hash, None)
                 self._free_slots.append(slot)
                 self._slots_cv.notify()
             raise
@@ -471,10 +489,38 @@ class _NixlEndpoint:
         """
         with self._slots_cv:
             slot = self._inflight_slots.pop(mm_hash, None)
+            self._inflight_msgs.pop(mm_hash, None)
             if slot is None:
                 return
             self._free_slots.append(slot)
             self._slots_cv.notify()
+
+    def _resend_pushes(self) -> None:
+        """Producer-only: every 30s, re-send PUSH for any unACK'd hash.
+
+        NIXL's notif AM control-plane drops individual messages under
+        sustained load (empirically after ~5–10 k advertises). The original
+        PUSH may have arrived, in which case the consumer's wait_for_notif
+        already drained it; the duplicate just lingers in the consumer's
+        _notif_q (acceptable for one experiment run). If the original was
+        dropped, the next periodic resend lands within 30 s — well inside
+        the consumer's 600 s wait.
+        """
+        while not self._stop.is_set():
+            self._stop.wait(30.0)
+            if self._stop.is_set():
+                return
+            if self._remote_agent is None:
+                continue
+            with self._slots_cv:
+                pairs = list(self._inflight_msgs.items())
+            for _hash, msg in pairs:
+                try:
+                    self._wrapper.send_notif(
+                        self._remote_agent, notif_msg=msg
+                    )
+                except Exception:
+                    pass
 
     def consumer_pull(
         self,
