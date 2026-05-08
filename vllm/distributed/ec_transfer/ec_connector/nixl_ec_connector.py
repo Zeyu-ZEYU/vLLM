@@ -381,6 +381,7 @@ class _NixlEndpoint:
                 continue
             if pending:
                 ack_hashes: list[str] = []
+                req_push_hashes: list[str] = []
                 with self._notif_lock:
                     for _agent, msgs in pending.items():
                         for raw in msgs:
@@ -388,24 +389,64 @@ class _NixlEndpoint:
                                 msg = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
                             except Exception:
                                 continue
-                            # Key by mm_hash: ACK|<hash> or PUSH|<hash>|...
+                            # Key by mm_hash: ACK|<hash>, PUSH|<hash>|..., or
+                            # REQ_PUSH|<hash> (consumer-initiated retry).
                             parts = msg.split("|")
                             if len(parts) >= 2:
                                 self._notif_q[parts[1]].append(msg)
                                 if parts[0] == "ACK" and self._is_producer:
                                     ack_hashes.append(parts[1])
+                                elif (
+                                    parts[0] == "REQ_PUSH"
+                                    and self._is_producer
+                                ):
+                                    req_push_hashes.append(parts[1])
                 # Release outside the notif lock to avoid lock-order issues
                 # with _slots_cv.
                 for mh in ack_hashes:
                     self._release_slot(mh)
+                # Consumer-initiated targeted retry: re-send PUSH from the
+                # cached msg if we still have it (slot not yet ACK'd).
+                if req_push_hashes and self._remote_agent is not None:
+                    with self._slots_cv:
+                        snap = {
+                            h: self._inflight_msgs.get(h)
+                            for h in req_push_hashes
+                        }
+                    for h, msg in snap.items():
+                        if msg is None:
+                            continue
+                        try:
+                            self._wrapper.send_notif(
+                                self._remote_agent, notif_msg=msg
+                            )
+                            logger.info(
+                                "BL2 NIXL producer re-sent PUSH on REQ_PUSH "
+                                "for mm_hash=%s", h,
+                            )
+                        except Exception:
+                            pass
             time.sleep(_POLL_INTERVAL_S)
 
     def wait_for_notif(
         self, mm_hash: str, prefix: str, timeout_s: float = 600.0
     ) -> str:
         """Block until a notif starting with ``prefix`` arrives for mm_hash.
-        Returns the full message string."""
+        Returns the full message string.
+
+        Consumer-side: if waiting for a PUSH from a producer for >req_interval
+        seconds, send a REQ_PUSH|<hash> notif to ask the producer to
+        re-advertise. Defends against NIXL/UCX AM control-plane drops that
+        would otherwise stall the engine for the full timeout.
+        """
         deadline = time.time() + timeout_s
+        # Consumer kicks targeted retries every 30 s if no PUSH has arrived.
+        # Producer mode (waiting for ACK) skips this — ACKs are auto-emitted
+        # by NIXL on transfer completion, so re-sending the read isn't safe.
+        next_retry = time.time() + 30.0 if (
+            not self._is_producer and prefix == "PUSH"
+        ) else None
+        retries = 0
         while time.time() < deadline:
             with self._notif_lock:
                 q = self._notif_q.get(mm_hash, [])
@@ -413,6 +454,23 @@ class _NixlEndpoint:
                     if m.startswith(prefix):
                         del q[i]
                         return m
+            now = time.time()
+            if next_retry is not None and now >= next_retry:
+                if self._remote_agent is not None:
+                    try:
+                        self._wrapper.send_notif(
+                            self._remote_agent,
+                            notif_msg=f"REQ_PUSH|{mm_hash}",
+                        )
+                        retries += 1
+                        logger.info(
+                            "BL2 NIXL consumer sent REQ_PUSH for "
+                            "mm_hash=%s (retry #%d after %.0fs wait)",
+                            mm_hash, retries, now - (deadline - timeout_s),
+                        )
+                    except Exception:
+                        pass
+                next_retry = now + 30.0
             time.sleep(_POLL_INTERVAL_S)
         raise TimeoutError(
             f"BL2 NIXL: timed out waiting for {prefix} notif for {mm_hash}"
@@ -498,29 +556,39 @@ class _NixlEndpoint:
     def _resend_pushes(self) -> None:
         """Producer-only: every 30s, re-send PUSH for any unACK'd hash.
 
-        NIXL's notif AM control-plane drops individual messages under
-        sustained load (empirically after ~5–10 k advertises). The original
-        PUSH may have arrived, in which case the consumer's wait_for_notif
-        already drained it; the duplicate just lingers in the consumer's
-        _notif_q (acceptable for one experiment run). If the original was
-        dropped, the next periodic resend lands within 30 s — well inside
-        the consumer's 600 s wait.
+        Two layers of defense against NIXL/UCX AM control-plane drops:
+        - Producer-side blind periodic resend (this method).
+        - Consumer-initiated REQ_PUSH retries (handled in _drain_notifs).
+        If the original PUSH made it, duplicates just linger in the
+        consumer's _notif_q (small leak, fine for one run). If dropped,
+        the next tick re-delivers within 30 s — well inside the consumer's
+        600 s wait window.
         """
+        tick = 0
         while not self._stop.is_set():
             self._stop.wait(30.0)
             if self._stop.is_set():
                 return
+            tick += 1
             if self._remote_agent is None:
                 continue
             with self._slots_cv:
                 pairs = list(self._inflight_msgs.items())
+            n_resent = 0
             for _hash, msg in pairs:
                 try:
                     self._wrapper.send_notif(
                         self._remote_agent, notif_msg=msg
                     )
+                    n_resent += 1
                 except Exception:
                     pass
+            # One log line per minute (every other tick) for visibility.
+            if tick % 2 == 0:
+                logger.info(
+                    "BL2 NIXL producer resender tick=%d inflight=%d "
+                    "resent=%d", tick, len(pairs), n_resent,
+                )
 
     def consumer_pull(
         self,
