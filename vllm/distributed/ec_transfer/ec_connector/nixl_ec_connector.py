@@ -81,6 +81,15 @@ _MAX_BOOT_BYTES = 1 << 24  # 16 MiB
 # Polling cadence while waiting on producer notifs / xfer completion.
 _POLL_INTERVAL_S = 0.001
 
+# Producer slot-reclaim safety net. Typical pull latency is sub-second; even
+# under congestion we've never observed pulls beyond a few seconds. Any slot
+# inflight beyond this is overwhelmingly likely to indicate that BOTH the
+# NIXL auto-ACK and the consumer's explicit app-level ACK were dropped on the
+# notif AM control-plane. Reclaiming the slot is then safe — the consumer
+# either already pulled the data or will eventually retry via its own
+# wait_for_notif timeout, which will land in a subsequent re-advertise cycle.
+_SLOT_RECLAIM_TIMEOUT_S = 180.0
+
 
 # ---- metadata shipped scheduler -> worker -----------------------------------
 
@@ -182,6 +191,12 @@ class _NixlEndpoint:
         # individual notifs; without resend, the consumer's wait_for_notif
         # times out and the engine asserts on cache miss.
         self._inflight_msgs: dict[str, str] = {}
+        # Per-slot acquisition time for the slot-timeout reclaim safety net.
+        # If neither NIXL's auto-ACK nor the consumer's explicit app-level
+        # ACK arrives within _SLOT_RECLAIM_TIMEOUT_S, the producer assumes
+        # the consumer must be done by now and reclaims the slot. Bounds
+        # the slot ring against unbounded ACK loss.
+        self._inflight_since: dict[str, float] = {}
         # Consumer-side serialization: only one transfer at a time uses the
         # local scratch slot 0 (consumers only need one because READs are
         # serialized within a single start_load_caches call).
@@ -514,6 +529,7 @@ class _NixlEndpoint:
                     )
             slot = self._free_slots.popleft()
             self._inflight_slots[mm_hash] = slot
+            self._inflight_since[mm_hash] = time.time()
 
         try:
             offset = slot * self._slot_size
@@ -534,6 +550,7 @@ class _NixlEndpoint:
             with self._slots_cv:
                 self._inflight_slots.pop(mm_hash, None)
                 self._inflight_msgs.pop(mm_hash, None)
+                self._inflight_since.pop(mm_hash, None)
                 self._free_slots.append(slot)
                 self._slots_cv.notify()
             raise
@@ -543,11 +560,13 @@ class _NixlEndpoint:
         """Return the slot held by mm_hash back to the free queue.
 
         Called by the notif drain thread when an ACK|<mm_hash> notif
-        arrives.
+        arrives, and by the resender thread for slots that have exceeded
+        the reclaim timeout.
         """
         with self._slots_cv:
             slot = self._inflight_slots.pop(mm_hash, None)
             self._inflight_msgs.pop(mm_hash, None)
+            self._inflight_since.pop(mm_hash, None)
             if slot is None:
                 return
             self._free_slots.append(slot)
@@ -583,11 +602,31 @@ class _NixlEndpoint:
                     n_resent += 1
                 except Exception:
                     pass
+            # Slot timeout reclaim: any slot inflight beyond
+            # _SLOT_RECLAIM_TIMEOUT_S is overwhelmingly likely to have lost
+            # both NIXL's auto-ACK and the consumer's explicit app-level
+            # ACK. The consumer either has the data already (cache populated)
+            # or will retry via wait_for_notif on a later re-advertise.
+            now = time.time()
+            with self._slots_cv:
+                stale = [
+                    h for h, t in self._inflight_since.items()
+                    if now - t > _SLOT_RECLAIM_TIMEOUT_S
+                ]
+            n_reclaimed = 0
+            for h in stale:
+                logger.warning(
+                    "BL2 NIXL forcing slot reclaim for stale hash=%s "
+                    "(no ACK after %.0fs)", h, _SLOT_RECLAIM_TIMEOUT_S,
+                )
+                self._release_slot(h)
+                n_reclaimed += 1
             # One log line per minute (every other tick) for visibility.
             if tick % 2 == 0:
                 logger.info(
                     "BL2 NIXL producer resender tick=%d inflight=%d "
-                    "resent=%d", tick, len(pairs), n_resent,
+                    "resent=%d reclaimed=%d", tick, len(pairs),
+                    n_resent, n_reclaimed,
                 )
 
     def consumer_pull(
@@ -684,6 +723,19 @@ class _NixlEndpoint:
             tensor.view(torch.uint8).flatten()[:n_bytes].copy_(
                 self._scratch[:n_bytes]
             )
+
+        # Explicit app-level ACK in addition to the NIXL auto-ACK above.
+        # Both go through the same notif AM channel that drops messages
+        # under sustained load, but two independent sends roughly halves
+        # the probability of *both* being lost. Combined with the
+        # producer's _SLOT_RECLAIM_TIMEOUT_S safety net, slot exhaustion
+        # is bounded even if the channel is highly lossy.
+        try:
+            self._wrapper.send_notif(
+                self.remote_agent, notif_msg=f"ACK|{mm_hash}"
+            )
+        except Exception:
+            pass
         return tensor
 
     def stop(self) -> None:
