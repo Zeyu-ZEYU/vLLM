@@ -1163,6 +1163,23 @@ class GPUModelRunner(
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             if req_id in self.requests:
+                # mono_kernel pipeline mode: a multi-image waiting request
+                # may have its mm_features prefetched piecemeal across
+                # multiple iters when the encoder cache is tight. The
+                # scheduler re-emits a NewRequestData for it on every
+                # such iter (since `_schedule_pipeline_prefetch` doesn't
+                # track "already announced before"), so we end up here
+                # with `req_id in self.requests` and num_scheduled_tokens
+                # still 0. Without this skip, the streaming path below
+                # would `reqs_to_add.append(...)` and the prefetch req
+                # would be wrongly inserted into `input_batch`, eventually
+                # overflowing `max_num_reqs`. Just skip — `self.requests`
+                # is already correct from the first prefetch iter, and
+                # this iter only needs `scheduled_encoder_inputs[req_id]`
+                # (handled in `_execute_mm_encoder`, which reads via
+                # `self.requests`, not `input_batch`).
+                if _is_pipeline_prefetch_only(req_id):
+                    continue
                 # For streaming case only.
                 req_state = self._update_streaming_request(req_id, new_req_data)
                 reqs_to_add.append(req_state)
