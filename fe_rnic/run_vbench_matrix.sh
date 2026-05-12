@@ -13,10 +13,11 @@
 # Run boundaries (mode, L, C, t_start, t_end as Unix epoch with ns):
 #   /tmp/vbench_run_boundaries.tsv
 #
-# v3 (2026-04-30): 机尾三网卡 task — 6 lengths × 3 concurrencies × 2 modes,
-#   750 prompts, output_len=2. Added P95 to percentile output. Records run
-#   boundaries to /tmp/vbench_run_boundaries.tsv so d_prefill JSONL records
-#   (which only carry per-request ts) can be bucketed back to (mode, L, C).
+# v4 (2026-05-12): MFS 仿制实验 — 4 lengths × 3 concurrencies × 2 modes,
+#   750 prompts, output_len=2. Records run boundaries to
+#   /tmp/vbench_run_boundaries.tsv so d_prefill JSONL records (which only
+#   carry per-request ts) can be bucketed back to (mode, L, C).
+#   OUT_DIR isolated to bench_vllm_mfs/ to avoid mixing with v2 data.
 #
 # Assumptions:
 #   - The proxy is up and reachable on localhost:9090.
@@ -32,17 +33,17 @@ set -euo pipefail
 
 MODE="${1:?Usage: $0 <tail|head>}"
 cd /home/zeyu/vLLM/v0.11.0/fe_rnic
-mkdir -p /home/zeyu/exp_results/fe_rnic/bench_vllm
+mkdir -p /home/zeyu/exp_results/fe_rnic/bench_vllm_mfs
 
-LENGTHS=(256 512 1024 2048 4096 8192)
-CONCURRENCIES=(50 150 250)
+LENGTHS=(1024 2048 4096 8192)
+CONCURRENCIES=(100 200 300)
 MODEL=Qwen3-235B
 TOKENIZER=/home/zeyu/models/Qwen3-235B-A22B
 HOST=localhost
 PORT=9090
 OUTPUT_LEN=2
 NUM_PROMPTS=750
-OUT_DIR=/home/zeyu/exp_results/fe_rnic/bench_vllm
+OUT_DIR=/home/zeyu/exp_results/fe_rnic/bench_vllm_mfs
 BOUNDARIES=/tmp/vbench_run_boundaries.tsv
 
 # init boundaries file with header if not present
