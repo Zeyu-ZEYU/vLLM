@@ -13,11 +13,13 @@
 # Run boundaries (mode, L, C, t_start, t_end as Unix epoch with ns):
 #   /tmp/vbench_run_boundaries.tsv
 #
-# v4 (2026-05-12): MFS 仿制实验 — 4 lengths × 3 concurrencies × 2 modes,
-#   750 prompts, output_len=2. Records run boundaries to
-#   /tmp/vbench_run_boundaries.tsv so d_prefill JSONL records (which only
-#   carry per-request ts) can be bucketed back to (mode, L, C).
-#   OUT_DIR isolated to bench_vllm_mfs/ to avoid mixing with v2 data.
+# v5 (2026-05-13): 机尾三网卡 v3 — 6 lengths × 3 concurrencies × 2 modes,
+#   750 prompts, output_len=2. **closed-loop saturate mode**:
+#     --request-rate inf + --max-concurrency $C (跟同事 H20 同口径)
+#   **deterministic seed** $((L*1000+C)) → 机头/机尾同 (L, C) 用同一 seed.
+#   Records run boundaries to /tmp/vbench_run_boundaries.tsv so d_prefill
+#   JSONL records (which only carry per-request ts) can be bucketed back
+#   to (mode, L, C). OUT_DIR isolated to bench_vllm_jiwei3_v3/.
 #
 # Assumptions:
 #   - The proxy is up and reachable on localhost:9090.
@@ -33,17 +35,17 @@ set -euo pipefail
 
 MODE="${1:?Usage: $0 <tail|head>}"
 cd /home/zeyu/vLLM/v0.11.0/fe_rnic
-mkdir -p /home/zeyu/exp_results/fe_rnic/bench_vllm_mfs
+mkdir -p /home/zeyu/exp_results/fe_rnic/bench_vllm_jiwei3_v3
 
-LENGTHS=(1024 2048 4096 8192)
-CONCURRENCIES=(100 200 300)
+LENGTHS=(256 512 1024 2048 4096 8192)
+CONCURRENCIES=(50 150 250)
 MODEL=Qwen3-235B
 TOKENIZER=/home/zeyu/models/Qwen3-235B-A22B
 HOST=localhost
 PORT=9090
 OUTPUT_LEN=2
 NUM_PROMPTS=750
-OUT_DIR=/home/zeyu/exp_results/fe_rnic/bench_vllm_mfs
+OUT_DIR=/home/zeyu/exp_results/fe_rnic/bench_vllm_jiwei3_v3
 BOUNDARIES=/tmp/vbench_run_boundaries.tsv
 
 # init boundaries file with header if not present
@@ -69,12 +71,11 @@ for C in "${CONCURRENCIES[@]}"; do
             --random-input-len "$L" \
             --random-output-len "$OUTPUT_LEN" \
             --random-range-ratio 0 \
-            --burstiness 1 \
             --percentile-metrics "ttft,tpot,itl,e2el" \
             --metric-percentiles "25,50,75,95,99" \
-            --seed "$(date +%s)" \
+            --seed "$((L*1000+C))" \
             --trust-remote-code \
-            --request-rate "$C" \
+            --request-rate inf \
             --max-concurrency "$C" \
             --num-prompts "$NUM_PROMPTS" \
             --save-result \
