@@ -55,7 +55,8 @@ fi
 # 配合 node 0 物理禁用 mlx5_bond_3（ip link set reth6/reth7 down）实现"非环境变量方式"
 # 限制 node 0 用 3 bond。
 # export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-# export GLOO_SOCKET_IFNAME=eth0
+# Gloo (Ray DP control plane) 必须显式 export，否则默认 127.0.0.1，跨 node DP>=2 connectFullMesh fail
+export GLOO_SOCKET_IFNAME=eth0
 # export NCCL_SOCKET_IFNAME=eth0
 # export NCCL_IB_HCA="${NCCL_IB_HCA:-${IB_DEVICES}}"
 # export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
