@@ -51,17 +51,20 @@ else
 fi
 
 # ======================== 导出环境变量（Ray worker 会继承） ========================
-# NCCL — MoE EP 跨节点 all-to-all
-export GLOO_SOCKET_IFNAME=eth0
-export NCCL_SOCKET_IFNAME=eth0
-export NCCL_IB_HCA="${NCCL_IB_HCA:-${IB_DEVICES}}"
-export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
-export NCCL_IB_QPS_PER_CONNECTION=8
-export NCCL_MIN_NCHANNELS=4
-export NCCL_IB_SL=5
-export NCCL_IB_TC=138
-export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-5}"
-export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+# v4 (2026-05-14): 机尾三网卡 v4 — 所有 NCCL/GLOO env 注释掉，让 NCCL 用默认值。
+# 配合 node 0 物理禁用 mlx5_bond_3（ip link set reth6/reth7 down）实现"非环境变量方式"
+# 限制 node 0 用 3 bond。
+# export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# export GLOO_SOCKET_IFNAME=eth0
+# export NCCL_SOCKET_IFNAME=eth0
+# export NCCL_IB_HCA="${NCCL_IB_HCA:-${IB_DEVICES}}"
+# export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
+# export NCCL_IB_QPS_PER_CONNECTION=8
+# export NCCL_MIN_NCHANNELS=4
+# export NCCL_IB_SL=5
+# export NCCL_IB_TC=138
+# export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-5}"
+# export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
 # UCX
 export UCX_TLS=all
@@ -94,8 +97,7 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 # Hash seed（prefill / decode 必须一致）
 export PYTHONHASHSEED="${VLLM_PYTHON_HASH_SEED:-123}"
 
-echo "[ray_start] 环境变量已导出"
-echo "[ray_start] NCCL_IB_HCA=$NCCL_IB_HCA"
+echo "[ray_start] 环境变量已导出（v4: NCCL/GLOO env 全部注释，由 NCCL 取默认值）"
 echo "[ray_start] LMCACHE_CONFIG_FILE=${LMCACHE_CONFIG_FILE:-not set}"
 
 # ======================== 启动 Ray ========================

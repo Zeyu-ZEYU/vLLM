@@ -35,7 +35,7 @@ set -euo pipefail
 
 MODE="${1:?Usage: $0 <tail|head>}"
 cd /home/zeyu/vLLM/v0.11.0/fe_rnic
-mkdir -p /home/zeyu/exp_results/fe_rnic/bench_vllm_jiwei3_v3
+mkdir -p /home/zeyu/exp_results/fe_rnic/bench_vllm_jiwei3_v4
 
 LENGTHS=(256 512 1024 2048 4096 8192)
 CONCURRENCIES=(50 150 250)
@@ -45,7 +45,7 @@ HOST=localhost
 PORT=9090
 OUTPUT_LEN=2
 NUM_PROMPTS=750
-OUT_DIR=/home/zeyu/exp_results/fe_rnic/bench_vllm_jiwei3_v3
+OUT_DIR=/home/zeyu/exp_results/fe_rnic/bench_vllm_jiwei3_v4
 BOUNDARIES=/tmp/vbench_run_boundaries.tsv
 
 # init boundaries file with header if not present
