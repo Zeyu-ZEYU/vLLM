@@ -58,7 +58,11 @@ fi
 # Gloo (Ray DP control plane) 必须显式 export，否则默认 127.0.0.1，跨 node DP>=2 connectFullMesh fail
 export GLOO_SOCKET_IFNAME=eth0
 # export NCCL_SOCKET_IFNAME=eth0
-# export NCCL_IB_HCA="${NCCL_IB_HCA:-${IB_DEVICES}}"
+# NCCL_IB_HCA=^mlx5_0: 排除机头 mlx5_0 (VPC eRDMA)，NCCL 只走机尾 bond。
+# 否则 NCCL 自动枚举会把 mlx5_0 拉进跨 node channel 导致 RoCE QP connect 卡死。
+# ^ 前缀 = 排除语法；prefix 匹配不误伤 mlx5_bond_*；tail/head 模式统一适用；
+# node 0 物理 down 的 mlx5_bond_3 由 NCCL 自动 skip。
+export NCCL_IB_HCA="${NCCL_IB_HCA:-^mlx5_0}"
 # export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
 # export NCCL_IB_QPS_PER_CONNECTION=8
 # export NCCL_MIN_NCHANNELS=4
