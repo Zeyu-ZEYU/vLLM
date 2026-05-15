@@ -63,7 +63,10 @@ export GLOO_SOCKET_IFNAME=eth0
 # ^ 前缀 = 排除语法；prefix 匹配不误伤 mlx5_bond_*；tail/head 模式统一适用；
 # node 0 物理 down 的 mlx5_bond_3 由 NCCL 自动 skip。
 export NCCL_IB_HCA="${NCCL_IB_HCA:-^mlx5_0}"
-# export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
+# NCCL_IB_GID_INDEX=3: RoCE v2 link-local IPv4 GID。不设 NCCL auto 选 GID
+# 在本 fabric 会选错 (RoCE v1 / IPv6 GID) -> 跨 node QP connect silent hang。
+# 同 GLOO_SOCKET_IFNAME / NCCL_IB_HCA: RDMA 跨 node 连通性硬前提，非 QoS/prio。
+export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
 # export NCCL_IB_QPS_PER_CONNECTION=8
 # export NCCL_MIN_NCHANNELS=4
 # export NCCL_IB_SL=5
