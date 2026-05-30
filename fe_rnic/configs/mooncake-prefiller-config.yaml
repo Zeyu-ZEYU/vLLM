@@ -28,14 +28,14 @@ extra_config:
   protocol: "rdma"
   device_name: "{IB_DEVICES}"                      # mlx5_bond_0,...,mlx5_bond_3
   master_server_address: "{MASTER_IP}:50052"
-  global_segment_size: 34359738368                 # 32 GB (was 60; see comment above)
-  local_buffer_size:    4294967296                  # 4 GB per GPU
+  global_segment_size: {PREFILL_SEGMENT_SIZE}       # 0 = prefill registers NO segment; KV lives only on decode (set via PREFILL_SEGMENT_SIZE env)
+  local_buffer_size:    4294967296                  # 4 GB per GPU (RDMA staging buffer; kept even with 0 segment)
   transfer_timeout: 10
   save_chunk_meta: False
-  # When KV head-NIC split is enabled, both the tail and head
-  # connectors register segments on the *same* master. Without a
-  # preferred_segment, master can cross-assign a tail put onto a
-  # head segment (registered on mlx5_0) and the tail engine's RDMA
-  # WRITE (mlx5_bond_*) would fail status=6 FAILED. Force local
-  # so the tail client always gets a tail-device segment.
-  mooncake_prefer_local_alloc: true
+  # Measurement setup: prefill registers no segment (global_segment_size=0),
+  # so all KV is allocated on the remote decode-node segment. prefer_local_alloc
+  # must be false (there is no local segment to prefer); this makes prefix-reuse
+  # reads (inbound) and fresh-KV writes (outbound P->D) all go over the backend
+  # network to the decode nodes. Head-NIC split is off here, so the old
+  # cross-assignment concern does not apply.
+  mooncake_prefer_local_alloc: false

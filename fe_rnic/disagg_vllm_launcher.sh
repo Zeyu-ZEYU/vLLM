@@ -35,6 +35,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODEL="${MODEL:-$HOME/models/Qwen3-235B-A22B}"
 IB_DEVICES="${IB_DEVICES:-mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3}"
 
+# Mooncake segment size (bytes) registered by the PREFILL node. Default 0 =
+# prefill holds no segment, so reused-prefix reads and fresh-KV writes all go
+# remote to the decode-node segments (the inbound + outbound backend traffic we
+# measure). Set e.g. 34359738368 (32 GB) to restore a prefill-side segment.
+PREFILL_SEGMENT_SIZE="${PREFILL_SEGMENT_SIZE:-0}"
+
 PREFILL_PORT="${PREFILL_PORT:-8100}"
 PREFILL_DP="${PREFILL_DP:-16}"
 PREFILL_DP_LOCAL="${PREFILL_DP_LOCAL:-8}"
@@ -71,6 +77,7 @@ generate_mooncake_config() {
     sed -e "s|{MASTER_IP}|${MASTER_IP}|g" \
         -e "s|{LOCAL_RDMA_IP}|${LOCAL_RDMA_IP}|g" \
         -e "s|{IB_DEVICES}|${IB_DEVICES}|g" \
+        -e "s|{PREFILL_SEGMENT_SIZE}|${PREFILL_SEGMENT_SIZE}|g" \
         "$template" > "$output"
 
     echo "$output"
