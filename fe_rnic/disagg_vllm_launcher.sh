@@ -41,6 +41,11 @@ IB_DEVICES="${IB_DEVICES:-mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3}"
 # measure). Set e.g. 34359738368 (32 GB) to restore a prefill-side segment.
 PREFILL_SEGMENT_SIZE="${PREFILL_SEGMENT_SIZE:-0}"
 
+# Per-iteration prefill token budget. Larger -> wider MoE all-to-all bursts
+# (more bytes moved at line rate per iteration), which a fine-grained bw sampler
+# can resolve as clean back-end saturation. Default matches the deployed config.
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-17000}"
+
 PREFILL_PORT="${PREFILL_PORT:-8100}"
 PREFILL_DP="${PREFILL_DP:-16}"
 PREFILL_DP_LOCAL="${PREFILL_DP_LOCAL:-8}"
@@ -164,7 +169,7 @@ prefill)
         --dtype bfloat16 \
         --enforce-eager \
         --max-model-len 17000 \
-        --max-num-batched-tokens 17000 \
+        --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
         --max-num-seqs 256 \
         --gpu-memory-utilization 0.9 \
         --no-enable-prefix-caching \
@@ -226,7 +231,7 @@ decode)
         --dtype bfloat16 \
         --enforce-eager \
         --max-model-len 17000 \
-        --max-num-batched-tokens 17000 \
+        --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
         --max-num-seqs 256 \
         --gpu-memory-utilization 0.9 \
         --no-enable-prefix-caching \
