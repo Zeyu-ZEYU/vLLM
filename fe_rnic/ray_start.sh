@@ -31,6 +31,10 @@ done
 MODEL="${MODEL:-$HOME/models/Qwen3-235B-A22B}"
 IB_DEVICES="${IB_DEVICES:-mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3}"
 RAY_PORT="${RAY_PORT:-6379}"
+# Prefill Mooncake segment size (bytes); 0 = prefill holds no segment (KV only
+# on decode). Must match the launcher default; substituted into the prefiller
+# template below so node-1's workers don't read an unsubstituted placeholder.
+PREFILL_SEGMENT_SIZE="${PREFILL_SEGMENT_SIZE:-0}"
 ROLE="${1:-}"
 
 # ======================== 生成 Mooncake config ========================
@@ -43,6 +47,7 @@ if [[ -f "$template" ]]; then
     sed -e "s|{MASTER_IP}|${MASTER_IP}|g" \
         -e "s|{LOCAL_RDMA_IP}|${LOCAL_RDMA_IP}|g" \
         -e "s|{IB_DEVICES}|${IB_DEVICES}|g" \
+        -e "s|{PREFILL_SEGMENT_SIZE}|${PREFILL_SEGMENT_SIZE}|g" \
         "$template" > "$output"
     echo "[ray_start] 生成 mooncake config: $output"
 else
