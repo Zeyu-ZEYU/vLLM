@@ -65,11 +65,13 @@ def build_prompt(hash_ids, input_length, cache, lo, hi, max_input_len):
     return toks[:L]
 
 
-def load_trace(path, n):
+def load_trace(path, n, start=0):
     op = lzma.open if path.endswith(".xz") else open
     out = []
     with op(path, "rt") as f:
-        for line in f:
+        for i, line in enumerate(f):
+            if i < start:
+                continue
             out.append(json.loads(line))
             if n and len(out) >= n:
                 break
@@ -115,7 +117,8 @@ async def main():
     ap.add_argument("--trace", required=True)
     ap.add_argument("--proxy", default="localhost:9090")
     ap.add_argument("--model", default="Qwen3-235B")
-    ap.add_argument("--num-requests", type=int, default=1000, help="replay the first N (0 = all)")
+    ap.add_argument("--num-requests", type=int, default=1000, help="replay N requests from --start-index (0 = all)")
+    ap.add_argument("--start-index", type=int, default=0, help="skip the first N trace requests (warm-up vs measure split)")
     ap.add_argument("--mode", choices=["timestamp", "poisson", "asap"], default="poisson")
     ap.add_argument("--rps", type=float, default=30.0, help="poisson mean arrival rate")
     ap.add_argument("--time-scale", type=float, default=1.0,
@@ -129,8 +132,8 @@ async def main():
     ap.add_argument("--out", default="", help="optional per-request JSONL log")
     args = ap.parse_args()
 
-    reqs = load_trace(args.trace, args.num_requests)
-    print(f"loaded {len(reqs)} requests from {args.trace}")
+    reqs = load_trace(args.trace, args.num_requests, args.start_index)
+    print(f"loaded {len(reqs)} requests from {args.trace} (start_index={args.start_index})")
 
     cache = {}
     prompts = []
