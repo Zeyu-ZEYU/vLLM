@@ -24,7 +24,7 @@ extra_config:
   protocol: "rdma"
   device_name: "{IB_DEVICES}"                      # mlx5_bond_0,...,mlx5_bond_3
   master_server_address: "{MASTER_IP}:50052"
-  global_segment_size: 34359738368                 # 32 GB (was 60)
+  global_segment_size: 68719476736                 # 64 GB (was 32; enlarged for ttft_contention 50% window)
   local_buffer_size:    4294967296                  # 4 GB per GPU
   transfer_timeout: 10
   save_chunk_meta: False
