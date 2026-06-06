@@ -85,10 +85,12 @@ def pct(arr, p):
     return a[min(len(a) - 1, int(len(a) * p / 100))]
 
 
-async def one_request(client, url, model, prompt, max_tokens, stats, idx, logf):
+async def one_request(client, url, model, prompt, max_tokens, stats, idx, logf, t_ref=None):
     body = {"model": model, "prompt": prompt, "max_tokens": max_tokens,
             "temperature": 0.0, "stream": True}
-    t0 = time.time()
+    # t_ref set => time TTFT from the request's scheduled send instant (open-loop
+    # overload: counts the client-side admission wait); else from admission.
+    t0 = t_ref if t_ref is not None else time.time()
     ttft = None
     try:
         async with client.stream("POST", url, json=body) as resp:
@@ -130,6 +132,10 @@ async def main():
     ap.add_argument("--vocab-lo", type=int, default=1000)
     ap.add_argument("--vocab-hi", type=int, default=150000)
     ap.add_argument("--out", default="", help="optional per-request JSONL log")
+    ap.add_argument("--ttft-from-arrival", action="store_true",
+                    help="time TTFT from the scheduled send instant (open-loop "
+                         "overload), not from when the request is admitted past "
+                         "--max-concurrency; lets latency diverge past saturation")
     args = ap.parse_args()
 
     reqs = load_trace(args.trace, args.num_requests, args.start_index)
@@ -165,7 +171,7 @@ async def main():
     logf = open(args.out, "w") if args.out else None
     limits = httpx.Limits(max_connections=args.max_concurrency + 32,
                           max_keepalive_connections=args.max_concurrency + 32)
-    timeout = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=900.0)
+    timeout = httpx.Timeout(connect=30.0, read=3600.0, write=3600.0, pool=3600.0)
 
     print(f"mode={args.mode} rps={args.rps} max_conc={args.max_concurrency} "
           f"max_tokens={args.max_tokens} -> {url}")
@@ -174,12 +180,13 @@ async def main():
         start = time.time()
 
         async def fire(i):
+            t_ref = (start + sched[i]) if args.ttft_from_arrival else None
             async with sem:
                 inflight["n"] += 1
                 inflight["max"] = max(inflight["max"], inflight["n"])
                 try:
                     await one_request(client, url, args.model, prompts[i][0],
-                                      prompts[i][1], stats, i, logf)
+                                      prompts[i][1], stats, i, logf, t_ref)
                 finally:
                     inflight["n"] -= 1
 
