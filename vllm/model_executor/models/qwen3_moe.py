@@ -355,14 +355,15 @@ class Qwen3MoeAttention(nn.Module):
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
-        # fe_rnic elastic attention (P2-M1): shadow-verify that a GQA-group head
-        # split + flash-attn reproduces the paged backend, before wiring the real
-        # NVLink offload (P2-M2). Log-only, self-quiets after a few prefill steps.
+        # fe_rnic elastic attention (P2-M2): the straggler offloads whole GQA head
+        # groups to same-node helpers over NVLink; plain self.attn when there is no
+        # offload this step (see vllm/distributed/elastic_attn.py).
         from vllm.distributed.parallel_state import elastic_attn_enabled
         if elastic_attn_enabled():
-            from vllm.distributed.elastic_attn import elastic_shadow_check
-            elastic_shadow_check(self, q, k, v, attn_output)
+            from vllm.distributed.elastic_attn import elastic_attention
+            attn_output = elastic_attention(self, q, k, v)
+        else:
+            attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -499,22 +500,17 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        # fe_rnic elastic attention (P1): once per step, same-node DP workers
-        # all-gather token counts + compute the Alg 2 offload plan (log-only here).
+        # fe_rnic elastic attention: once per step, same-node DP workers all-gather
+        # their token counts + compute the Alg 2 GQA-group offload plan, stashed for
+        # the attention layers (see vllm/distributed/elastic_attn.py).
         from vllm.distributed.parallel_state import elastic_attn_enabled
-        global _ELASTIC_DBG
-        if _ELASTIC_DBG < 3:
-            logger.info(
-                "[elastic-hook] Qwen3MoeModel.forward reached: enabled=%s tokens=%d",
-                elastic_attn_enabled(), int(hidden_states.shape[0]),
-            )
-            _ELASTIC_DBG += 1
         if elastic_attn_enabled():
-            from vllm.distributed.elastic_attn import maybe_log_elastic_plan
-            maybe_log_elastic_plan(
+            from vllm.distributed.elastic_attn import set_step_plan
+            set_step_plan(
                 hidden_states.shape[0],
                 hidden_states.device,
                 self.config.num_attention_heads,
+                self.config.num_key_value_heads,
             )
 
         aux_hidden_states = self._maybe_add_hidden_state(

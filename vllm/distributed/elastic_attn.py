@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 
 import torch
+import torch.distributed as dist
 
 from vllm.distributed.parallel_state import get_intra_node_dp_group
 from vllm.forward_context import get_forward_context
@@ -193,3 +194,234 @@ def elastic_shadow_check(attn_module, q, k, v, attn_output) -> None:
         )
     except Exception as e:  # never break serving for a debug check
         logger.warning("[elastic-shadow] skipped (error: %r)", e)
+
+
+# ---------------------------------------------------------------------------
+# P2-M2: real GQA-group offload over the intra-node DP NCCL group.
+#
+# Once per step (Qwen3MoeModel.forward) the same-node DP workers all-gather
+# (token_count, offloadable_flag) and compute an identical Alg 2 plan in GQA-group
+# units. Each attention layer then runs elastic_attention():
+#   - straggler: writes its full K/V to cache, computes only the groups it keeps,
+#     ships the offloaded groups' q/k/v to helpers over NVLink, recvs their
+#     outputs, and reassembles. (Output is bit-identical to self.attn -- see M1.)
+#   - helper: does its own self.attn, plus recomputes the straggler's offloaded
+#     groups and returns them.
+#   - everyone else: plain self.attn.
+# All P2P uses the dedicated intra-node communicator (isolated from vLLM's DP
+# all-reduces) with global peer ranks, deadlock-free via two batched rounds.
+# ---------------------------------------------------------------------------
+
+_STEP_PLAN: dict | None = None
+
+
+def _offloadable_flag() -> int:
+    """1 iff THIS worker's current batch is a single, no-prefix prefill request
+    (the case M2 handles without transferring cu_seqlens). Decode / multi-request
+    / chunked-prefix batches return 0 and are left to plain self.attn (P3)."""
+    try:
+        am = get_forward_context().attn_metadata
+        if isinstance(am, dict):
+            am = next(iter(am.values())) if am else None
+        if am is None or int(am.max_query_len) <= 1:
+            return 0
+        qsl = am.query_start_loc
+        nreq = int(qsl.shape[0] - 1)
+        if nreq != 1:
+            return 0
+        qlen = qsl[1:] - qsl[:-1]
+        sl = am.seq_lens[:nreq]
+        return 1 if bool(torch.equal(qlen.to(sl.dtype), sl)) else 0
+    except Exception:
+        return 0
+
+
+def compute_group_plan(counts, flags, num_groups, theta: float = THETA) -> dict | None:
+    """Alg 2 in GQA-group units. Offload whole groups (grp query heads + their
+    shared kv head) from the straggler to lighter same-node workers so all finish
+    near the node mean. Identical on every worker (pure function of all-gathered
+    counts/flags). Returns None if no offload."""
+    n = len(counts)
+    if n < 2:
+        return None
+    total = sum(counts)
+    if total == 0:
+        return None
+    mean = total / n
+    s = max(range(n), key=lambda w: counts[w])
+    if flags[s] != 1:                       # straggler batch not offloadable
+        return None
+    if counts[s] <= theta * mean:           # theta-gate
+        return None
+    per_group = counts[s] / num_groups
+    if per_group <= 0:
+        return None
+    n_off = int(round((counts[s] - mean) / per_group))
+    n_off = max(1, min(n_off, num_groups - 1))   # keep >=1 group on the straggler
+    cand = [w for w in range(n) if w != s and counts[w] < mean]
+    if not cand:
+        return None
+    n_keep = num_groups - n_off
+    load = {w: float(counts[w]) for w in cand}
+    offload = []
+    for g in range(n_keep, num_groups):     # offload the high-index groups
+        h = min(cand, key=lambda w: load[w])  # currently-lightest helper
+        offload.append((g, h))
+        load[h] += per_group
+    helpers = sorted({h for _, h in offload})
+    return {
+        "straggler": s, "n_keep": n_keep, "offload": offload,
+        "helpers": helpers, "counts": counts, "T": int(counts[s]),
+    }
+
+
+def set_step_plan(num_tokens: int, device: torch.device, num_q_heads: int,
+                  num_kv_heads: int) -> dict | None:
+    """Once per step: all-gather (count, flag) over the intra-node DP group and
+    stash the Alg 2 group plan for the attention layers to read."""
+    global _STEP_PLAN, _step
+    _step += 1
+    flag = _offloadable_flag()
+    grp = get_intra_node_dp_group()
+    n = grp.world_size
+    t = torch.tensor([int(num_tokens), int(flag)], dtype=torch.int64, device=device)
+    out = torch.empty(n * 2, dtype=torch.int64, device=device)
+    torch.distributed.all_gather_into_tensor(out, t, group=grp.device_group)
+    info = out.view(n, 2).tolist()
+    counts = [r[0] for r in info]
+    flags = [r[1] for r in info]
+    _STEP_PLAN = compute_group_plan(counts, flags, num_kv_heads)
+    if _STEP_PLAN is not None and (_step <= 50 or _step % _LOG_EVERY == 0):
+        logger.info(
+            "[elastic-attn] step=%d counts=%s -> straggler r%d keep %d/%d groups "
+            "offload %s", _step, counts, _STEP_PLAN["straggler"],
+            _STEP_PLAN["n_keep"], num_kv_heads, _STEP_PLAN["offload"],
+        )
+    return _STEP_PLAN
+
+
+def get_step_plan() -> dict | None:
+    return _STEP_PLAN
+
+
+def _flash(q_g, k_g, v_g, cu, T, scale):
+    o = flash_attn_varlen_func(
+        q_g, k_g, v_g, cu_seqlens_q=cu, cu_seqlens_k=cu,
+        max_seqlen_q=T, max_seqlen_k=T, softmax_scale=scale, causal=True,
+    )
+    return o[0] if isinstance(o, tuple) else o
+
+
+def _straggler_attention(attn_module, q, k, v, plan, nq, nkv, hd, grp, scale, grp_pg):
+    from vllm._custom_ops import reshape_and_cache_flash
+    from vllm.model_executor.layers.attention.attention import get_attention_context
+
+    dev = q.device
+    T = q.shape[0]
+    pg = grp_pg.device_group
+    q3 = q.view(T, nq, hd)
+    k3 = k.view(T, nkv, hd)
+    v3 = v.view(T, nkv, hd)
+
+    # 1. write the straggler's full K/V to the paged cache (decode correctness).
+    _, attn_layer, kv_cache, slot_mapping = get_attention_context(attn_module.attn.layer_name)
+    if kv_cache is not None and kv_cache.numel() > 0 and slot_mapping is not None:
+        kc, vc = kv_cache.unbind(0)
+        reshape_and_cache_flash(
+            k3, v3, kc, vc, slot_mapping,
+            attn_layer.kv_cache_dtype, attn_layer._k_scale, attn_layer._v_scale,
+        )
+
+    cu = torch.tensor([0, T], dtype=torch.int32, device=dev)
+    # 2. round 1: ship offloaded groups to helpers (non-blocking).
+    ops1, hold = [], {}
+    for g, h in plan["offload"]:
+        hg = grp_pg.ranks[h]
+        q_g = q3[:, g * grp:(g + 1) * grp, :].contiguous()
+        k_g = k3[:, g:g + 1, :].contiguous()
+        v_g = v3[:, g:g + 1, :].contiguous()
+        hold[g] = (q_g, k_g, v_g)
+        ops1 += [dist.P2POp(dist.isend, q_g, hg, pg),
+                 dist.P2POp(dist.isend, k_g, hg, pg),
+                 dist.P2POp(dist.isend, v_g, hg, pg)]
+    works1 = dist.batch_isend_irecv(ops1) if ops1 else []
+
+    # 3. compute kept groups locally (overlaps with helper compute + transfer).
+    o_full = torch.empty(T, nq, hd, dtype=q.dtype, device=dev)
+    for g in range(plan["n_keep"]):
+        q_g = q3[:, g * grp:(g + 1) * grp, :].contiguous()
+        k_g = k3[:, g:g + 1, :].contiguous()
+        v_g = v3[:, g:g + 1, :].contiguous()
+        o_full[:, g * grp:(g + 1) * grp, :] = _flash(q_g, k_g, v_g, cu, T, scale)
+    for w in works1:
+        w.wait()
+
+    # 4. round 2: receive offloaded groups' outputs and assemble.
+    ops2, recv_o = [], {}
+    for g, h in plan["offload"]:
+        hg = grp_pg.ranks[h]
+        o_buf = torch.empty(T, grp, hd, dtype=q.dtype, device=dev)
+        recv_o[g] = o_buf
+        ops2.append(dist.P2POp(dist.irecv, o_buf, hg, pg))
+    works2 = dist.batch_isend_irecv(ops2) if ops2 else []
+    for w in works2:
+        w.wait()
+    for g, _h in plan["offload"]:
+        o_full[:, g * grp:(g + 1) * grp, :] = recv_o[g]
+    return o_full.reshape(T, nq * hd)
+
+
+def _helper_attention(attn_module, q, k, v, plan, my, nq, nkv, hd, grp, scale, grp_pg):
+    dev = q.device
+    pg = grp_pg.device_group
+    sg = grp_pg.ranks[plan["straggler"]]
+    T_s = int(plan["T"])
+    my_groups = [g for g, h in plan["offload"] if h == my]
+
+    # 1. post recvs for the straggler's offloaded groups (before own attn).
+    recv, ops1 = {}, []
+    for g in my_groups:
+        q_g = torch.empty(T_s, grp, hd, dtype=q.dtype, device=dev)
+        k_g = torch.empty(T_s, 1, hd, dtype=q.dtype, device=dev)
+        v_g = torch.empty(T_s, 1, hd, dtype=q.dtype, device=dev)
+        recv[g] = (q_g, k_g, v_g)
+        ops1 += [dist.P2POp(dist.irecv, q_g, sg, pg),
+                 dist.P2POp(dist.irecv, k_g, sg, pg),
+                 dist.P2POp(dist.irecv, v_g, sg, pg)]
+    works1 = dist.batch_isend_irecv(ops1) if ops1 else []
+
+    # 2. own attention for this helper's own tokens (overlaps with the transfer).
+    own_out = attn_module.attn(q, k, v)
+
+    # 3. recompute the straggler's offloaded groups, send results back.
+    for w in works1:
+        w.wait()
+    cu = torch.tensor([0, T_s], dtype=torch.int32, device=dev)
+    out_g = {}
+    for g in my_groups:
+        q_g, k_g, v_g = recv[g]
+        out_g[g] = _flash(q_g, k_g, v_g, cu, T_s, scale).contiguous()
+    ops2 = [dist.P2POp(dist.isend, out_g[g], sg, pg) for g in my_groups]
+    works2 = dist.batch_isend_irecv(ops2) if ops2 else []
+    for w in works2:
+        w.wait()
+    return own_out
+
+
+def elastic_attention(attn_module, q, k, v):
+    """Drop-in for self.attn(q, k, v) under VLLM_ELASTIC_ATTN. Dispatches on this
+    worker's role in the current step's plan; falls back to plain attention when
+    there is no offload this step."""
+    plan = _STEP_PLAN
+    if plan is None:
+        return attn_module.attn(q, k, v)
+    grp_pg = get_intra_node_dp_group()
+    my = grp_pg.rank_in_group
+    nq, nkv, hd = attn_module.num_heads, attn_module.num_kv_heads, attn_module.head_dim
+    grp = nq // nkv
+    scale = attn_module.scaling
+    if my == plan["straggler"]:
+        return _straggler_attention(attn_module, q, k, v, plan, nq, nkv, hd, grp, scale, grp_pg)
+    if my in plan["helpers"]:
+        return _helper_attention(attn_module, q, k, v, plan, my, nq, nkv, hd, grp, scale, grp_pg)
+    return attn_module.attn(q, k, v)
