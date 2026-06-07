@@ -1248,6 +1248,24 @@ def get_dp_group() -> GroupCoordinator:
     return _DP
 
 
+# fe_rnic: elastic attention — DP workers on the SAME physical node, used to
+# offload a straggler's attention heads to same-node lighter workers over NVLink.
+# Only built when VLLM_ELASTIC_ATTN=1 (default off => vanilla vLLM untouched).
+_INTRA_NODE_DP: GroupCoordinator | None = None
+
+
+def get_intra_node_dp_group() -> GroupCoordinator:
+    assert _INTRA_NODE_DP is not None, (
+        "intra-node DP group is not initialized (set VLLM_ELASTIC_ATTN=1)"
+    )
+    return _INTRA_NODE_DP
+
+
+def elastic_attn_enabled() -> bool:
+    import os
+    return os.environ.get("VLLM_ELASTIC_ATTN", "0") == "1"
+
+
 _EP: GroupCoordinator | None = None
 
 
@@ -1656,6 +1674,39 @@ def initialize_model_parallel(
             group_ranks, get_world_group().local_rank, backend, group_name="dp"
         )
 
+    # fe_rnic: per-node DP-worker group for elastic attention (offload straggler
+    # heads to same-node lighter workers over NVLink). Groups DP ranks by physical
+    # hostname; assumes TP=PP=PCP=1 (DP rank == global rank), true for this deploy.
+    global _INTRA_NODE_DP
+    if elastic_attn_enabled():
+        assert (
+            tensor_model_parallel_size == 1
+            and pipeline_model_parallel_size == 1
+            and prefill_context_model_parallel_size == 1
+        ), "elastic attention assumes TP=PP=PCP=1 (DP rank == global rank)"
+        import socket
+
+        host = socket.gethostname()
+        hosts: list[object] = [None] * world_size
+        torch.distributed.all_gather_object(hosts, host)
+        by_host: dict[str, list[int]] = {}
+        for r, h in enumerate(hosts):
+            by_host.setdefault(str(h), []).append(r)
+        node_groups = list(by_host.values())
+        _INTRA_NODE_DP = init_model_parallel_group(
+            node_groups,
+            get_world_group().local_rank,
+            backend,
+            group_name="intra_node_dp",
+        )
+        my_grp = next(g for g in node_groups if rank in g)
+        logger.info(
+            "[elastic-attn] intra-node DP groups=%s; rank %d -> group %s",
+            node_groups,
+            rank,
+            my_grp,
+        )
+
     global _EP
     assert _EP is None, "expert parallel group is already initialized"
     # Don't create EP group for dense models.
@@ -1876,6 +1927,11 @@ def destroy_model_parallel():
     if _DP:
         _DP.destroy()
     _DP = None
+
+    global _INTRA_NODE_DP
+    if _INTRA_NODE_DP:
+        _INTRA_NODE_DP.destroy()
+    _INTRA_NODE_DP = None
 
     global _EP
     if _EP:

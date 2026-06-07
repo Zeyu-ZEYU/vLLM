@@ -85,6 +85,8 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+_ELASTIC_DBG = 0  # fe_rnic: one-shot debug counter for the elastic-attn forward hook
+
 
 class Qwen3MoeMLP(nn.Module):
     def __init__(
@@ -354,6 +356,13 @@ class Qwen3MoeAttention(nn.Module):
         k = k_by_head.view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
+        # fe_rnic elastic attention (P2-M1): shadow-verify that a GQA-group head
+        # split + flash-attn reproduces the paged backend, before wiring the real
+        # NVLink offload (P2-M2). Log-only, self-quiets after a few prefill steps.
+        from vllm.distributed.parallel_state import elastic_attn_enabled
+        if elastic_attn_enabled():
+            from vllm.distributed.elastic_attn import elastic_shadow_check
+            elastic_shadow_check(self, q, k, v, attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -489,6 +498,24 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+
+        # fe_rnic elastic attention (P1): once per step, same-node DP workers
+        # all-gather token counts + compute the Alg 2 offload plan (log-only here).
+        from vllm.distributed.parallel_state import elastic_attn_enabled
+        global _ELASTIC_DBG
+        if _ELASTIC_DBG < 3:
+            logger.info(
+                "[elastic-hook] Qwen3MoeModel.forward reached: enabled=%s tokens=%d",
+                elastic_attn_enabled(), int(hidden_states.shape[0]),
+            )
+            _ELASTIC_DBG += 1
+        if elastic_attn_enabled():
+            from vllm.distributed.elastic_attn import maybe_log_elastic_plan
+            maybe_log_elastic_plan(
+                hidden_states.shape[0],
+                hidden_states.device,
+                self.config.num_attention_heads,
+            )
 
         aux_hidden_states = self._maybe_add_hidden_state(
             [], self.start_layer, hidden_states, residual
