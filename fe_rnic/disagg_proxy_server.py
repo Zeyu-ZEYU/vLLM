@@ -298,13 +298,16 @@ async def zmq_pull_server():
 
 
 async def send_request_to_service(
-    client: httpx.AsyncClient, endpoint: str, req_data: dict
+    client: httpx.AsyncClient, endpoint: str, req_data: dict,
+    extra_headers: dict | None = None
 ):
     """
     Send a request to a service using a persistent client.
     """
 
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+    if extra_headers:
+        headers.update(extra_headers)
     response = await client.post(endpoint, json=req_data, headers=headers)
     response.raise_for_status()
     return response
@@ -441,9 +444,16 @@ async def handle_completions(request: Request):
         req_data["stream"] = False
         stream_options = req_data.pop("stream_options", None)
 
+        # Forward the DP-rank pin header (ORS oracle routing) to prefill if the
+        # client set it; absent => vLLM load-balances normally (baseline).
+        dp_rank_hdr = request.headers.get("X-data-parallel-rank")
+        prefill_headers = (
+            {"X-data-parallel-rank": dp_rank_hdr} if dp_rank_hdr is not None else None
+        )
+
         # Send request to prefill service, ignore the response
         prefill_output = await send_request_to_service(
-            prefill_client.client, "/v1/completions", req_data
+            prefill_client.client, "/v1/completions", req_data, prefill_headers
         )
 
         prefill_output = prefill_output.json()

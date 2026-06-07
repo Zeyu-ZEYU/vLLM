@@ -85,15 +85,18 @@ def pct(arr, p):
     return a[min(len(a) - 1, int(len(a) * p / 100))]
 
 
-async def one_request(client, url, model, prompt, max_tokens, stats, idx, logf, t_ref=None):
+async def one_request(client, url, model, prompt, max_tokens, stats, idx, logf,
+                      t_ref=None, dp_rank=None):
     body = {"model": model, "prompt": prompt, "max_tokens": max_tokens,
             "temperature": 0.0, "stream": True}
+    # dp_rank set => pin this request to a DP worker (ORS oracle routing).
+    headers = {"X-data-parallel-rank": str(dp_rank)} if dp_rank is not None else None
     # t_ref set => time TTFT from the request's scheduled send instant (open-loop
     # overload: counts the client-side admission wait); else from admission.
     t0 = t_ref if t_ref is not None else time.time()
     ttft = None
     try:
-        async with client.stream("POST", url, json=body) as resp:
+        async with client.stream("POST", url, json=body, headers=headers) as resp:
             resp.raise_for_status()
             async for _chunk in resp.aiter_bytes():
                 if ttft is None:
@@ -136,6 +139,9 @@ async def main():
                     help="time TTFT from the scheduled send instant (open-loop "
                          "overload), not from when the request is admitted past "
                          "--max-concurrency; lets latency diverge past saturation")
+    ap.add_argument("--dp-rank-file", default="",
+                    help="file with one DP rank per request (offline ORS oracle); "
+                         "sent as the X-data-parallel-rank header to pin routing")
     args = ap.parse_args()
 
     reqs = load_trace(args.trace, args.num_requests, args.start_index)
@@ -169,6 +175,14 @@ async def main():
     stats = {"ok": 0, "errors": 0, "ttft": [], "lat": []}
     inflight = {"n": 0, "max": 0}
     logf = open(args.out, "w") if args.out else None
+
+    dp_ranks = None
+    if args.dp_rank_file:
+        with open(args.dp_rank_file) as f:
+            dp_ranks = [int(x) for x in f if x.strip()]
+        if len(dp_ranks) < len(reqs):
+            raise SystemExit(f"dp-rank-file has {len(dp_ranks)} ranks < {len(reqs)} requests")
+        print(f"loaded {len(dp_ranks)} DP-rank pins from {args.dp_rank_file} (ORS)")
     limits = httpx.Limits(max_connections=args.max_concurrency + 32,
                           max_keepalive_connections=args.max_concurrency + 32)
     timeout = httpx.Timeout(connect=30.0, read=3600.0, write=3600.0, pool=3600.0)
@@ -181,12 +195,13 @@ async def main():
 
         async def fire(i):
             t_ref = (start + sched[i]) if args.ttft_from_arrival else None
+            dp_rank = dp_ranks[i] if dp_ranks is not None else None
             async with sem:
                 inflight["n"] += 1
                 inflight["max"] = max(inflight["max"], inflight["n"])
                 try:
                     await one_request(client, url, args.model, prompts[i][0],
-                                      prompts[i][1], stats, i, logf, t_ref)
+                                      prompts[i][1], stats, i, logf, t_ref, dp_rank)
                 finally:
                     inflight["n"] -= 1
 
