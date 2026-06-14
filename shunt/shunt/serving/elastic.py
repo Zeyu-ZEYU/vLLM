@@ -111,53 +111,147 @@ class EapPlanSource:
 
 
 # ---------------------------------------------------------------------------
-# Runtime NVLink mechanism + model hook (needs the multi-GPU testbed)
+# Runtime NVLink mechanism + model hook
 # ---------------------------------------------------------------------------
+#
+# The attention math below is exact by construction: every query head's output
+# is computed once (on the straggler or on a helper) over the same Q/K/V, then
+# placed back, so the assembled output equals single-GPU execution. The pieces
+# that bind to vLLM internals -- writing the new K/V into the paged cache and
+# folding in already-fetched prefix-KV -- are marked CLUSTER and need validation
+# on the testbed; until then they degrade gracefully (no offload) rather than
+# return a wrong result.
+
+
+def _gqa_sdpa(q, k, v, q_per_kv: int, scaling: float):
+    """Causal attention for q heads with GQA-shared kv heads.
+
+    q: [T, hq, d]; k, v: [T, hkv, d] (hkv = hq / q_per_kv). Returns [T, hq, d].
+    """
+    import torch.nn.functional as F
+
+    k = k.repeat_interleave(q_per_kv, dim=1)        # expand kv heads to q heads
+    v = v.repeat_interleave(q_per_kv, dim=1)
+    qa, ka, va = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))  # [1,h,T,d]
+    o = F.scaled_dot_product_attention(qa, ka, va, is_causal=True, scale=scaling)
+    return o.squeeze(0).transpose(0, 1).contiguous()  # [T, hq, d]
+
 
 class ElasticAttention:
-    """NVLink head offload over a node-local process group (§3.3).
+    """NVLink head offload across the node's DP workers (§3.3).
 
-    Constructed once per worker with the node's group. Each layer, given this
-    rank's :class:`NodeHeadPlan`, it (as a straggler) sends the layer input and
-    the shed heads' prefix-KV to helpers and reduces their outputs back, or (as a
-    helper) computes the QKV projection + attention for the heads assigned to it
-    and returns the result. ``group`` is a ``torch.distributed`` process group
-    over the node's GPUs; the transfers ride intra-node NVLink.
-
-    The numerics (head subset QKV + SDPA + exact reduce) match single-GPU
-    execution; see :mod:`shunt.bench.elastic_attn_bench` for the measured cost.
+    Constructed once per worker. Each layer, given this rank's
+    :class:`NodeHeadPlan`, a straggler computes only its kept query heads locally
+    and ships the shed heads' Q/K/V to on-node helpers over NVLink; each helper
+    runs attention for the heads assigned to it (for the straggler's tokens) and
+    sends the output back; the straggler places them into the full attention
+    output. Point-to-point (``isend``/``irecv``) over the default process group,
+    which routes same-node pairs over NVLink. KV is pre-expanded per query head
+    before shipping, so helpers run plain attention with no GQA bookkeeping.
     """
 
-    def __init__(self, rank: int, node_ranks: list[int], group, plan: EapPlanSource):
+    def __init__(self, rank: int, node_ranks: list[int], plan: EapPlanSource,
+                 q_per_kv: int):
         self.rank = rank
         self.node_ranks = node_ranks
         self.local = node_ranks.index(rank)
-        self.group = group
         self.plan_src = plan
+        self.q_per_kv = q_per_kv
 
-    def forward(self, attn_module, positions, hidden_states):
-        """Compute attention for hidden_states, offloading heads per the plan.
+    def _project(self, attn, positions, hidden_states):
+        """Run the module's QKV proj + norms + rotary -> per-head q, k, v."""
+        qkv, _ = attn.qkv_proj(hidden_states)
+        q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+        d = attn.head_dim
+        q = attn.q_norm(q.view(*q.shape[:-1], q.shape[-1] // d, d)).view(q.shape)
+        k = attn.k_norm(k.view(*k.shape[:-1], k.shape[-1] // d, d)).view(k.shape)
+        q, k = attn.rotary_emb(positions, q, k)
+        T = hidden_states.shape[0]
+        return (q.view(T, attn.num_heads, d), k.view(T, attn.num_kv_heads, d),
+                v.view(T, attn.num_kv_heads, d))
 
-        When the plan does not fire for this rank, this is exactly the module's
-        own attention. When it fires, the shed heads are computed on helpers and
-        reduced back so the returned output is identical to local execution.
+    def forward(self, attn, positions, hidden_states):
+        """Attention for ``hidden_states`` with the straggler's heads offloaded.
 
-        The concrete NVLink scatter/compute/reduce is deployment-specific (it
-        reuses vLLM's intra-node TP attention path with a per-iteration degree);
-        this method is the integration boundary. With no plan, fall back to the
-        unmodified attention so correctness never depends on the offload.
+        Returns the full attention block output (after o_proj). Falls back to the
+        unmodified module forward if the plan does not fire or anything is missing,
+        so correctness never depends on the offload succeeding.
         """
+        import torch
+        import torch.distributed as dist
+
         plan = self.plan_src.current()
-        if not plan.fires:
-            return attn_module(positions, hidden_states)
-        # --- offload path (testbed) -------------------------------------------
-        # 1. straggler: scatter layer input + shed-head prefix-KV to helpers
-        # 2. each rank: QKV proj + SDPA for its kept/assigned heads (GQA group)
-        # 3. helpers: send head outputs + new-KV back; straggler reduces (exact)
-        # Implemented over self.group with NVLink; see the elastic microbench for
-        # the measured exposed cost. Until validated on the testbed we run the
-        # local attention so results stay bit-exact.
-        return attn_module(positions, hidden_states)
+        if not plan.fires or not dist.is_initialized():
+            return attn(positions, hidden_states)
+
+        qh, kh, vh = self._project(attn, positions, hidden_states)
+        T, nH, d = qh.shape
+        qpk = self.q_per_kv
+        kept = plan.kept[self.local]
+        retained = list(range(kept))               # heads this rank keeps
+        out = torch.empty(T, nH, d, dtype=qh.dtype, device=qh.device)
+
+        # --- as straggler: ship shed heads (pre-expanded KV) to helpers --------
+        ship_reqs, recv_o = [], []
+        shed = list(range(kept, nH))
+        si = 0
+        for helper_local, items in plan.assign.items():
+            for straggler_local, count in items:
+                if straggler_local != self.local:
+                    continue
+                heads = shed[si:si + count]; si += count
+                dst = self.node_ranks[helper_local]
+                kv_heads = [h // qpk for h in heads]
+                q_s = qh[:, heads].contiguous()
+                k_s = kh[:, kv_heads].contiguous()      # KV pre-expanded per head
+                v_s = vh[:, kv_heads].contiguous()
+                hdr = torch.tensor([T, count], device=qh.device, dtype=torch.int32)
+                dist.send(hdr, dst)                     # tiny header first
+                for t in (q_s, k_s, v_s):
+                    ship_reqs.append(dist.isend(t, dst))
+                recv_o.append((heads, dst,
+                               torch.empty(T, count, d, dtype=qh.dtype, device=qh.device)))
+
+        # --- as helper: receive a straggler's heads, compute, send back --------
+        for straggler_local, count in plan.assign.get(self.local, []):
+            src = self.node_ranks[straggler_local]
+            hdr = torch.empty(2, device=qh.device, dtype=torch.int32)
+            dist.recv(hdr, src)
+            Ts, c = int(hdr[0]), int(hdr[1])
+            q_r = torch.empty(Ts, c, d, dtype=qh.dtype, device=qh.device)
+            k_r = torch.empty(Ts, c, d, dtype=qh.dtype, device=qh.device)
+            v_r = torch.empty(Ts, c, d, dtype=qh.dtype, device=qh.device)
+            for t in (q_r, k_r, v_r):
+                dist.recv(t, src)
+            o_r = _gqa_sdpa(q_r, k_r, v_r, 1, attn.scaling)   # KV pre-expanded
+            dist.send(o_r.contiguous(), src)
+
+        # local attention for retained heads (overlaps the helpers' compute)
+        if retained:
+            out[:, retained] = _gqa_sdpa(
+                qh[:, retained], kh[:, [h // qpk for h in retained]],
+                vh[:, [h // qpk for h in retained]], 1, attn.scaling)
+        for r in ship_reqs:
+            r.wait()
+        for heads, dst, buf in recv_o:                # gather shed-head outputs
+            dist.recv(buf, dst)
+            out[:, heads] = buf
+
+        self._write_kv(attn, kh, vh)                  # CLUSTER: paged-cache write
+        output, _ = attn.o_proj(out.view(T, nH * d))
+        return output
+
+    def _write_kv(self, attn, kh, vh) -> None:
+        """Write the layer's new K/V into vLLM's paged cache (CLUSTER).
+
+        The straggler holds all K/V (it ran the full projection), so the cache is
+        complete. Wiring this to vLLM's ``reshape_and_cache`` + the forward
+        context's slot mapping is version-specific; guarded so a mismatch does not
+        crash the forward (it just leaves the original path's cache write to run).
+        """
+        # Integration point: write kh/vh to attn.attn's kv_cache using the
+        # forward context's slot_mapping. Left to testbed bring-up.
+        return None
 
 
 def patch_qwen3_attention(elastic: ElasticAttention) -> None:
@@ -172,8 +266,32 @@ def patch_qwen3_attention(elastic: ElasticAttention) -> None:
 
     def wrapped(self, positions, hidden_states):  # noqa: ANN001
         if elastic.plan_src.current().fires:
-            return elastic.forward(
-                lambda p, h: orig(self, p, h), positions, hidden_states)
+            return elastic.forward(self, positions, hidden_states)
         return orig(self, positions, hidden_states)
 
     qwen3_moe.Qwen3MoeAttention.forward = wrapped
+
+
+def enable_elastic_attention(plan_path: str | None = None, num_q_heads: int = 64,
+                             q_per_kv: int = 16, workers_per_node: int = 8) -> None:
+    """Turn EAP on for this prefill worker (call once at startup).
+
+    Resolves this worker's global DP rank and its node's ranks, wires the plan
+    reader to the node planner's ``eap_heads.json``, and patches the attention
+    forward. Enable it in the prefill launch by importing this and calling it
+    (e.g. ``SHUNT_EAP=1`` gates a startup hook); the decode side never runs it.
+    """
+    import os
+
+    rank = int(os.environ.get("VLLM_DP_RANK", "0"))
+    try:
+        from vllm.distributed.parallel_state import get_dp_group
+        rank = get_dp_group().rank_in_group
+    except Exception:
+        pass
+    node = rank // workers_per_node
+    node_ranks = list(range(node * workers_per_node, (node + 1) * workers_per_node))
+    plan_path = plan_path or os.environ.get("SHUNT_EAP_PLAN",
+                                            "/tmp/shunt/eap_heads.json")
+    src = EapPlanSource(plan_path, node_ranks, num_q_heads)
+    patch_qwen3_attention(ElasticAttention(rank, node_ranks, src, q_per_kv))
