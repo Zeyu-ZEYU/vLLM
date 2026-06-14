@@ -73,6 +73,40 @@ def _summ(name: str, s: np.ndarray) -> str:
             f"max={mx:.2f}  frac>3x={frac3:.2%}")
 
 
+def plot(series: dict[str, np.ndarray], keys: list[str], out_prefix: str) -> None:
+    """Emit a per-iteration series PDF and a CDF PDF for the chosen metrics."""
+    from ..plots import BLUE, GREEN, RED, SUB_H, SUB_W, apply_style
+    import matplotlib.pyplot as plt
+    apply_style()
+    color = {"compute": GREEN, "inbound": RED, "outbound": BLUE}
+    label = {"compute": "Compute", "inbound": "Inbound", "outbound": "Outbound"}
+    top = max(series[k].max() for k in keys)
+
+    fig, ax = plt.subplots(figsize=(SUB_W, SUB_H))
+    for k in keys:
+        x = np.arange(1, len(series[k]) + 1)
+        ax.plot(x, series[k], color=color[k], lw=0.7, label=label[k])
+    ax.set_xlabel("Prefill iteration"); ax.set_ylabel(r"$\max/\mathrm{mean}$")
+    ax.set_xlim(1, len(series[keys[0]])); ax.set_ylim(1.0, top * 1.05)
+    ax.grid(True, lw=0.4, alpha=0.4); ax.tick_params(direction="in", length=2.5)
+    ax.legend(loc="upper right", frameon=False, handlelength=1.1)
+    fig.tight_layout(pad=0.2); fig.savefig(f"{out_prefix}_series.pdf",
+                                           bbox_inches="tight", pad_inches=0.02)
+
+    fig, ax = plt.subplots(figsize=(SUB_W, SUB_H))
+    for k in keys:
+        s = np.sort(series[k])
+        ax.plot(s, np.arange(1, len(s) + 1) / len(s), color=color[k], lw=1.2,
+                label=label[k])
+    ax.set_xlabel(r"$\max/\mathrm{mean}$"); ax.set_ylabel("CDF of iterations")
+    ax.set_xlim(1.0, top * 1.05); ax.set_ylim(0, 1); ax.set_yticks([0, 0.5, 1.0])
+    ax.grid(True, lw=0.4, alpha=0.4); ax.tick_params(direction="in", length=2.5)
+    ax.legend(loc="lower right", frameon=False, handlelength=1.1)
+    fig.tight_layout(pad=0.2); fig.savefig(f"{out_prefix}_cdf.pdf",
+                                           bbox_inches="tight", pad_inches=0.02)
+    print(f"wrote {out_prefix}_series.pdf and _cdf.pdf")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Trace imbalance analysis (Figs 6-8)")
     ap.add_argument("--trace", required=True)
@@ -81,6 +115,8 @@ def main() -> None:
     ap.add_argument("--max-windows", type=int, default=None,
                     help="cap iterations analyzed (the oracle is slow)")
     ap.add_argument("--profile", default=None, help="compute-model profile json")
+    ap.add_argument("--plot-dir", default=None,
+                    help="if set, emit Figs 6 (compute,RR), 7 (KV,RR), 8 (oracle)")
     a = ap.parse_args()
 
     model = (ComputeModel.from_profile(a.profile) if a.profile
@@ -88,11 +124,21 @@ def main() -> None:
     records = load_trace(a.trace, limit=a.limit)
     print(f"loaded {len(records)} requests")
 
+    import os
     for mode in ("roundrobin", "oracle"):
         s = imbalance_series(records, model, mode=mode, max_windows=a.max_windows)
         print(f"[{mode}]  ({len(s['compute'])} iterations)")
         for k in ("compute", "inbound", "outbound"):
             print(_summ(k, s[k]))
+        if a.plot_dir:
+            os.makedirs(a.plot_dir, exist_ok=True)
+            if mode == "roundrobin":
+                plot(s, ["compute"], os.path.join(a.plot_dir, "straggler_imbalance"))
+                plot(s, ["outbound", "inbound"],
+                     os.path.join(a.plot_dir, "kv_imbalance"))
+            else:
+                plot(s, ["compute", "outbound", "inbound"],
+                     os.path.join(a.plot_dir, "kv_imbalance_oracle"))
 
 
 if __name__ == "__main__":
