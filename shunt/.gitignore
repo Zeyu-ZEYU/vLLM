@@ -7,3 +7,4 @@ build/
 results/
 *.jsonl
 *.log
+csrc/scalability_bench
