@@ -2,160 +2,147 @@
 
 Source code for *Shunt: Balancing Compute and KV Traffic without All-to-All
 Contention in Disaggregated MoE Serving*. Shunt lowers prefill time-to-first-token
-(TTFT) for MoE serving by planning each iteration ahead of time:
+for MoE serving by planning each iteration ahead of time with three components:
 
-1. **RS** — compute-aware request scheduling at the proxy (§3.2);
-2. **EAP** — straggler-aware elastic attention parallelism (§3.3);
-3. **KVLB** — contention- and urgency-aware KV traffic load balancing (§3.4).
+- **RS** — compute-aware request scheduling at the proxy (§3.2);
+- **EAP** — straggler-aware elastic attention parallelism inside the prefill
+  engines (§3.3);
+- **KVLB** — contention- and urgency-aware KV traffic load balancing in LMCache
+  over Mooncake (§3.4).
 
-It is built on three repositories, each on a `shunt_artifact` branch:
+This README explains how to bring the whole system up on the evaluation testbed
+and run it end to end.
 
-| Repo | Branch | What Shunt adds |
-|------|--------|-----------------|
-| vLLM | `shunt_artifact` (from `main`) | the `shunt/` package: planner cores, RS proxy, EAP, harness, analyses, plotters |
-| LMCache | `shunt_artifact` (from `dev`) | `routing_backend.py` + `routing_policy.py`: the KVLB device-bound KV router |
-| Mooncake | `shunt_artifact` (from `main`) | no source change — DSCP is `MC_IB_TC`, dma-buf is a build flag |
+## Repositories
+
+Shunt spans three repositories, each on a `shunt_artifact` branch:
+
+| Repo | Branch (from) | Shunt's part |
+|------|---------------|--------------|
+| vLLM | `shunt_artifact` (`main`) | the `shunt/` package: planner cores, RS proxy, EAP, node planner, launcher/configs |
+| LMCache | `shunt_artifact` (`dev`) | `routing_backend.py` + `routing_policy.py`: the KVLB device-bound KV router |
+| Mooncake | `shunt_artifact` (`main`) | no source change — DSCP is `MC_IB_TC`, dma-buf is a build flag |
 
 Everything Shunt-specific in vLLM lives under `shunt/`; the rest of each repo is
 upstream.
 
-## Layout (`vllm/shunt/`)
+## Testbed assumed by this guide
 
-```
-shunt/                  planner package (compute model + Alg 1/2/3, validated on the trace)
-  compute_model.py      §3.1 worker/expert compute-time model
-  algorithms.py         Alg 1 RS (LPT), oracle, Alg 2 EAP, Alg 3 KVLB
-  planner.py            per-iteration RS->EAP->KVLB
-  trace.py              Qwen trace loader + prefix-reuse sim
-  serving/              RS proxy + scheduler + EAP serving integration
-  harness/              launcher, trace driver, node planner, bw sampler, configs, cleanup
-  analysis/             figure generators (Figs 5-8, 16-20)
-  bench/                GPU microbench (Fig 18)
-  plots/                shared figure style
-csrc/                   C++ planner cores + ctypes lib + Fig 19 bench
-tests/                  unit + parity tests
-docs/integration_map.md where each component hooks into the three repos
-```
+Four nodes, eight NVIDIA H20-3e GPUs each (32 GPUs), two RoCEv2 fabrics per node
+(per-GPU backend RNIC ports + one host-attached frontend RNIC). The deployment:
 
-## Setup
+- **2 prefill nodes** form one DP=16, EP=16, TP=1 job (16 GPUs);
+- **2 decode nodes**, each an independent DP=8, EP=8, TP=1 job;
+- the model is Qwen3-235B-A22B.
+
+## Setup (each node)
 
 ```bash
-# 1. check out the three branches (worktrees or clones)
-git -C vllm    checkout shunt_artifact
-git -C LMCache checkout shunt_artifact
+# check out the three branches (worktrees or clones)
+git -C vLLM     checkout shunt_artifact
+git -C LMCache  checkout shunt_artifact
 git -C Mooncake checkout shunt_artifact
 
-# 2. build the C++ planner cores (needs a C++17 compiler)
-make -C vllm/shunt/csrc            # -> libshunt.so (ctypes) + scalability_bench
+# build the planner core (libshunt.so) used at runtime by the RS proxy and the
+# node planner; needs a C++17 compiler
+make -C vLLM/shunt/csrc
 
-# 3. Python deps for the analyses/driver (numpy, matplotlib, aiohttp)
-pip install numpy matplotlib aiohttp
-
-# 4. for the live system, install the three packages on the testbed as usual
-#    (vLLM + LMCache from source on shunt_artifact; Mooncake via pip, built with
-#     -DWITH_NVIDIA_PEERMEM=OFF -DUSE_CUDA=ON for dma-buf GPU-direct)
+# install the stack: vLLM + LMCache from source on shunt_artifact; Mooncake via
+# pip built with dma-buf GPU-direct
+#   (cmake ... -DWITH_NVIDIA_PEERMEM=OFF -DUSE_CUDA=ON)
+# and the proxy/driver deps:
+pip install -e vLLM/shunt[serving]    # numpy, matplotlib, aiohttp
 ```
 
-Run the tests (no GPU needed):
+## Bringing the system up
+
+Always set the DSCP split so the MoE A2A wins the wire over KV: NCCL marks the
+A2A high (`NCCL_IB_TC`), Mooncake marks KV low (`MC_IB_TC`); DSCP = traffic
+class >> 2. NICs and switches must trust DSCP (`mlnx_qos --trust=dscp`, strict
+ETS); PFC keeps both classes lossless. `launch.sh` sets these for you.
+
+### 1. Prefill (2 nodes, one DP=16/EP=16 job)
+
+On each prefill node (`NODE_RANK` 0 and 1):
 
 ```bash
-cd vllm/shunt
-PYTHONPATH=. python tests/test_planner.py
-PYTHONPATH=. python tests/test_scheduler.py
-PYTHONPATH=. python tests/test_elastic.py
-PYTHONPATH=. python tests/test_native_parity.py     # after `make -C csrc`
-```
-
-## Reproducing the figures
-
-`TRACE=path/to/qwen_traceB_blksz_16.jsonl.xz` throughout. Three tracks by where
-each experiment runs:
-
-### A. Single machine, CPU only — no cluster needed
-
-| Figure | What | Command |
-|--------|------|---------|
-| 5 | trace I/O length CDF | `python -m shunt.analysis.trace_stats --trace $TRACE --out fig5.pdf` |
-| 6, 7, 8 | compute / KV imbalance, round-robin and oracle | `python -m shunt.analysis.imbalance --trace $TRACE --plot-dir figs/` |
-| 19 | RS/EAP/KVLB decision cost vs DP workers | `./csrc/scalability_bench > r.txt && python -m shunt.analysis.scalability --results r.txt --out fig19.pdf` |
-
-The imbalance run prints, and Figs 6-8 reproduce, the paper's Measurement numbers
-exactly: round-robin compute max/mean 2.56×/11.39×, inbound 1.49×/2.54×, outbound
-1.93×/5.49×; under the oracle compute stays 11.17× worst (16.9% of iterations
->3×), outbound drops to 4.52×, and inbound *worsens* to 3.35×.
-
-### B. One multi-GPU node (8 GPUs)
-
-| Figure | What | Command |
-|--------|------|---------|
-| 18 | elastic-attention NVLink overhead | `torchrun --nproc_per_node=8 -m shunt.bench.elastic_attn_bench --out e.jsonl` then `python -m shunt.analysis.elastic_overhead --results e.jsonl --out fig18.pdf` |
-
-### C. Full 4-node RoCE testbed — the live system
-
-Deploy (see *Running the system* below), drive the trace, then plot.
-
-| Figure | What | How |
-|--------|------|-----|
-| 9 | backend RNIC near-saturation | `shunt.harness.bw_sampler` on a prefill + a decode node during serving |
-| 10 | TTFT cost of A2A↔KV contention | run baseline vs the no-contention KVLB mode (`shunt_no_contention`), `shunt.analysis.ttft box` |
-| 11 | frontend RNIC idle | `shunt.harness.bw_sampler` on the frontend NIC |
-| 16 | overall TTFT + load (Baseline/ORS/Shunt/Sh-ORS) | drive each config, `shunt.analysis.ttft box` and `... load` |
-| 17 | leave-one-out ablation (/RS, /EAP, /KVLB) | drive each arm, `shunt.analysis.ttft` |
-| 20 | θ sensitivity | drive Shunt at θ∈{1,1.5,2,2.5,3}, `shunt.analysis.theta` |
-
-## Running the system
-
-The proxy runs RS and publishes the per-iteration EAP+KVLB plans; vLLM serves
-prefill (DP=16/EP=16/TP=1 across two nodes) and decode (DP=8/EP=8/TP=1 per node);
-LMCache routes KV across the NICs through Mooncake; the MoE A2A and KV ride
-different DSCP classes so the A2A always wins the wire.
-
-```bash
-# prefill node 0 and 1 (NODE_RANK 0/1), one DP=16/EP=16 job:
-MODEL=$HOME/models/Qwen3-235B-A22B MASTER_ADDR=prefill0 NODE_RANK=0 \
+MODEL=$HOME/models/Qwen3-235B-A22B MASTER_ADDR=<prefill-node-0> NODE_RANK=0 \
   ./shunt/harness/launch.sh prefill
-# decode nodes:
-./shunt/harness/launch.sh decode
-# proxy (edit configs/proxy.example.json with the node URLs + mode):
-PROXY_CONFIG=my-proxy.json ./shunt/harness/launch.sh proxy
-# drive the trace:
-python -m shunt.harness.trace_replay --trace $TRACE --url http://proxy:8000 \
-  --concurrency 512 --out shunt.jsonl          # closed loop (TTFT dist)
-python -m shunt.harness.trace_replay --trace $TRACE --rate 12 --out shunt_r12.jsonl  # open loop
 ```
 
-The four configurations and ablation arms are selected by the proxy config
-(`mode` = `shunt`/`baseline`/`ors`, plus `enable_eap`/`enable_kvlb`):
+This serves with `--data-parallel-size 16 --enable-expert-parallel
+--tensor-parallel-size 1`, the LMCache KV producer, and the prefill LMCache
+config (`configs/lmcache-prefill.yaml`) that enables KVLB.
 
-| Config | mode | enable_eap | enable_kvlb |
-|--------|------|-----------|------------|
-| Baseline | baseline | false | false |
-| ORS | ors | false | false |
-| **Shunt** | shunt | true | true |
-| Sh-ORS | ors | true | true |
-| /RS | baseline | true | true |
-| /EAP | shunt | false | true |
-| /KVLB | shunt | true | false |
+### 2. Decode (2 nodes, independent DP=8/EP=8 each)
 
-Always `clean.sh` then `clean_host.sh` and wait ~60 s for TIME_WAIT before the
-next run.
+```bash
+./shunt/harness/launch.sh decode
+```
 
-### DSCP priority (no Mooncake source change)
+### 3. Proxy (runs RS, publishes the EAP + KVLB plans)
 
-The launcher sets `NCCL_IB_TC` (A2A, high class) and `MC_IB_TC` (KV, low class);
-DSCP = traffic class >> 2. NICs and switches must trust DSCP (`mlnx_qos
---trust=dscp`, strict ETS). The two classes are lossless under PFC.
+Copy `configs/proxy.example.json`, fill in the prefill/decode node URLs, and pick
+the mode (below), then:
 
-## Notes
+```bash
+PROXY_CONFIG=my-proxy.json ./shunt/harness/launch.sh proxy
+```
 
-- **The planner is verified against the paper.** The compute model, trace
-  reconstruction, RS/oracle, EAP head split, and KVLB allocation reproduce the
-  Measurement numbers exactly and pass C++↔Python parity.
-- **Microsecond costs are machine-dependent.** Fig 19's absolute RS/EAP/KVLB
-  times depend on the CPU; the paper pins a Xeon core. The shape (RS ~linear to
-  8 K workers, EAP/KVLB flat and sub-µs) is the claim and is reproduced.
-- **The live-serving figures need the RoCE testbed.** Figs 9-11 and 16-17/20 are
-  produced by the deployed system; the analyses here consume its output JSONL.
-- The elastic-attention serving path (`serving/elastic.py`) falls back to local
-  attention until validated on the multi-GPU testbed; its NVLink cost is measured
-  standalone by Fig 18.
+### 4. Drive a run
+
+```bash
+python -m shunt.harness.trace_replay \
+  --trace qwen_traceB_blksz_16.jsonl.xz --url http://<proxy>:8000 \
+  --concurrency 512 --out run.jsonl
+```
+
+The driver replays the production trace (reconstructing reuse-preserving prompts
+so prefix caching hits), passes each request's prefix/fresh-token counts to the
+proxy, and records TTFT.
+
+Between runs: `clean.sh` (in container) then `clean_host.sh`, and wait ~60 s for
+TIME_WAIT to drain.
+
+## How each component runs
+
+- **RS (proxy).** The proxy coalesces admitted requests into per-tick batches and
+  assigns each to a prefill DP worker with the longest-processing-time rule (the
+  C++ core in `libshunt.so`), pricing requests by the compute they add. It pins
+  the prefill onto that worker (per-rank URL or the `X-data-parallel-rank` hint).
+
+- **EAP (prefill engines).** Each iteration the proxy's node planner writes
+  `eap_heads.json` — the post-split query-head count per worker. Inside the
+  prefill forward, a straggler worker offloads its extra query heads to underloaded
+  on-node helper GPUs over NVLink, which compute those heads and reduce the result
+  back exactly; it triggers only above the straggler threshold θ (default 1.5).
+  This runs within each prefill node as part of live serving (`serving/elastic.py`,
+  hooked into `Qwen3MoeAttention.forward`).
+
+- **KVLB (LMCache + Mooncake).** The node planner also writes per-worker
+  `kvlb_plan_w*.json` — the per-NIC byte budget for inbound and outbound KV. The
+  LMCache routing backend (`RoutingBackend`) binds one Mooncake backend per RDMA
+  NIC (each worker's own backend port first, the node's other ports next, the
+  frontend last) and routes each KV chunk per that plan, keeping KV inside the
+  MoE-free compute window and spilling overflow to spare ports and the idle
+  frontend. The A2A keeps strict priority via the DSCP classes above.
+
+## Configurations
+
+The proxy config selects the scheduling mode and which node-local components run,
+so the same deployment serves the full system and its variants:
+
+| Config | `mode` | `enable_eap` | `enable_kvlb` |
+|--------|--------|-------------|--------------|
+| Baseline | `baseline` | false | false |
+| ORS | `ors` | false | false |
+| **Shunt** | `shunt` | true | true |
+| Sh-ORS | `ors` | true | true |
+| /RS | `baseline` | true | true |
+| /EAP | `shunt` | false | true |
+| /KVLB | `shunt` | true | false |
+
+`ors` mode reads a precomputed assignment from `ors_rank_file`.
+
+`docs/integration_map.md` records exactly where each component hooks into vLLM,
+LMCache, and Mooncake.
