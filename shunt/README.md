@@ -114,10 +114,11 @@ TIME_WAIT to drain.
 - **EAP (prefill engines).** Each iteration the proxy's node planner writes
   `eap_heads.json` — the post-split query-head count per worker. Inside the
   prefill forward, a straggler worker offloads its extra query heads to underloaded
-  on-node helper GPUs over NVLink, which compute those heads and reduce the result
-  back exactly; it triggers only above the straggler threshold θ (default 1.5).
-  This runs within each prefill node as part of live serving (`serving/elastic.py`,
-  hooked into `Qwen3MoeAttention.forward`).
+  on-node helper GPUs over NVLink (point-to-point, GQA-aware, exact), which compute
+  those heads and return the output; it triggers only above the straggler threshold
+  θ (default 1.5). Enable it per prefill worker at startup with
+  `shunt.serving.elastic.enable_elastic_attention()`, which patches
+  `Qwen3MoeAttention.forward`; the decode side never runs it.
 
 - **KVLB (LMCache + Mooncake).** The node planner also writes per-worker
   `kvlb_plan_w*.json` — the per-NIC byte budget for inbound and outbound KV. The
