@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shunt"
+version = "0.1.0"
+description = "Shunt: balancing compute and KV traffic without A2A contention in disaggregated MoE serving"
+requires-python = ">=3.10"
+dependencies = ["numpy", "matplotlib"]
+
+[project.optional-dependencies]
+serving = ["aiohttp"]          # the RS proxy and trace driver
+
+[tool.setuptools]
+packages = ["shunt", "shunt.analysis", "shunt.serving", "shunt.harness",
+            "shunt.bench", "shunt.plots"]
+
+# The C++ planner cores (csrc/) are built separately: `make -C csrc`.
