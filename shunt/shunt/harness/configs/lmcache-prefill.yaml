@@ -1,0 +1,36 @@
+# LMCache config for a Shunt PREFILL worker (§4.1).
+#
+# KV streams layer by layer through Mooncake. The Shunt KVLB routing backend
+# (shunt_kvlb_enabled) binds one Mooncake backend per RDMA NIC and routes each
+# chunk per the node planner's per-iteration plan. KV rides a low-priority DSCP
+# class (MC_IB_TC, set in the launcher env); the MoE A2A rides a high class
+# (NCCL_IB_TC), so the A2A always wins the wire.
+#
+# Placeholders in <ANGLE_BRACKETS> are filled per worker by launch.sh.
+
+chunk_size: 256              # KV chunk span (tokens), = §3.1 chunk
+local_cpu: true
+max_local_cpu_size: 32.0     # GB pinned CPU staging pool (GPU<->CPU<->RDMA)
+use_layerwise: true          # overlap KV transfer with prefill, one layer at a time
+
+extra_config:
+  # --- Shunt KVLB ---
+  shunt_kvlb_enabled: true
+  # One entry per backend port a GPU is pinned to (workers_per_node of them, so
+  # KVLB's per-port plan lines up), then the frontend NIC LAST. On this testbed
+  # the 8 GPUs share 4 LACP bonds (2 ports each), so each bond appears twice.
+  # The routing backend rotates this per DP rank so each worker's own port is
+  # first, the rest (borrowable, nearest first) after, frontend last (§3.4).
+  shunt_kvlb_devices: ["mlx5_bond_0", "mlx5_bond_0", "mlx5_bond_1", "mlx5_bond_1",
+                       "mlx5_bond_2", "mlx5_bond_2", "mlx5_bond_3", "mlx5_bond_3",
+                       "mlx5_0"]
+  # node planner writes {"inbound":[...],"outbound":[...]} here each iteration;
+  # omit (or set shunt_kvlb_static: own) to disable offload (the /KVLB arm).
+  shunt_kvlb_plan_path: "/tmp/shunt/kvlb_plan_<WORKER>.json"
+
+  # --- Mooncake transfer engine (device_name is set per child by KVLB) ---
+  mooncake_local_buffer_size: "4294967296"        # 4 GB
+  mooncake_global_segment_size: "34359738368"     # 32 GB pool
+  mooncake_protocol: "rdma"
+  mooncake_master_server_address: "<MOONCAKE_MASTER>"
+  mooncake_metadata_server: "<METADATA_SERVER>"

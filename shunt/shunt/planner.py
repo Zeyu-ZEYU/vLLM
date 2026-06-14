@@ -18,21 +18,38 @@ def plan_iteration(requests: list[Request], model: ComputeModel,
                    use_oracle: bool = False,
                    enable_eap: bool = True, enable_kvlb: bool = True
                    ) -> IterationPlan:
-    """Compute the full plan for one prefill iteration.
+    """Compute the full plan for one prefill iteration (RS -> EAP -> KVLB).
 
     ``enable_eap`` / ``enable_kvlb`` and ``use_oracle`` select the ablation arms
     of §4.3 (/EAP, /KVLB, and the ORS / Sh-ORS scheduling variants).
+    """
+    G = testbed.ep_group_workers
+    for r in requests:
+        r.compute_time = model.worker_compute_time(r.prefix_tokens, r.fresh_tokens)
+    ctimes = [r.compute_time for r in requests]
+    worker_of = (optimal_oracle(ctimes, G) if use_oracle else lpt_schedule(ctimes, G))
+    return plan_from_assignment(requests, worker_of, model, testbed, theta,
+                                enable_eap, enable_kvlb)
+
+
+def plan_from_assignment(requests: list[Request], worker_of: list[int],
+                         model: ComputeModel, testbed: TestbedConfig = TESTBED,
+                         theta: float = 1.5, enable_eap: bool = True,
+                         enable_kvlb: bool = True) -> IterationPlan:
+    """Run the node-local steps (EAP, KVLB) over an already-chosen assignment.
+
+    The proxy picks the worker for each request (RS, ORS, or round-robin); this
+    completes the plan for that assignment, so the same code serves every
+    scheduling mode. ``worker_of[i]`` is the worker for ``requests[i]``.
     """
     G = testbed.ep_group_workers
     wpn = testbed.workers_per_node
     nodes = testbed.num_prefill_nodes
     H = model.model.num_q_heads
 
-    # --- RS: place requests on workers by the compute they add (Alg. 1) --------
     for r in requests:
-        r.compute_time = model.worker_compute_time(r.prefix_tokens, r.fresh_tokens)
-    ctimes = [r.compute_time for r in requests]
-    worker_of = (optimal_oracle(ctimes, G) if use_oracle else lpt_schedule(ctimes, G))
+        if not r.compute_time:
+            r.compute_time = model.worker_compute_time(r.prefix_tokens, r.fresh_tokens)
     assignment = {r.req_id: worker_of[i] for i, r in enumerate(requests)}
 
     # --- per-worker aggregates -------------------------------------------------

@@ -14,13 +14,13 @@ from __future__ import annotations
 from .algorithms import allocate_offload, balance_heads, lpt_schedule, optimal_oracle
 from .compute_model import ComputeModel
 from .config import MODEL, TESTBED, ModelConfig, TestbedConfig
-from .planner import plan_iteration
+from .planner import plan_from_assignment, plan_iteration
 from .trace import load_trace, to_requests
 from .types import DirectionPlan, IterationPlan, Request
 
 __all__ = [
     "ComputeModel", "ModelConfig", "TestbedConfig", "MODEL", "TESTBED",
     "lpt_schedule", "optimal_oracle", "balance_heads", "allocate_offload",
-    "plan_iteration", "load_trace", "to_requests",
+    "plan_iteration", "plan_from_assignment", "load_trace", "to_requests",
     "Request", "IterationPlan", "DirectionPlan",
 ]

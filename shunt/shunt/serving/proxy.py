@@ -53,6 +53,13 @@ class Proxy:
         self.queue: asyncio.Queue = asyncio.Queue()
         self._decode_rr = itertools.cycle(range(len(self.decode_urls)))
         self.session: aiohttp.ClientSession | None = None
+        # node-local planning (EAP + KVLB); switch the arms of §4.3 here
+        self.model = model
+        self.publish_plan = cfg.get("publish_plan", cfg.get("mode") != "baseline")
+        self.enable_eap = cfg.get("enable_eap", True)
+        self.enable_kvlb = cfg.get("enable_kvlb", True)
+        self.theta = cfg.get("theta", 1.5)
+        self.plan_dir = cfg.get("plan_dir", "/tmp/shunt")
 
     # --- per-tick batched scheduling (one RS pass per tick) --------------------
 
@@ -63,10 +70,27 @@ class Proxy:
             await asyncio.sleep(self.sched_tick_s)
             while not self.queue.empty() and len(batch) < self.sched_batch:
                 batch.append(self.queue.get_nowait())
-            assign = self.scheduler.assign_batch([b[0] for b in batch])
+            items = [b[0] for b in batch]
+            assign = self.scheduler.assign_batch(items)
+            if self.publish_plan:
+                self._publish(items, assign)
             for item, fut in batch:
                 if not fut.done():
                     fut.set_result(assign[item.req_id])
+
+    def _publish(self, items: list[SchedItem], assign: dict[str, int]) -> None:
+        """Turn the assignment into the node-local EAP + KVLB plan files."""
+        from ..harness import node_planner
+        from ..types import Request
+        reqs = [Request(it.req_id, it.prefix_tokens, it.fresh_tokens)
+                for it in items]
+        worker_of = [assign[it.req_id] for it in items]
+        try:
+            node_planner.publish(reqs, worker_of, self.model, self.plan_dir,
+                                 enable_eap=self.enable_eap,
+                                 enable_kvlb=self.enable_kvlb, theta=self.theta)
+        except Exception:  # planning must never stall request routing
+            pass
 
     async def _schedule(self, item: SchedItem) -> int:
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
