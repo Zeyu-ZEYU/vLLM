@@ -1,10 +1,10 @@
 # Shunt integration map
 
 Where each Shunt component hooks into the upstream stack. File paths are relative
-to each repo's `shunt_artifact` worktree root. Captured from a fresh code survey
-of vLLM @ `1c607d7b2`, LMCache @ `140990dc`, Mooncake @ `b0bda8c`.
+to each repo's subdirectory below. Captured from a fresh code survey of
+vLLM @ `1c607d7b2`, LMCache @ `140990dc`, Mooncake @ `b0bda8c`.
 
-## vLLM (`~/zeyu/vLLM/shunt_artifact`)
+## vLLM (`vllm/`)
 
 ### RS — compute-aware request scheduling (proxy)
 - Dispatch lives in a **proxy**, not vLLM core. Upstream ships only an example
@@ -40,7 +40,7 @@ of vLLM @ `1c607d7b2`, LMCache @ `140990dc`, Mooncake @ `b0bda8c`.
   rides whatever NCCL is told. KV rides `MC_IB_TC` (low class), set on the
   Mooncake side. Both live in the launcher env.
 
-## LMCache (`~/zeyu/LMCache/shunt_artifact`)
+## LMCache (`lmcache/`)
 
 ### KVLB — routing backend (NEW; does not exist upstream)
 - Build `lmcache/v1/storage_backend/routing_backend.py` implementing
@@ -60,7 +60,7 @@ of vLLM @ `1c607d7b2`, LMCache @ `140990dc`, Mooncake @ `b0bda8c`.
 - Config via `LMCacheEngineConfig` (`lmcache/v1/config.py`): `extra_config`,
   `remote_storage_plugins`, `chunk_size` (256).
 
-## Mooncake (`~/zeyu/Mooncake/shunt_artifact`)
+## Mooncake (`mooncake/`)
 
 **No source change required.**
 - DSCP: `MC_IB_TC` env → `mooncake-transfer-engine/src/config.cpp:352` →
