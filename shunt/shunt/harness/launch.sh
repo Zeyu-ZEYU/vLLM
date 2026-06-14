@@ -25,6 +25,7 @@ NCCL_IB_TC="${NCCL_IB_TC:-96}"          # A2A high class  (DSCP 24)
 export MC_IB_TC="${MC_IB_TC:-32}"        # KV  low  class  (DSCP 8)
 export NCCL_IB_TC
 export VLLM_USE_V1=1
+export SHUNT_GPU_DIRECT=1                 # KV rides dma-buf GPU-direct, no host staging
 
 lmcache_producer='{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_producer","kv_connector_extra_config":{"discard_partial_chunks":false}}'
 lmcache_consumer='{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_consumer","kv_connector_extra_config":{"discard_partial_chunks":false}}'

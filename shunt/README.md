@@ -126,7 +126,11 @@ TIME_WAIT to drain.
   NIC (each worker's own backend port first, the node's other ports next, the
   frontend last) and routes each KV chunk per that plan, keeping KV inside the
   MoE-free compute window and spilling overflow to spare ports and the idle
-  frontend. The A2A keeps strict priority via the DSCP classes above.
+  frontend. Transfers are GPU-direct: the prefill GPU's KV memory is registered
+  with Mooncake via dma-buf, so inbound prefix-KV is read by one-sided RDMA
+  straight into the prefill GPU and outbound new-KV is written by one-sided RDMA
+  straight from it into the decode node's Mooncake segment. The A2A keeps strict
+  priority via the DSCP classes above.
 
 ## Configurations
 
