@@ -1,21 +1,27 @@
-"""Shunt disaggregated-serving proxy (§4.1).
+"""The Shunt proxy for prefill-decode disaggregated serving.
 
-Replaces vLLM's round-robin disagg proxy with compute-aware request scheduling.
-Incoming OpenAI-compatible requests are coalesced into per-tick batches, assigned
-to prefill DP workers by :class:`RequestScheduler`, then driven through the
-standard 1P/1D prefill->decode handshake (vLLM v1 + LMCache + Mooncake).
+For every OpenAI ``/v1/completions`` request it:
 
-The driver (``shunt.harness.trace_replay``) sends each request's reused-prefix
-and fresh-token counts in ``X-Shunt-Prefix-Tokens`` / ``X-Shunt-Fresh-Tokens`` so
-the scheduler can price it exactly; without them we fall back to the prompt
-length (prefix unknown).
+1. places the request on a prefill DP rank (:mod:`shunt.serving.placement`) and
+   pins it there with vLLM's ``X-data-parallel-rank`` header;
+2. runs the prefill with ``max_tokens=1`` and streams that first token to the
+   client as soon as the prefill returns it;
+3. hands the request to a decode instance (round-robin) and streams the rest
+   of the output, dropping the decode's repeat of the first token.
 
-Run::
+Each request is logged as one JSON line (``log`` in the config). The trace
+driver passes a request's estimated prefix and fresh tokens in
+``X-Shunt-Prefix-Tokens`` / ``X-Shunt-Fresh-Tokens`` and its trace index in
+``X-Shunt-Request-Id``.
+
+Usage::
 
     python -m shunt.serving.proxy --config proxy.json
 
-where the JSON gives the prefill URLs (one per DP rank), decode URLs, mode, and
-the compute profile. See shunt/harness for the launcher that starts the engines.
+Config keys: ``prefill_url``, ``prefill_ranks``, ``decode_urls``,
+``placement``, ``shunt_config`` (model and deployment for the compute
+estimates), and optionally ``tick_ms``, ``oracle_file``, ``kv_events``
+(one ZMQ endpoint per prefill DP rank), ``lb_factor``, ``log``, ``port``.
 """
 from __future__ import annotations
 
@@ -29,165 +35,168 @@ import uuid
 import aiohttp
 from aiohttp import web
 
+from .. import algorithms, native
 from ..compute_model import ComputeModel
-from ..config import TESTBED
-from .scheduler import RequestScheduler, SchedItem
+from ..config import ShuntConfig
+from .placement import Placement
 
 
 class Proxy:
     def __init__(self, cfg: dict):
-        self.prefill_urls: list[str] = cfg["prefill_urls"]
-        self.decode_urls: list[str] = cfg["decode_urls"]
-        self.num_workers = cfg.get("num_workers", TESTBED.ep_group_workers)
-        model = (ComputeModel.from_profile(cfg["compute_profile"])
-                 if cfg.get("compute_profile") else ComputeModel.default())
-        ors_ranks = None
-        if cfg.get("ors_rank_file"):
-            with open(cfg["ors_rank_file"]) as f:
-                ors_ranks = [int(x) for x in f.read().split()]
-        self.scheduler = RequestScheduler(
-            self.num_workers, model, mode=cfg.get("mode", "shunt"),
-            ors_ranks=ors_ranks)
-        self.sched_tick_s = cfg.get("sched_tick_ms", 2.0) / 1000.0
-        self.sched_batch = cfg.get("sched_batch", 512)
-        self.queue: asyncio.Queue = asyncio.Queue()
+        self.cfg = cfg
+        self.prefill_url = cfg["prefill_url"].rstrip("/")
+        self.num_ranks = int(cfg["prefill_ranks"])
+        self.decode_urls = [u.rstrip("/") for u in cfg["decode_urls"]]
         self._decode_rr = itertools.cycle(range(len(self.decode_urls)))
+        sc = ShuntConfig.from_json(cfg["shunt_config"]) if cfg.get("shunt_config") \
+            else ShuntConfig()
+        self.cm = ComputeModel.from_profile(sc.compute_profile, sc.model, sc.deploy)
+        lpt = native.lpt_schedule if native.available() else algorithms.lpt_schedule
+        oracle = None
+        if cfg.get("oracle_file"):
+            with open(cfg["oracle_file"]) as f:
+                oracle = {str(k): int(v) for k, v in json.load(f).items()}
+        kv_index = None
+        if cfg.get("kv_events"):
+            from .kv_index import KVIndex
+
+            kv_index = KVIndex(self.num_ranks)
+            kv_index.subscribe(cfg["kv_events"], cfg.get("kv_events_topic", ""))
+        self.placement = Placement(
+            cfg.get("placement", "rr"), self.num_ranks, lpt,
+            tick_s=float(cfg.get("tick_ms", 2.0)) / 1e3, oracle=oracle,
+            kv_index=kv_index, lb_factor=float(cfg.get("lb_factor", 1.5)))
+        self.log = open(cfg["log"], "a", buffering=1) if cfg.get("log") else None
         self.session: aiohttp.ClientSession | None = None
-        # node-local planning (EAP + KVLB); switch the arms of §4.3 here
-        self.model = model
-        self.publish_plan = cfg.get("publish_plan", cfg.get("mode") != "baseline")
-        self.enable_eap = cfg.get("enable_eap", True)
-        self.enable_kvlb = cfg.get("enable_kvlb", True)
-        self.theta = cfg.get("theta", 1.5)
-        self.plan_dir = cfg.get("plan_dir", "/tmp/shunt")
 
-    # --- per-tick batched scheduling (one RS pass per tick) --------------------
+    # --- lifecycle -----------------------------------------------------------------
 
-    async def scheduler_loop(self) -> None:
-        while True:
-            first = await self.queue.get()
-            batch = [first]
-            await asyncio.sleep(self.sched_tick_s)
-            while not self.queue.empty() and len(batch) < self.sched_batch:
-                batch.append(self.queue.get_nowait())
-            items = [b[0] for b in batch]
-            assign = self.scheduler.assign_batch(items)
-            if self.publish_plan:
-                self._publish(items, assign)
-            for item, fut in batch:
-                if not fut.done():
-                    fut.set_result(assign[item.req_id])
+    async def on_startup(self, app) -> None:
+        conn = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
+        self.session = aiohttp.ClientSession(
+            connector=conn, timeout=aiohttp.ClientTimeout(total=None))
+        self.placement.start()
 
-    def _publish(self, items: list[SchedItem], assign: dict[str, int]) -> None:
-        """Turn the assignment into the node-local EAP + KVLB plan files."""
-        from ..harness import node_planner
-        from ..types import Request
-        reqs = [Request(it.req_id, it.prefix_tokens, it.fresh_tokens)
-                for it in items]
-        worker_of = [assign[it.req_id] for it in items]
-        try:
-            node_planner.publish(reqs, worker_of, self.model, self.plan_dir,
-                                 enable_eap=self.enable_eap,
-                                 enable_kvlb=self.enable_kvlb, theta=self.theta)
-        except Exception:  # planning must never stall request routing
-            pass
+    async def on_cleanup(self, app) -> None:
+        if self.session is not None:
+            await self.session.close()
+        if self.log is not None:
+            self.log.close()
 
-    async def _schedule(self, item: SchedItem) -> int:
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        await self.queue.put((item, fut))
-        return await fut
-
-    # --- request handling ------------------------------------------------------
+    # --- request path --------------------------------------------------------------
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
+        t_arrive = time.time()
         body = await request.json()
-        req_id = body.get("request_id") or f"shunt-{uuid.uuid4().hex[:16]}"
+        rid = request.headers.get("X-Shunt-Request-Id") or uuid.uuid4().hex[:16]
+        prompt = body.get("prompt")
+        tokens = prompt if isinstance(prompt, list) and prompt and \
+            isinstance(prompt[0], int) else None
         prefix = int(request.headers.get("X-Shunt-Prefix-Tokens", 0))
         fresh = int(request.headers.get("X-Shunt-Fresh-Tokens", 0)) or \
-            self._estimate_fresh(body)
-        dp_rank = await self._schedule(SchedItem(req_id, prefix, fresh))
-        return await self._forward_pd(request, body, req_id, dp_rank)
+            (len(tokens) if tokens else 1)
+        est = self.cm.worker_time(prefix, fresh)
+        rank = await self.placement.place(rid, est, tokens)
+        rec = {"id": rid, "rank": rank, "prefix": prefix, "fresh": fresh,
+               "est_s": est, "t_arrive": t_arrive, "t_placed": time.time()}
 
-    def _estimate_fresh(self, body: dict) -> int:
-        p = body.get("prompt") or body.get("messages")
-        if isinstance(p, str):
-            return max(1, len(p) // 4)   # ~4 chars/token, prefix unknown
-        return 1
-
-    def _prefill_target(self, dp_rank: int) -> tuple[str, dict]:
-        """URL + extra headers to land the prefill on the chosen DP worker."""
-        if len(self.prefill_urls) == self.num_workers:
-            return self.prefill_urls[dp_rank], {}        # one engine per rank
-        url = self.prefill_urls[dp_rank % len(self.prefill_urls)]
-        return url, {"X-data-parallel-rank": str(dp_rank)}  # DP engine honors hint
-
-    async def _forward_pd(self, request: web.Request, body: dict, req_id: str,
-                          dp_rank: int) -> web.StreamResponse:
-        assert self.session is not None
-        path = request.path
-        prefill_url, extra = self._prefill_target(dp_rank)
-        decode_url = self.decode_urls[next(self._decode_rr)]
-
-        # Phase 1: prefill one token, hand KV to the decode side via Mooncake.
-        pf_body = dict(body)
-        pf_body["max_tokens"] = 1
-        pf_body["request_id"] = req_id
-        pf_body["kv_transfer_params"] = {
-            "do_remote_decode": True, "do_remote_prefill": False,
-            "remote_engine_id": None, "remote_block_ids": None,
-        }
-        async with self.session.post(prefill_url + path, json=pf_body,
-                                     headers=extra) as pf:
-            pf_json = await pf.json()
-        kvt = pf_json.get("kv_transfer_params", {})
-
-        # Phase 2: decode reads the KV and streams the completion to the client.
-        dec_body = dict(body)
-        dec_body["request_id"] = req_id
-        dec_body["kv_transfer_params"] = {
-            "do_remote_decode": False, "do_remote_prefill": True, **kvt,
-        }
-        resp = web.StreamResponse()
-        resp.headers["Content-Type"] = "text/event-stream"
+        resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await resp.prepare(request)
-        async with self.session.post(decode_url + path, json=dec_body) as dec:
-            async for chunk in dec.content.iter_any():
-                await resp.write(chunk)
+        self.placement.started(rank, est)
+        try:
+            first, kvp = await self._prefill(body, rid, rank)
+        except Exception as e:  # noqa: BLE001
+            self.placement.finished(rank, est)
+            rec["error"] = f"prefill: {e}"
+            self._write(rec)
+            await resp.write_eof()
+            return resp
+        self.placement.finished(rank, est)
+        rec["t_first"] = time.time()
+        await resp.write(_sse({"id": rid, "object": "text_completion",
+                               "choices": [{"index": 0, "text": first,
+                                            "finish_reason": None}]}))
+        n_out = 1
+        max_tokens = int(body.get("max_tokens", 16))
+        if max_tokens > 1:
+            try:
+                n_out += await self._decode(body, rid, kvp, resp, rec)
+            except Exception as e:  # noqa: BLE001
+                rec["error"] = f"decode: {e}"
+        rec["t_last"] = time.time()
+        rec["n_out"] = n_out
+        await resp.write(b"data: [DONE]\n\n")
         await resp.write_eof()
+        self._write(rec)
         return resp
 
-    # --- lifecycle -------------------------------------------------------------
+    async def _prefill(self, body: dict, rid: str, rank: int) -> tuple[str, dict]:
+        pf = dict(body)
+        pf.update({"max_tokens": 1, "stream": False, "request_id": rid + "-p"})
+        pf.pop("stream_options", None)
+        pf["kv_transfer_params"] = {"do_remote_decode": True,
+                                    "do_remote_prefill": False,
+                                    "remote_engine_id": None,
+                                    "remote_block_ids": None}
+        headers = {"X-data-parallel-rank": str(rank)}
+        async with self.session.post(self.prefill_url + "/v1/completions", json=pf,
+                                     headers=headers) as r:
+            r.raise_for_status()
+            out = await r.json()
+        text = out["choices"][0].get("text", "")
+        return text, out.get("kv_transfer_params") or {}
 
-    async def on_startup(self, app: web.Application) -> None:
-        self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=3600))
-        app["sched_task"] = asyncio.create_task(self.scheduler_loop())
+    async def _decode(self, body: dict, rid: str, kvp: dict, resp, rec: dict) -> int:
+        url = self.decode_urls[next(self._decode_rr)]
+        dec = dict(body)
+        dec.update({"stream": True, "request_id": rid + "-d"})
+        dec["kv_transfer_params"] = {"do_remote_decode": False,
+                                     "do_remote_prefill": True, **kvp}
+        n = 0
+        skipped_first = False
+        async with self.session.post(url + "/v1/completions", json=dec) as r:
+            r.raise_for_status()
+            async for line in r.content:
+                if not line.startswith(b"data: ") or line.startswith(b"data: [DONE]"):
+                    continue
+                if not skipped_first:
+                    skipped_first = True      # the prefill already returned it
+                    rec["t_decode_first"] = time.time()
+                    continue
+                n += 1
+                await resp.write(line + b"\n")
+        return n
 
-    async def on_cleanup(self, app: web.Application) -> None:
-        app["sched_task"].cancel()
-        if self.session:
-            await self.session.close()
+    def _write(self, rec: dict) -> None:
+        if self.log is not None:
+            self.log.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+
+def _sse(obj: dict) -> bytes:
+    return b"data: " + json.dumps(obj).encode() + b"\n\n"
 
 
 def build_app(cfg: dict) -> web.Application:
     proxy = Proxy(cfg)
-    app = web.Application()
+    app = web.Application(client_max_size=64 << 20)
     app.router.add_post("/v1/completions", proxy.handle)
-    app.router.add_post("/v1/chat/completions", proxy.handle)
+    app.router.add_get("/health", lambda r: web.Response(text="ok"))
     app.on_startup.append(proxy.on_startup)
     app.on_cleanup.append(proxy.on_cleanup)
+    app["proxy"] = proxy
     return app
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Shunt RS disaggregation proxy")
-    ap.add_argument("--config", required=True, help="proxy JSON config")
+    ap = argparse.ArgumentParser(description="Shunt PD proxy")
+    ap.add_argument("--config", required=True)
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--port", type=int, default=None)
     a = ap.parse_args()
     with open(a.config) as f:
         cfg = json.load(f)
-    web.run_app(build_app(cfg), host=a.host, port=a.port)
+    web.run_app(build_app(cfg), host=a.host, port=a.port or int(cfg.get("port", 8000)),
+                access_log=None)
 
 
 if __name__ == "__main__":

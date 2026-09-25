@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+from vllm import shunt_integration
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
@@ -459,11 +460,12 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
         else:
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+            with shunt_integration.phase("route"):
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
 
             # Passing shared_experts_input in case SharedExpertsOrder is
             # MK_INTERNAL_OVERLAPPED.
@@ -707,27 +709,31 @@ class MoERunner(MoERunnerInterface):
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
         if self.gate is not None:
-            router_logits, _ = self.gate(hidden_states)
+            with shunt_integration.phase("gate"):
+                router_logits, _ = self.gate(hidden_states)
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
             # code will probably remain
-            hidden_states, router_logits = self._maybe_dispatch(
-                layer,
-                hidden_states,
-                router_logits,
-            )
+            with shunt_integration.phase("dispatch"):
+                hidden_states, router_logits = self._maybe_dispatch(
+                    layer,
+                    hidden_states,
+                    router_logits,
+                )
 
-            shared_output, hidden_states = self._apply_quant_method(
-                layer=layer,
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                shared_experts_input=shared_experts_input,
-                input_ids=input_ids,
-            )
+            with shunt_integration.phase("moe"):
+                shared_output, hidden_states = self._apply_quant_method(
+                    layer=layer,
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    shared_experts_input=shared_experts_input,
+                    input_ids=input_ids,
+                )
 
-            return self._maybe_combine(
-                shared_output,
-                hidden_states,
-            )
+            with shunt_integration.phase("combine"):
+                return self._maybe_combine(
+                    shared_output,
+                    hidden_states,
+                )

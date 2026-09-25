@@ -1081,6 +1081,12 @@ def init_worker_distributed_environment(
         parallel_config.decode_context_parallel_size,
     )
 
+    # Shunt: bind the per-iteration planner and elastic attention to this rank.
+    from vllm import shunt_integration
+
+    if shunt_integration.ENABLED:
+        shunt_integration.on_distributed_ready(vllm_config)
+
     # Init ec connector here before KV caches init
     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode
     ensure_ec_transfer_initialized(vllm_config)

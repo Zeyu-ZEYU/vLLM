@@ -4,6 +4,7 @@
 import torch
 import torch.distributed as dist
 
+from vllm import shunt_integration
 from vllm.config import ParallelConfig
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.logger import init_logger
@@ -43,12 +44,22 @@ def _run_ar(
     dp_size = parallel_config.data_parallel_size
     dp_rank = parallel_config.data_parallel_rank
     device, group = _get_device_and_group(parallel_config)
-    tensor = torch.zeros(4, dp_size, device=device, dtype=torch.int32)
+    # Shunt: each rank also contributes its planner inputs in extra rows, so
+    # the group plan needs no communication beyond this all-reduce.
+    extra = shunt_integration.dp_extra_column()
+    rows = 4 if extra is None else 4 + len(extra)
+    dtype = torch.int32 if extra is None else torch.int64
+    tensor = torch.zeros(rows, dp_size, device=device, dtype=dtype)
     tensor[0][dp_rank] = orig_num_tokens_per_ubatch
     tensor[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor[2][dp_rank] = 1 if should_ubatch else 0
     tensor[3][dp_rank] = cudagraph_mode
+    if extra is not None:
+        tensor[4:, dp_rank] = torch.tensor(extra, dtype=dtype)
     dist.all_reduce(tensor, group=group)
+    if extra is not None:
+        shunt_integration.on_dp_rows(tensor[4:].tolist())
+        tensor = tensor[:4].to(torch.int32)
     return tensor
 
 
@@ -194,6 +205,9 @@ def coordinate_batch_across_dp(
     """
     if parallel_config.data_parallel_size == 1:
         # Early exit.
+        extra = shunt_integration.dp_extra_column()
+        if extra is not None:
+            shunt_integration.on_dp_rows([[v] for v in extra])
         return False, None, cudagraph_mode
 
     # If the caller has explicitly enabled microbatching.

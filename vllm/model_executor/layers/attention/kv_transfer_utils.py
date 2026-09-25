@@ -4,6 +4,7 @@ import inspect
 from collections.abc import Callable
 from functools import wraps
 
+from vllm import shunt_integration
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -48,7 +49,8 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
             return func(*args, **kwargs)
 
         # Wait for KV layer on entry
-        connector.wait_for_layer_load(layer_name)
+        with shunt_integration.timed_kv_wait():
+            connector.wait_for_layer_load(layer_name)
 
         # Execute the function
         result = func(*args, **kwargs)

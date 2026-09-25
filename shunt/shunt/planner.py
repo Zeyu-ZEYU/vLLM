@@ -1,117 +1,117 @@
-"""Per-iteration planner: RS -> EAP -> KVLB into one :class:`IterationPlan` (§3.1).
+"""The per-iteration plan for one EP group: elastic attention, then KVLB.
 
-This is the brain Shunt runs on the CPU before any layer executes. In the live
-system the global RS step runs at the proxy and the two node-local steps (EAP,
-KVLB) run in each prefill node's planner; :func:`plan_iteration` composes all
-three so tests, the offline analyses, and the node planner share one code path.
+Every prefill rank computes the same plan from the same group-wide inputs
+(estimated worker-compute and attention times, fresh tokens, and KV volumes of
+all DP workers), so the ranks agree on it without further coordination. The
+proxy's placement (RS) happens earlier and only shapes these inputs.
 """
 from __future__ import annotations
 
-from .algorithms import allocate_offload, balance_heads, lpt_schedule, optimal_oracle
+from dataclasses import dataclass, field
+
+from . import algorithms as ref
 from .compute_model import ComputeModel
-from .config import TESTBED, TestbedConfig
-from .types import DirectionPlan, IterationPlan, Request
+from .config import DeploySpec, PlanOptions
 
 
-def plan_iteration(requests: list[Request], model: ComputeModel,
-                   testbed: TestbedConfig = TESTBED, theta: float = 1.5,
-                   use_oracle: bool = False,
-                   enable_eap: bool = True, enable_kvlb: bool = True
-                   ) -> IterationPlan:
-    """Compute the full plan for one prefill iteration (RS -> EAP -> KVLB).
+@dataclass
+class GroupInputs:
+    """Per-worker planner inputs for one iteration (lists of length G).
 
-    ``enable_eap`` / ``enable_kvlb`` and ``use_oracle`` select the ablation arms
-    of §4.3 (/EAP, /KVLB, and the ORS / Sh-ORS scheduling variants).
+    Times are per layer in seconds; KV volumes are per layer in bytes.
     """
-    G = testbed.ep_group_workers
-    for r in requests:
-        r.compute_time = model.worker_compute_time(r.prefix_tokens, r.fresh_tokens)
-    ctimes = [r.compute_time for r in requests]
-    worker_of = (optimal_oracle(ctimes, G) if use_oracle else lpt_schedule(ctimes, G))
-    return plan_from_assignment(requests, worker_of, model, testbed, theta,
-                                enable_eap, enable_kvlb)
+
+    tau_wk: list[float]
+    attn: list[float]
+    fresh: list[int]
+    v_in: list[float]
+    v_out: list[float]
+
+    @classmethod
+    def empty(cls, G: int) -> "GroupInputs":
+        return cls([0.0] * G, [0.0] * G, [0] * G, [0.0] * G, [0.0] * G)
 
 
-def plan_from_assignment(requests: list[Request], worker_of: list[int],
-                         model: ComputeModel, testbed: TestbedConfig = TESTBED,
-                         theta: float = 1.5, enable_eap: bool = True,
-                         enable_kvlb: bool = True) -> IterationPlan:
-    """Run the node-local steps (EAP, KVLB) over an already-chosen assignment.
+@dataclass
+class KVAlloc:
+    """One worker's KV placement in one direction (bytes per layer).
 
-    The proxy picks the worker for each request (RS, ORS, or round-robin); this
-    completes the plan for that assignment, so the same code serves every
-    scheduling mode. ``worker_of[i]`` is the worker for ``requests[i]``.
+    ``borrow`` maps a node-local port index to the bytes this worker sends
+    through that port.
     """
-    G = testbed.ep_group_workers
-    wpn = testbed.workers_per_node
-    nodes = testbed.num_prefill_nodes
-    H = model.model.num_q_heads
 
-    for r in requests:
-        if not r.compute_time:
-            r.compute_time = model.worker_compute_time(r.prefix_tokens, r.fresh_tokens)
-    assignment = {r.req_id: worker_of[i] for i, r in enumerate(requests)}
+    own: float = 0.0
+    borrow: dict[int, float] = field(default_factory=dict)
+    frontend: float = 0.0
 
-    # --- per-worker aggregates -------------------------------------------------
-    tau_wk = [0.0] * G
-    attn = [0.0] * G
-    v_in = [0.0] * G
-    v_out = [0.0] * G
-    for i, r in enumerate(requests):
-        w = worker_of[i]
-        tau_wk[w] += r.compute_time
-        attn[w] += model.attention_time(r.prefix_tokens, r.fresh_tokens)
-        v_in[w] += model.kv_bytes_inbound(r.prefix_tokens)
-        v_out[w] += model.kv_bytes_outbound(r.fresh_tokens)
-
-    total_fresh = sum(r.fresh_tokens for r in requests)
-    tau_ex = model.expert_time(total_fresh)
-    group_mean = sum(tau_wk) / G if G else 0.0
-
-    # --- EAP: shrink the residual straggler within each node (Alg. 2) ----------
-    head_counts = [H] * G
-    if enable_eap:
-        for n in range(nodes):
-            lo, hi = n * wpn, (n + 1) * wpn
-            h, t_post = balance_heads(tau_wk[lo:hi], attn[lo:hi], group_mean, H, theta)
-            head_counts[lo:hi] = h
-            tau_wk[lo:hi] = t_post
-
-    # --- compute window after the split (§3.1) ---------------------------------
-    t_cmp = (max(tau_wk) if tau_wk else 0.0) + tau_ex
-    t_a2a = model.a2a_time(total_fresh)
-
-    # --- KVLB: fit KV into the window, offload the rest (Alg. 3) ----------------
-    inbound = [DirectionPlan(owner=w) for w in range(G)]
-    outbound = [DirectionPlan(owner=w) for w in range(G)]
-    if enable_kvlb:
-        b_be = testbed.bw_port_GBps * 1e9 * t_cmp
-        b_fe = testbed.bw_fe_GBps * 1e9 * (t_cmp + t_a2a)
-        bw_port = testbed.bw_port_GBps * 1e9
-        bw_fe = testbed.bw_fe_GBps * 1e9
-        for n in range(nodes):
-            lo, hi = n * wpn, (n + 1) * wpn
-            for vol, out in ((v_in[lo:hi], inbound), (v_out[lo:hi], outbound)):
-                local = allocate_offload(vol, b_be, b_fe, bw_port, bw_fe)
-                for j, p in enumerate(local):
-                    out[lo + j] = _shift_ports(p, lo)
-    else:
-        # /KVLB arm: all KV stays on each worker's own backend port (§4.3)
-        for w in range(G):
-            inbound[w].backend[w] = v_in[w]
-            outbound[w].backend[w] = v_out[w]
-
-    return IterationPlan(
-        assignment=assignment, head_counts=head_counts, worker_compute=tau_wk,
-        attention_time=attn, t_cmp=t_cmp, t_a2a=t_a2a,
-        inbound=inbound, outbound=outbound,
-    )
+    @property
+    def total(self) -> float:
+        return self.own + sum(self.borrow.values()) + self.frontend
 
 
-def _shift_ports(p: DirectionPlan, offset: int) -> DirectionPlan:
-    """Remap a node-local DirectionPlan to global worker indices."""
-    return DirectionPlan(
-        owner=p.owner + offset,
-        backend={port + offset: b for port, b in p.backend.items()},
-        frontend=p.frontend,
-    )
+@dataclass
+class GroupPlan:
+    """The plan every rank derives for one iteration.
+
+    ``moves`` lists the head moves ``(donor, recipient)`` in global worker
+    ranks, one per query head, in the order Algorithm S1 made them.
+    """
+
+    moves: list[tuple[int, int]]
+    tau_post: list[float]
+    t_cmp: float
+    t_a2a: float
+    b_be: float
+    b_fe: float
+    inbound: list[KVAlloc]
+    outbound: list[KVAlloc]
+    group_mean: float = 0.0
+    tau_ex: float = 0.0
+
+    def eap_active(self) -> bool:
+        return bool(self.moves)
+
+
+def plan_group(inp: GroupInputs, cm: ComputeModel, deploy: DeploySpec,
+               opts: PlanOptions, impl=None) -> GroupPlan:
+    """Compute the group plan with the reference (``impl=None``) or native core."""
+    impl = impl or ref
+    G = deploy.ep_group_workers
+    wpn = deploy.workers_per_node
+    H = cm.model.num_q_heads
+    tau = list(inp.tau_wk)
+    group_mean = sum(tau) / G if G else 0.0
+
+    moves: list[tuple[int, int]] = []
+    if opts.eap:
+        for n in range(deploy.num_nodes):
+            lo = n * wpn
+            node_moves, post = impl.balance_heads(
+                tau[lo:lo + wpn], inp.attn[lo:lo + wpn], group_mean, H, opts.theta)
+            moves.extend((lo + s, lo + d) for s, d in node_moves)
+            tau[lo:lo + wpn] = post
+
+    total_fresh = sum(inp.fresh)
+    tau_ex = cm.expert_time(total_fresh) if total_fresh else 0.0
+    t_cmp = (max(tau) if tau else 0.0) + tau_ex
+    t_a2a = cm.a2a_time(total_fresh)
+
+    inbound = [KVAlloc(own=v) for v in inp.v_in]
+    outbound = [KVAlloc(own=v) for v in inp.v_out]
+    b_be = b_fe = 0.0
+    if opts.kvlb_budget and total_fresh:
+        window = max(0.0, t_cmp - t_a2a) if opts.dbo else t_cmp
+        b_be = deploy.bw_port * window
+        b_fe = deploy.bw_fe * (t_cmp + t_a2a) if opts.kvlb_frontend else 0.0
+        for n in range(deploy.num_nodes):
+            lo = n * wpn
+            for vols, out in ((inp.v_in, inbound), (inp.v_out, outbound)):
+                node = impl.allocate_offload(
+                    vols[lo:lo + wpn], b_be, b_fe, deploy.bw_port, deploy.bw_fe,
+                    deploy.pcie_distance, opts.kvlb_borrow, opts.kvlb_frontend)
+                for j, a in enumerate(node):
+                    out[lo + j] = KVAlloc(own=a["own"], borrow=dict(a["borrow"]),
+                                          frontend=a["frontend"])
+    return GroupPlan(moves=moves, tau_post=tau, t_cmp=t_cmp, t_a2a=t_a2a,
+                     b_be=b_be, b_fe=b_fe, inbound=inbound, outbound=outbound,
+                     group_mean=group_mean, tau_ex=tau_ex)

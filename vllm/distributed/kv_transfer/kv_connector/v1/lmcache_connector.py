@@ -186,6 +186,16 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             layer_name, kv_layer, attn_metadata, **kwargs
         )
 
+    def shunt_kv_tokens(self, metadata: Any) -> dict[str, int]:
+        """Shunt: inbound prefix-KV tokens each request loads this step."""
+        fn = getattr(self._lmcache_engine, "shunt_kv_tokens", None)
+        return fn(metadata) if fn is not None else {}
+
+    def is_producer(self) -> bool:
+        """Shunt: whether this instance sends its new KV (a prefill role)."""
+        cfg = self._vllm_config.kv_transfer_config
+        return cfg is not None and cfg.kv_role in ("kv_producer", "kv_both")
+
     def wait_for_save(self):
         """
         Block until all the save operations is done. This is called

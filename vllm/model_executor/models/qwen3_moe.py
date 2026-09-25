@@ -32,6 +32,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm import shunt_integration
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -341,6 +342,18 @@ class Qwen3MoeAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        if shunt_integration.ENABLED:
+            # Shunt: per-layer timing and elastic attention on prefill ranks.
+            return shunt_integration.attention_forward(
+                self, positions, hidden_states, self._forward_local
+            )
+        return self._forward_local(positions, hidden_states)
+
+    def _forward_local(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,

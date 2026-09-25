@@ -1,1 +1,1 @@
-"""Online serving glue: the RS proxy and its scheduler (§3.2, §4.1)."""
+"""The Shunt proxy: request placement, PD handoff, and per-request logs."""

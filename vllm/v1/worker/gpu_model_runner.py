@@ -186,6 +186,7 @@ from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_total_cp_world_size,
 )
+from vllm import shunt_integration
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
@@ -3923,6 +3924,12 @@ class GPUModelRunner(
                     num_scheduled_tokens_np,
                     self.input_batch.num_computed_tokens_cpu[:num_reqs],
                     scheduler_output.num_common_prefix_blocks,
+                )
+
+            if shunt_integration.ENABLED:
+                # Shunt: this rank's planner inputs ride the DP sync below.
+                shunt_integration.begin_step(
+                    self, scheduler_output, num_scheduled_tokens_np
                 )
 
             (

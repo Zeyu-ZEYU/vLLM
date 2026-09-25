@@ -1,228 +1,256 @@
-"""The three Shunt algorithms (§3.2-§3.4) plus the offline oracle baseline.
+"""Reference implementations of Shunt's per-iteration algorithms.
 
-These are the reference implementations: short, pure-Python, and algorithmically
-identical to the C++ in ``csrc/`` (a parity test pins them together). The online
-proxy and node planner call the C++ for the microsecond-scale decision cost the
-paper reports; the offline analyses and tests call these.
+- :func:`lpt_schedule`: LPT placement of requests onto DP workers (RS).
+- :func:`optimal_oracle`: offline min-makespan placement (the ORS baseline).
+- :func:`balance_heads`: per-node attention-head balancing (Algorithm S1).
+- :func:`allocate_offload`: per-node KV offload allocation (Algorithm 1).
+
+The C++ versions in ``csrc/include/shunt_core.hpp`` implement the same rules
+with the same tie-breaking; ``tests/test_native_parity.py`` checks that both
+produce identical results. The engine runtime and the proxy use the C++ code.
 """
 from __future__ import annotations
 
-from .types import DirectionPlan
+import math
+
+EPS = 1e-9
 
 
 # ---------------------------------------------------------------------------
-# Algorithm 1: compute-aware request scheduling (RS), §3.2
+# Request placement
 # ---------------------------------------------------------------------------
 
 def lpt_schedule(compute_times: list[float], num_workers: int) -> list[int]:
-    """Longest-processing-time assignment of requests to workers (Alg. 1).
+    """Longest-processing-time placement.
 
-    Take requests heaviest-first and put each on the worker lightest so far; this
-    makes the largest worker load (the straggler's compute time) as small as a
-    fast online rule can. Returns ``worker_of[i]`` for each input request ``i``.
+    Requests are taken heaviest first (ties: lower index first) and each goes
+    to the currently least-loaded worker (ties: lower worker index). Returns
+    ``worker_of[i]`` for every request ``i``.
     """
+    n = len(compute_times)
+    order = sorted(range(n), key=lambda i: (-compute_times[i], i))
     load = [0.0] * num_workers
-    worker_of = [0] * len(compute_times)
-    order = sorted(range(len(compute_times)), key=lambda i: compute_times[i], reverse=True)
+    worker_of = [0] * n
     for i in order:
-        w = min(range(num_workers), key=lambda w: load[w])
+        w = min(range(num_workers), key=lambda x: (load[x], x))
         worker_of[i] = w
         load[w] += compute_times[i]
     return worker_of
 
 
-def optimal_oracle(compute_times: list[float], num_workers: int,
-                   iters: int = 4000) -> list[int]:
-    """Offline min-makespan assignment used as the ORS baseline (§2.3, §4.2).
+def makespan_lower_bound(compute_times: list[float], num_workers: int) -> float:
+    """No placement can beat the largest request or the mean load."""
+    if not compute_times:
+        return 0.0
+    return max(max(compute_times), sum(compute_times) / num_workers)
 
-    LPT seed then local moves and swaps toward the lower bound
-    ``max(total/W, largest job)``. Far too slow to run online (it is the
-    "oracle"); RS approximates it. Returns ``worker_of[i]``.
+
+def optimal_oracle(compute_times: list[float], num_workers: int,
+                   max_rounds: int = 20000) -> list[int]:
+    """Offline min-makespan placement used by the ORS baseline.
+
+    Starts from LPT and applies improving moves and swaps between the most
+    loaded worker and the others until no move lowers the makespan or the
+    makespan meets :func:`makespan_lower_bound`, at which point it is optimal.
     """
-    W = num_workers
-    n = len(compute_times)
     c = compute_times
-    order = sorted(range(n), key=lambda i: c[i], reverse=True)
-    load = [0.0] * W
+    n, W = len(c), num_workers
+    worker_of = lpt_schedule(c, W)
     groups: list[list[int]] = [[] for _ in range(W)]
-    for i in order:
-        w = min(range(W), key=lambda w: load[w])
+    load = [0.0] * W
+    for i, w in enumerate(worker_of):
         groups[w].append(i)
         load[w] += c[i]
+    bound = makespan_lower_bound(c, W)
 
-    for _ in range(iters):
-        hi = max(range(W), key=lambda w: load[w])
-        order_lo = sorted(range(W), key=lambda w: load[w])
-        moved = False
-        if len(groups[hi]) > 1:
-            for i in sorted(groups[hi], key=lambda x: c[x]):
-                for lo in order_lo:
-                    if lo != hi and load[lo] + c[i] < load[hi] - 1e-12:
-                        groups[hi].remove(i); groups[lo].append(i)
-                        load[hi] -= c[i]; load[lo] += c[i]; moved = True
-                        break
-                if moved:
+    for _ in range(max_rounds):
+        hi = max(range(W), key=lambda w: (load[w], -w))
+        if load[hi] <= bound * (1 + 1e-12):
+            break
+        improved = False
+        others = sorted((w for w in range(W) if w != hi), key=lambda w: (load[w], w))
+        # single move: send a job from hi to a worker where it lowers the max
+        for i in sorted(groups[hi], key=lambda x: (c[x], x)):
+            for lo in others:
+                if load[lo] + c[i] < load[hi] - EPS:
+                    groups[hi].remove(i)
+                    groups[lo].append(i)
+                    load[hi] -= c[i]
+                    load[lo] += c[i]
+                    improved = True
                     break
-        if not moved:
-            for lo in order_lo:
-                if lo == hi:
-                    continue
-                for i in sorted(groups[hi], key=lambda x: -c[x]):
-                    for j in sorted(groups[lo], key=lambda x: c[x]):
-                        if c[i] > c[j] and load[hi] - c[i] + c[j] < load[hi] - 1e-12 \
-                           and load[lo] - c[j] + c[i] < load[hi] - 1e-12:
-                            groups[hi].remove(i); groups[lo].remove(j)
-                            groups[hi].append(j); groups[lo].append(i)
-                            load[hi] += c[j] - c[i]; load[lo] += c[i] - c[j]
-                            moved = True; break
-                    if moved:
+            if improved:
+                break
+        if not improved:
+            # swap a larger job on hi with a smaller one elsewhere
+            for lo in others:
+                for i in sorted(groups[hi], key=lambda x: (-c[x], x)):
+                    for j in sorted(groups[lo], key=lambda x: (c[x], x)):
+                        delta = c[i] - c[j]
+                        if delta > EPS and load[lo] + delta < load[hi] - EPS:
+                            groups[hi].remove(i)
+                            groups[lo].remove(j)
+                            groups[hi].append(j)
+                            groups[lo].append(i)
+                            load[hi] -= delta
+                            load[lo] += delta
+                            improved = True
+                            break
+                    if improved:
                         break
-                if moved:
+                if improved:
                     break
-        if not moved:
+        if not improved:
             break
 
-    worker_of = [0] * n
+    out = [0] * n
     for w, g in enumerate(groups):
         for i in g:
-            worker_of[i] = w
-    return worker_of
+            out[i] = w
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Algorithm 2: straggler-aware elastic attention parallelism (EAP), §3.3
+# Algorithm S1: attention-head balancing on one prefill node
 # ---------------------------------------------------------------------------
 
 def balance_heads(worker_compute: list[float], attention_time: list[float],
-                  group_mean: float, num_q_heads: int, theta: float = 1.5
-                  ) -> tuple[list[int], list[float]]:
-    """Per-node attention-head balancing (Alg. 2).
+                  group_mean: float, num_q_heads: int, theta: float
+                  ) -> tuple[list[tuple[int, int]], list[float]]:
+    """Hand query heads from the busiest worker to the idlest, one at a time.
 
-    Acts only when the node's worst worker-compute time exceeds ``theta`` times
-    the *group* mean; then it hands one query head at a time from the busiest
-    worker to the idlest until every GPU is within one head of the node mean.
-    Returns ``(head_counts, post_split_worker_compute)`` for this node's workers.
+    ``worker_compute`` and ``attention_time`` hold the node's workers only;
+    ``group_mean`` is the mean worker-compute time over the whole EP group.
+    Nothing moves unless a worker exceeds ``theta * group_mean``. Each move
+    takes one of the donor's own heads, carrying ``attention_time[s] / H``.
+    The loop stops when the busiest worker has none of its own heads left or
+    when the move would bring the recipient up to the donor's time.
 
-    ``worker_compute`` and ``attention_time`` are this node's workers only;
-    ``group_mean`` is the mean over the whole EP group (the straggler is judged
-    against the group, not the node).
+    Returns the moves ``[(donor, recipient), ...]`` in order (node-local
+    indices, one per head) and the post-split worker-compute times.
     """
-    W = len(worker_compute)
-    H = num_q_heads
-    if W == 0 or max(worker_compute) <= theta * group_mean:
-        return [H] * W, list(worker_compute)
-
-    t = list(worker_compute)
-    e = [a / H for a in attention_time]   # per-head attention time, per worker
-    h = [H] * W
+    W, H = len(worker_compute), num_q_heads
+    t = [float(x) for x in worker_compute]
+    if W == 0 or H <= 0 or max(t) <= theta * group_mean:
+        return [], t
+    e = [float(a) / H for a in attention_time]
+    own = [H] * W
+    moves: list[tuple[int, int]] = []
     while True:
-        s = max(range(W), key=lambda w: t[w])
-        d = min(range(W), key=lambda w: t[w])
-        if t[s] - t[d] <= e[s] or h[s] <= 0:
+        s = max(range(W), key=lambda w: (t[w], -w))
+        d = min(range(W), key=lambda w: (t[w], w))
+        if own[s] == 0 or e[s] <= 0.0 or t[d] + e[s] >= t[s]:
             break
-        t[s] -= e[s]; t[d] += e[s]      # hand one of s's heads to d
-        h[s] -= 1;   h[d] += 1
-    return h, t
+        t[s] -= e[s]
+        t[d] += e[s]
+        own[s] -= 1
+        moves.append((s, d))
+    return moves, t
 
 
 # ---------------------------------------------------------------------------
-# Algorithm 3: contention- and urgency-aware KV traffic load balancing, §3.4
+# Algorithm 1: KV offload allocation on one prefill node, one direction
 # ---------------------------------------------------------------------------
+
+def waterfill(load: list[float], bw: list[float], extra: float) -> list[float]:
+    """Add ``extra`` bytes over links so the latest finish time is minimal.
+
+    A link's finish time is ``load / bw``. Returns the bytes added per link.
+    Exact: raises the lowest links to a common finish level.
+    """
+    n = len(load)
+    added = [0.0] * n
+    if extra <= EPS or n == 0:
+        return added
+    order = sorted(range(n), key=lambda i: (load[i] / bw[i], i))
+    cum_b = cum_l = 0.0
+    level = 0.0
+    k = 0
+    for k, i in enumerate(order):
+        cum_b += bw[i]
+        cum_l += load[i]
+        level = (extra + cum_l) / cum_b
+        nxt = load[order[k + 1]] / bw[order[k + 1]] if k + 1 < n else math.inf
+        if level <= nxt:
+            break
+    for i in order[:k + 1]:
+        added[i] = max(0.0, level * bw[i] - load[i])
+    return added
+
 
 def allocate_offload(volumes: list[float], budget_be: float, budget_fe: float,
-                     bw_port: float = 1.0, bw_fe: float = 1.0,
-                     pcie_distance: list[list[float]] | None = None
-                     ) -> list[DirectionPlan]:
-    """Per-iteration KV offload allocation for one direction (Alg. 3).
+                     bw_port: float, bw_fe: float,
+                     pcie_distance: list[list[float]] | None = None,
+                     allow_borrow: bool = True, allow_frontend: bool = True
+                     ) -> list[dict]:
+    """KV allocation for one node and one direction (Algorithm 1).
 
-    Each backend port carries ``budget_be`` (= BW_port x T_cmp, from the post-split
-    window); the shared frontend carries ``budget_fe``. A worker's KV first fills
-    its own port; overflow borrows spare budget on the nearest backend ports
-    (PCIe distance), then the idle frontend; anything past every budget is spread
-    across all links to balance finish times (``bw_port``/``bw_fe`` set the
-    relative drain rates). ``volumes[w]`` is worker w's KV bytes (one direction,
-    one layer). Returns one :class:`DirectionPlan` per worker.
+    ``volumes[w]`` is worker ``w``'s KV bytes per layer. Each worker first
+    fills its own port up to ``budget_be``. Over-budget workers, largest
+    overflow first, borrow spare budget on other ports (nearest in
+    ``pcie_distance`` first), then use the frontend up to ``budget_fe``. What
+    no budget absorbs is spread over the links the worker may use, balancing
+    their finish times. Returns one dict per worker with ``own`` bytes,
+    ``borrow`` (port -> bytes), and ``frontend`` bytes.
     """
     W = len(volumes)
-    if pcie_distance is None:
-        pcie_distance = [[abs(i - j) for j in range(W)] for i in range(W)]
 
-    plans = [DirectionPlan(owner=w) for w in range(W)]
-    spare = [0.0] * W           # spare backend budget left on each port
-    residual = [0.0] * W        # bytes still unplaced for each worker
-    for w in range(W):
-        own = min(volumes[w], budget_be)
-        plans[w].backend[w] = own
-        spare[w] = budget_be - own
-        residual[w] = max(0.0, volumes[w] - budget_be)
+    def dist(i: int, j: int) -> float:
+        return pcie_distance[i][j] if pcie_distance is not None else float(abs(i - j))
 
-    fe_left = budget_fe
-    for w in sorted(range(W), key=lambda x: residual[x], reverse=True):
-        if residual[w] <= 0:
+    own = [min(v, budget_be) for v in volumes]
+    spare = [budget_be - o for o in own]
+    residual = [max(0.0, v - budget_be) for v in volumes]
+    borrow = [[0.0] * W for _ in range(W)]
+    fe = [0.0] * W
+    fe_left = budget_fe if allow_frontend else 0.0
+
+    order = sorted(range(W), key=lambda x: (-residual[x], x))
+    for w in order:
+        if residual[w] <= EPS:
             continue
-        # 1) borrow nearest backend ports with spare budget (PCIe distance)
-        for lender in sorted(range(W), key=lambda j: (pcie_distance[w][j], j)):
-            if residual[w] <= 1e-12:
-                break
-            if lender == w or spare[lender] <= 0:
-                continue
-            take = min(residual[w], spare[lender])
-            plans[w].backend[lender] = plans[w].backend.get(lender, 0.0) + take
-            spare[lender] -= take
-            residual[w] -= take
-        # 2) then the idle frontend, up to its remaining budget
-        if residual[w] > 1e-12 and fe_left > 0:
+        if allow_borrow:
+            for p in sorted(range(W), key=lambda j: (dist(w, j), j)):
+                if residual[w] <= EPS:
+                    break
+                if p == w or spare[p] <= EPS:
+                    continue
+                take = min(residual[w], spare[p])
+                borrow[w][p] += take
+                spare[p] -= take
+                residual[w] -= take
+        if allow_frontend and residual[w] > EPS and fe_left > EPS:
             take = min(residual[w], fe_left)
-            plans[w].frontend += take
+            fe[w] += take
             fe_left -= take
             residual[w] -= take
 
-    # 3) anything past every budget spills past the window: spread it across all
-    #    links to equalize finish times (minimize the transfer straggler). Each
-    #    link's committed load and bandwidth set its current finish time; water-
-    #    fill the leftover so the slowest link finishes as early as possible.
-    leftover = [(w, residual[w]) for w in range(W) if residual[w] > 1e-12]
-    if leftover:
-        committed = [budget_be - spare[p] for p in range(W)] + [budget_fe - fe_left]
-        bw = [bw_port] * W + [bw_fe]
-        total_extra = sum(r for _, r in leftover)
-        extra = _waterfill(committed, bw, total_extra)   # bytes to add per link
-        # assign the extra on each link to the still-residual workers in order
-        donors = [w for w, _ in sorted(leftover, key=lambda x: -x[1])]
-        di = 0
-        for link in range(W + 1):
-            give = extra[link]
-            while give > 1e-12 and di < len(donors):
-                w = donors[di]
-                take = min(give, residual[w])
-                if link < W:
-                    plans[w].backend[link] = plans[w].backend.get(link, 0.0) + take
-                else:
-                    plans[w].frontend += take
-                residual[w] -= take
-                give -= take
-                if residual[w] <= 1e-12:
-                    di += 1
-    return plans
+    # Beyond every budget: spread over the allowed links, balancing finish times.
+    port_load = [own[p] + sum(borrow[w][p] for w in range(W)) for p in range(W)]
+    fe_load = sum(fe)
+    for w in sorted(range(W), key=lambda x: (-residual[x], x)):
+        if residual[w] <= EPS:
+            continue
+        links = [p for p in range(W) if p == w or allow_borrow]
+        loads = [port_load[p] for p in links]
+        bws = [bw_port] * len(links)
+        if allow_frontend:
+            loads.append(fe_load)
+            bws.append(bw_fe)
+        added = waterfill(loads, bws, residual[w])
+        for k, p in enumerate(links):
+            if added[k] <= 0.0:
+                continue
+            if p == w:
+                own[w] += added[k]
+            else:
+                borrow[w][p] += added[k]
+            port_load[p] += added[k]
+        if allow_frontend and added[-1] > 0.0:
+            fe[w] += added[-1]
+            fe_load += added[-1]
+        residual[w] = 0.0
 
-
-def _waterfill(load: list[float], bw: list[float], extra: float) -> list[float]:
-    """Add ``extra`` total bytes across links to minimize the max finish time.
-
-    Returns per-link added bytes. Finish time of a link is (load+added)/bw; we
-    raise all links to a common finish level T with sum_l max(0, T*bw-load)=extra.
-    """
-    n = len(load)
-    if extra <= 0:
-        return [0.0] * n
-    # binary search the common finish time T
-    lo, hi = 0.0, max(load[i] / bw[i] for i in range(n)) + extra / sum(bw)
-    for _ in range(100):
-        T = 0.5 * (lo + hi)
-        need = sum(max(0.0, T * bw[i] - load[i]) for i in range(n))
-        if need < extra:
-            lo = T
-        else:
-            hi = T
-    T = hi
-    return [max(0.0, T * bw[i] - load[i]) for i in range(n)]
+    return [{"own": own[w],
+             "borrow": {p: b for p, b in enumerate(borrow[w]) if b > 0.0},
+             "frontend": fe[w]} for w in range(W)]

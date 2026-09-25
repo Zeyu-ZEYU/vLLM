@@ -10,6 +10,7 @@ from typing import final
 import torch
 
 import vllm.envs as envs
+from vllm import shunt_integration
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -1380,40 +1381,45 @@ class FusedMoEKernelModularImpl:
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
-        a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            global_num_experts,
-            expert_map,
-            apply_router_weight_on_input,
-        )
+        with shunt_integration.phase("mk_prepare"):
+            a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = (
+                self._prepare(
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    global_num_experts,
+                    expert_map,
+                    apply_router_weight_on_input,
+                )
+            )
 
-        fused_out = self._fused_experts(
-            in_dtype=hidden_states.dtype,
-            a1q=a1q,
-            a1q_scale=a1q_scale,
-            w1=w1,
-            w2=w2,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=activation,
-            global_num_experts=global_num_experts,
-            local_num_experts=local_num_experts,
-            expert_map=expert_map,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            expert_tokens_meta=expert_tokens_meta,
-        )
+        with shunt_integration.phase("mk_experts"):
+            fused_out = self._fused_experts(
+                in_dtype=hidden_states.dtype,
+                a1q=a1q,
+                a1q_scale=a1q_scale,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                local_num_experts=local_num_experts,
+                expert_map=expert_map,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                expert_tokens_meta=expert_tokens_meta,
+            )
 
-        return self._finalize(
-            output,
-            fused_out,
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            apply_router_weight_on_input,
-            shared_experts_input=shared_experts_input,
-        )
+        with shunt_integration.phase("mk_finalize"):
+            return self._finalize(
+                output,
+                fused_out,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                apply_router_weight_on_input,
+                shared_experts_input=shared_experts_input,
+            )
 
 
 @final

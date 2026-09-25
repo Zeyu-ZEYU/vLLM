@@ -3,11 +3,11 @@ CXXFLAGS ?= -O3 -std=c++17 -Iinclude -Wall -Wextra
 
 all: libshunt.so scalability_bench
 
-# Shared library loaded from Python via ctypes (shunt._native).
+# Shared library loaded from Python via ctypes (shunt.native).
 libshunt.so: capi.cpp include/shunt_core.hpp
 	$(CXX) $(CXXFLAGS) -shared -fPIC capi.cpp -o $@
 
-# Fig. 19 microbenchmark.
+# Decision-cost microbenchmark (python -m shunt.bench.scalability runs it).
 scalability_bench: scalability_bench.cpp include/shunt_core.hpp
 	$(CXX) $(CXXFLAGS) scalability_bench.cpp -o $@
 
