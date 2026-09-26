@@ -13,7 +13,9 @@ Two load protocols:
   scheduled arrival (queueing included).
 
 Output: one JSON line per request with its trace index, scheduled, send,
-first-token and last-token times, and output tokens.
+first-token and last-token times, the requested output tokens
+(``max_tokens``, generated exactly because of ``ignore_eos``), and the number
+of streamed chunks.
 
 Example::
 
@@ -78,7 +80,7 @@ async def _one(session, url: str, model: str, rec: TraceRecord, prompt: list[int
                 n += 1
     except Exception as e:  # noqa: BLE001
         row["error"] = f"{type(e).__name__}: {e}"
-    row["n_out"] = n
+    row["n_chunks"] = n
     return row
 
 

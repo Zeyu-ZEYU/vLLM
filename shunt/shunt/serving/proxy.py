@@ -149,7 +149,8 @@ class Proxy:
     async def _decode(self, body: dict, rid: str, kvp: dict, resp, rec: dict) -> int:
         url = self.decode_urls[next(self._decode_rr)]
         dec = dict(body)
-        dec.update({"stream": True, "request_id": rid + "-d"})
+        dec.update({"stream": True, "request_id": rid + "-d",
+                    "stream_options": {"include_usage": True}})
         dec["kv_transfer_params"] = {"do_remote_decode": False,
                                      "do_remote_prefill": True, **kvp}
         n = 0
@@ -159,11 +160,16 @@ class Proxy:
             async for line in r.content:
                 if not line.startswith(b"data: ") or line.startswith(b"data: [DONE]"):
                     continue
+                chunk = json.loads(line[6:])
+                if chunk.get("usage"):
+                    # the decode regenerates the first token; count the rest
+                    n = max(0, int(chunk["usage"].get("completion_tokens", 0)) - 1)
+                if not chunk.get("choices"):
+                    continue
                 if not skipped_first:
                     skipped_first = True      # the prefill already returned it
                     rec["t_decode_first"] = time.time()
                     continue
-                n += 1
                 await resp.write(line + b"\n")
         return n
 
