@@ -9,6 +9,9 @@ description = "Shunt: balancing compute and KV traffic without all-to-all conten
 requires-python = ">=3.10"
 dependencies = ["numpy", "matplotlib", "aiohttp", "pyzmq", "msgspec"]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [tool.setuptools]
 packages = ["shunt", "shunt.runtime", "shunt.serving", "shunt.harness", "shunt.bench",
             "shunt.profiling", "shunt.analysis", "shunt.tools"]
