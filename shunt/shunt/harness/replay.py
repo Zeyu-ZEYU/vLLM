@@ -41,11 +41,14 @@ def _block_tokens(h, lo: int, hi: int) -> tuple[int, ...]:
     return tuple(rng.randrange(lo, hi) for _ in range(BLOCK))
 
 
-def build_prompt(rec: TraceRecord, lo: int, hi: int) -> list[int]:
-    """Token ids of a request; identical hash ids give identical blocks."""
+def build_prompt(rec: TraceRecord, lo: int, hi: int, reuse: bool = True) -> list[int]:
+    """Token ids of a request; identical hash ids give identical blocks.
+
+    With ``reuse=False`` every prompt is unique (no prefix is shared).
+    """
     toks: list[int] = []
     for h in rec.hash_ids:
-        toks.extend(_block_tokens(h, lo, hi))
+        toks.extend(_block_tokens(h if reuse else f"{rec.index}-{h}", lo, hi))
         if len(toks) >= rec.input_length:
             break
     if len(toks) < rec.input_length:
@@ -89,7 +92,7 @@ async def run(args) -> None:
 
     recs = load_trace(args.trace, limit=args.num_requests, start=args.start)
     lo, hi = args.token_range
-    prompts = [build_prompt(r, lo, hi) for r in recs]
+    prompts = [build_prompt(r, lo, hi, reuse=not args.no_reuse) for r in recs]
     out = open(args.out, "w", buffering=1)
     done = 0
     t0 = time.time()
@@ -135,6 +138,7 @@ async def run(args) -> None:
     out.close()
     meta = {"trace": args.trace, "start": args.start, "num_requests": len(recs),
             "concurrency": args.concurrency, "rate": args.rate, "seed": args.seed,
+            "reuse": not args.no_reuse,
             "t_begin": t0, "t_end": time.time()}
     with open(args.out + ".meta.json", "w") as f:
         json.dump(meta, f, indent=1)
@@ -158,6 +162,8 @@ def main() -> None:
                     help="cap on output tokens per request")
     ap.add_argument("--token-range", type=int, nargs=2, default=(1000, 100000),
                     help="token ids are drawn from [lo, hi)")
+    ap.add_argument("--no-reuse", action="store_true",
+                    help="make every prompt unique (no prefix reuse)")
     ap.add_argument("--timeout", type=float, default=3600.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--progress", type=int, default=1000)

@@ -1,109 +1,91 @@
-"""Figs 16-17: TTFT distribution and mean TTFT vs offered load.
+"""TTFT distributions of closed-loop runs (Figs. 9, 13a, 14a, 15a, S5; Tables 1,
+2b, S4, and the TTFT columns of Table S5).
 
-Consumes the per-request JSONL written by ``shunt.harness.trace_replay``. The box
-mode draws one box per configuration (Baseline / ORS / Shunt / Sh-ORS, or the
-ablation arms): box edges and median at P25/P50/P75, whiskers at P1/P99. The load
-mode plots mean TTFT against the offered request rate.
+Boxes span P25-P75 with the median marked; whiskers end at P1 and P99. The
+table adds the mean TTFT, the completion rate (requests/s), and the median
+decode time per output token.
 
-Box::   python -m shunt.analysis.ttft box --out f.pdf \
-            Baseline=base.jsonl ORS=ors.jsonl Shunt=shunt.jsonl Sh-ORS=shors.jsonl
-Load::  python -m shunt.analysis.ttft load --out f.pdf \
-            Shunt=rate8:s8.jsonl,rate12:s12.jsonl,rate16:s16.jsonl  Baseline=...
+Examples::
+
+    python -m shunt.analysis.ttft box Baseline=results/main/baseline \\
+        ORS=results/main/ors Combo=results/main/combo Shunt=results/main/shunt \\
+        Sh-ORS=results/main/sh-ors --out figs/fig13a_ttft
+    python -m shunt.analysis.ttft table NCCL/Baseline=results/a2a/baseline \\
+        NCCL/Shunt=results/a2a/shunt DBO/Baseline=results/a2a/baseline+dbo \\
+        --out tables/tab1_a2a
 """
 from __future__ import annotations
 
 import argparse
-import json
 
 import numpy as np
 
-from ..plots import BLUE, COL_H, COL_W, GREEN, GREY, RED, SUB_H, SUB_W, apply_style
-
-_PALETTE = [GREY, GREEN, RED, BLUE, "#8e44ad"]
-
-
-def load_ttfts(path: str) -> np.ndarray:
-    vals = []
-    with open(path) as f:
-        for line in f:
-            r = json.loads(line)
-            if r.get("ttft"):
-                vals.append(r["ttft"])
-    return np.array(sorted(vals), dtype=np.float64)
+from . import style
+from .load import Run, pct
 
 
-def _box_stats(v: np.ndarray) -> dict:
-    p = np.percentile(v, [1, 25, 50, 75, 99])
-    return {"whislo": p[0], "q1": p[1], "med": p[2], "q3": p[3], "whishi": p[4],
-            "fliers": []}
+def stats(run: Run) -> list:
+    t = run.ttft()
+    tp = run.tpot()
+    return [len(t), pct(t, 1), pct(t, 25), pct(t, 50), pct(t, 75), pct(t, 99),
+            float(t.mean()) if t.size else float("nan"), run.completion_rate(),
+            float(np.median(tp)) * 1e3 if tp.size else float("nan"), run.errors()]
 
 
-def cmd_box(pairs: list[tuple[str, str]], out: str) -> None:
+HEADER = ["system", "requests", "P1 (s)", "P25 (s)", "P50 (s)", "P75 (s)", "P99 (s)",
+          "mean (s)", "req/s", "TPOT (ms)", "errors"]
+
+
+def box(runs: list[tuple[str, str]], out: str, xlabel: str = "TTFT (s)",
+        warmup_s: float = 0.0) -> None:
+    style.setup()
     import matplotlib.pyplot as plt
-    apply_style()
-    labels = [p[0] for p in pairs]
-    stats = [_box_stats(load_ttfts(p[1])) for p in pairs]
-    fig, ax = plt.subplots(figsize=(SUB_W * 1.3, SUB_H))
-    bp = ax.bxp(stats, showfliers=False, patch_artist=True, widths=0.6)
-    for i, box in enumerate(bp["boxes"]):
-        box.set(facecolor=_PALETTE[i % len(_PALETTE)], alpha=0.65, lw=0.6)
-    for med in bp["medians"]:
-        med.set(color="black", lw=1.0)
-    ax.set_xticklabels(labels, rotation=20, ha="right")
-    ax.set_ylabel("TTFT (s)")
-    ax.grid(True, axis="y", lw=0.4, alpha=0.4)
-    ax.tick_params(direction="in", length=2.5)
-    fig.tight_layout(pad=0.2)
-    fig.savefig(out, bbox_inches="tight", pad_inches=0.02)
-    for lab, st in zip(labels, stats):
-        print(f"  {lab:10s} p50={st['med']:.2f}s p99={st['whishi']:.2f}s")
-    print(f"wrote {out}")
+
+    data = [(label, Run(p, warmup_s=warmup_s)) for label, p in runs]
+    fig, ax = plt.subplots(figsize=(3.4, 0.35 * len(data) + 0.6))
+    for i, (label, r) in enumerate(data):
+        t = r.ttft()
+        if not t.size:
+            continue
+        p1, p25, p50, p75, p99 = (pct(t, q) for q in (1, 25, 50, 75, 99))
+        y = len(data) - 1 - i
+        ax.add_patch(plt.Rectangle((p25, y - 0.3), p75 - p25, 0.6, fill=True,
+                                   facecolor=style.PALETTE[i % 8], alpha=0.35,
+                                   edgecolor=style.PALETTE[i % 8]))
+        ax.plot([p50, p50], [y - 0.3, y + 0.3], color="black", lw=1.2)
+        ax.plot([p1, p25], [y, y], color="black", lw=0.8)
+        ax.plot([p75, p99], [y, y], color="black", lw=0.8)
+        for x in (p1, p99):
+            ax.plot([x, x], [y - 0.15, y + 0.15], color="black", lw=0.8)
+    ax.set_yticks(range(len(data)))
+    ax.set_yticklabels([label for label, _ in data][::-1])
+    ax.set_ylim(-0.6, len(data) - 0.4)
+    ax.set_xlabel(xlabel)
+    ax.set_xlim(left=0)
+    style.save(fig, f"{out}.pdf")
+    table(runs, out, warmup_s)
 
 
-def cmd_load(series: list[tuple[str, list[tuple[float, str]]]], out: str) -> None:
-    import matplotlib.pyplot as plt
-    apply_style()
-    fig, ax = plt.subplots(figsize=(SUB_W * 1.3, SUB_H))
-    for i, (label, points) in enumerate(series):
-        rates = [r for r, _ in points]
-        means = [float(load_ttfts(f).mean()) for _, f in points]
-        ax.plot(rates, means, "-o", color=_PALETTE[i % len(_PALETTE)], lw=1.2,
-                ms=3, label=label)
-    ax.set_xlabel("Offered load (req/s)")
-    ax.set_ylabel("Mean TTFT (s)")
-    ax.grid(True, lw=0.4, alpha=0.4)
-    ax.tick_params(direction="in", length=2.5)
-    ax.legend(loc="upper left", frameon=False, handlelength=1.4)
-    fig.tight_layout(pad=0.2)
-    fig.savefig(out, bbox_inches="tight", pad_inches=0.02)
-    print(f"wrote {out}")
+def table(runs: list[tuple[str, str]], out: str | None, warmup_s: float = 0.0) -> None:
+    rows = [[label] + stats(Run(p, warmup_s=warmup_s)) for label, p in runs]
+    style.write_table(rows, HEADER, out, title="TTFT (closed loop)")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Figs 16-17: TTFT box / load")
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    b = sub.add_parser("box")
-    b.add_argument("pairs", nargs="+", help="Label=file.jsonl")
-    b.add_argument("--out", default="eval_ttft_box.pdf")
-    ld = sub.add_parser("load")
-    ld.add_argument("series", nargs="+",
-                    help="Label=rate:file,rate:file (mean TTFT vs rate)")
-    ld.add_argument("--out", default="eval_load_ttft.pdf")
+    for name in ("box", "table"):
+        p = sub.add_parser(name)
+        p.add_argument("runs", nargs="+", help="label=run_dir")
+        p.add_argument("--out", required=name == "box")
+        p.add_argument("--warmup-s", type=float, default=0.0,
+                       help="drop requests sent in the first seconds")
     a = ap.parse_args()
-
+    runs = style.labeled(a.runs)
     if a.cmd == "box":
-        pairs = [tuple(p.split("=", 1)) for p in a.pairs]
-        cmd_box(pairs, a.out)
+        box(runs, a.out, warmup_s=a.warmup_s)
     else:
-        series = []
-        for s in a.series:
-            label, rest = s.split("=", 1)
-            pts = []
-            for tok in rest.split(","):
-                rate, f = tok.split(":", 1)
-                pts.append((float(rate.replace("rate", "")), f))
-            series.append((label, pts))
-        cmd_load(series, a.out)
+        table(runs, a.out, a.warmup_s)
 
 
 if __name__ == "__main__":

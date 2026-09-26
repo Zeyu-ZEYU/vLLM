@@ -1,23 +1,18 @@
 #!/usr/bin/env bash
-# Tear down a Shunt run inside the container. Run before every experiment, then
-# clean_host.sh, then wait ~60s for TIME_WAIT to drain (see README).
-set -uo pipefail
-
-echo "[clean] stopping vLLM / proxy / planner / samplers"
-pkill -f "shunt.serving.proxy"        2>/dev/null || true
-pkill -f "shunt.harness.node_planner" 2>/dev/null || true
-pkill -f "shunt.harness.bw_sampler"   2>/dev/null || true
-pkill -f "vllm serve"                 2>/dev/null || true
-pkill -f "vllm.entrypoints"           2>/dev/null || true
-pkill -f "EngineCore"                 2>/dev/null || true
-
-echo "[clean] freeing GPUs held by stragglers"
-for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | sort -u); do
-  kill -9 "$pid" 2>/dev/null || true
+# Stop every process of a Shunt run owned by this user on this host (vLLM
+# servers and their workers, the Mooncake master, the proxy, the trace driver,
+# RNIC samplers) and remove Mooncake shared-memory files. Run on every host
+# before a run; the harness does it for you.
+set -u
+me=$(id -u)
+for pat in '[v]llm serve' '[V]LLM::' '[m]ooncake_master' '[s]hunt.serving.proxy' \
+           '[s]hunt.harness.replay' '[s]hunt.harness.bw_sampler'; do
+  pgrep -u "$me" -f "$pat" | xargs -r kill -TERM 2>/dev/null
 done
-
-echo "[clean] clearing planner plan files + mooncake metadata"
-rm -f /tmp/shunt/kvlb_plan_*.json 2>/dev/null || true
-rm -rf /dev/shm/mooncake* 2>/dev/null || true
-
-echo "[clean] done"
+sleep 3
+for pat in '[v]llm serve' '[V]LLM::' '[m]ooncake_master' '[s]hunt.serving.proxy' \
+           '[s]hunt.harness.replay' '[s]hunt.harness.bw_sampler'; do
+  pgrep -u "$me" -f "$pat" | xargs -r kill -KILL 2>/dev/null
+done
+find /dev/shm -maxdepth 1 -user "$me" -name 'mooncake*' -exec rm -rf {} + 2>/dev/null
+echo "clean: done on $(hostname)"

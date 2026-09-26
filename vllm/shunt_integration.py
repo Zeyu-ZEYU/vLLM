@@ -46,6 +46,11 @@ def on_distributed_ready(vllm_config) -> None:
     rt = _state()
     rank = get_dp_group().rank_in_group if pc.data_parallel_size > 1 else 0
     rt.set_rank(rank, pc.data_parallel_size)
+    if pc.tensor_parallel_size > 1:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        if get_tp_group().rank_in_group != 0:
+            rt.logs.dir = None   # one log per DP rank
 
     from shunt.runtime import kv_router, timing
 

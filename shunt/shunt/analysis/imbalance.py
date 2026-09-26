@@ -1,18 +1,23 @@
-"""Per-iteration imbalance of compute and KV traffic (Figs 6-8).
+"""Per-iteration imbalance across DP ranks (Figs. 5-7, Tables S1 and S7).
 
-An "iteration" is a window of ``ep_group_workers * batch`` consecutive trace
-requests run in lockstep across the DP workers (§2.3). We report, per iteration,
-the max/mean over workers of (a) worker-compute time, (b) inbound prefix-KV
-volume, (c) outbound new-KV volume, under two assignments:
+Every iteration's imbalance is the max/mean over the DP ranks of the measured
+worker-compute time (attention, gate, and routing phases summed over the
+layers, from runs with ``SHUNT_TIMING>=1``) and of the inbound and outbound KV
+tokens (from the ranks' request logs).
 
-- ``roundrobin`` -- vLLM's default dispatch (worker = request index mod W),
-  giving the natural imbalance of Figs 6 and 7;
-- ``oracle`` -- the offline min-makespan compute balance of Fig 8, which evens
-  compute and outbound-KV but cannot remove the straggler and even worsens the
-  inbound prefix-KV.
+Examples::
 
-KV volumes are in tokens here (the per-token/per-layer constant cancels in
-max/mean); compute is the model's worker-compute time.
+    # Fig. 5 (compute) and Fig. 6 (KV) from a Baseline run
+    python -m shunt.analysis.imbalance plot --run results/motivation/baseline \\
+        --kind compute --out figs/fig5_straggler
+    python -m shunt.analysis.imbalance plot --run results/motivation/baseline \\
+        --kind kv --out figs/fig6_kv
+    # Fig. 7 from the ORS run (compute, inbound, and outbound on one plot)
+    python -m shunt.analysis.imbalance plot --run results/motivation/ors \\
+        --kind all --out figs/fig7_oracle
+    # Tables S1 and S7: one column per run
+    python -m shunt.analysis.imbalance table traceB=results/.../baseline \\
+        coder=results/.../baseline-coder --out tables/tab_s1_imbalance
 """
 from __future__ import annotations
 
@@ -20,125 +25,85 @@ import argparse
 
 import numpy as np
 
-from ..algorithms import optimal_oracle
-from ..compute_model import ComputeModel
-from ..config import TESTBED
-from ..trace import TraceRecord, load_trace
+from . import style
+from .load import Run, kv_imbalance, pct, worker_compute_imbalance
 
 
-def _maxmean(values: np.ndarray) -> float:
-    m = values.mean()
-    return float(values.max() / m) if m > 0 else 1.0
+def _series(run: Run, kind: str) -> dict[str, np.ndarray]:
+    out = {}
+    if kind in ("compute", "all"):
+        out["Worker compute"] = worker_compute_imbalance(run)
+    if kind in ("kv", "all"):
+        kin, kout = kv_imbalance(run)
+        out["Inbound prefix-KV"] = kin
+        out["Outbound new-KV"] = kout
+    return out
 
 
-def imbalance_series(records: list[TraceRecord], model: ComputeModel,
-                     mode: str = "roundrobin", batch: int = 32,
-                     max_windows: int | None = None
-                     ) -> dict[str, np.ndarray]:
-    """Return per-iteration max/mean series for compute, inbound, outbound."""
-    W = TESTBED.ep_group_workers
-    per = W * batch
-    P = np.array([r.prefix_tokens for r in records], dtype=np.float64)
-    N = np.array([r.fresh_tokens for r in records], dtype=np.float64)
-    C = np.array([model.worker_compute_time(r.prefix_tokens, r.fresh_tokens)
-                  for r in records], dtype=np.float64)
-
-    T = len(records) // per
-    if max_windows is not None:
-        T = min(T, max_windows)
-    comp = np.empty(T); inb = np.empty(T); outb = np.empty(T)
-    for t in range(T):
-        sl = slice(t * per, (t + 1) * per)
-        Cw, Pw, Nw = C[sl], P[sl], N[sl]
-        if mode == "roundrobin":
-            cs = np.array([Cw[w::W].sum() for w in range(W)])
-            ps = np.array([Pw[w::W].sum() for w in range(W)])
-            ns = np.array([Nw[w::W].sum() for w in range(W)])
-        elif mode == "oracle":
-            assign = optimal_oracle(list(Cw), W)
-            a = np.array(assign)
-            cs = np.array([Cw[a == w].sum() for w in range(W)])
-            ps = np.array([Pw[a == w].sum() for w in range(W)])
-            ns = np.array([Nw[a == w].sum() for w in range(W)])
-        else:
-            raise ValueError(mode)
-        comp[t] = _maxmean(cs); inb[t] = _maxmean(ps); outb[t] = _maxmean(ns)
-    return {"compute": comp, "inbound": inb, "outbound": outb}
-
-
-def _summ(name: str, s: np.ndarray) -> str:
-    p10, p50, p90, mx = np.percentile(s, [10, 50, 90, 100])
-    frac3 = float((s > 3.0).mean())
-    return (f"  {name:9s} p10={p10:.2f} p50={p50:.2f} p90={p90:.2f} "
-            f"max={mx:.2f}  frac>3x={frac3:.2%}")
-
-
-def plot(series: dict[str, np.ndarray], keys: list[str], out_prefix: str) -> None:
-    """Emit a per-iteration series PDF and a CDF PDF for the chosen metrics."""
-    from ..plots import BLUE, GREEN, RED, SUB_H, SUB_W, apply_style
+def plot(run: Run, kind: str, out: str) -> None:
+    style.setup()
     import matplotlib.pyplot as plt
-    apply_style()
-    color = {"compute": GREEN, "inbound": RED, "outbound": BLUE}
-    label = {"compute": "Compute", "inbound": "Inbound", "outbound": "Outbound"}
-    top = max(series[k].max() for k in keys)
 
-    fig, ax = plt.subplots(figsize=(SUB_W, SUB_H))
-    for k in keys:
-        x = np.arange(1, len(series[k]) + 1)
-        ax.plot(x, series[k], color=color[k], lw=0.7, label=label[k])
-    ax.set_xlabel("Prefill iteration"); ax.set_ylabel(r"$\max/\mathrm{mean}$")
-    ax.set_xlim(1, len(series[keys[0]])); ax.set_ylim(1.0, top * 1.05)
-    ax.grid(True, lw=0.4, alpha=0.4); ax.tick_params(direction="in", length=2.5)
-    ax.legend(loc="upper right", frameon=False, handlelength=1.1)
-    fig.tight_layout(pad=0.2); fig.savefig(f"{out_prefix}_series.pdf",
-                                           bbox_inches="tight", pad_inches=0.02)
+    series = _series(run, kind)
+    fig, ax = plt.subplots(figsize=(3.4, 1.6))
+    for i, (label, v) in enumerate(series.items()):
+        ax.plot(np.arange(len(v)), v, lw=0.8, color=style.PALETTE[i], label=label)
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Imbalance\n(max/mean)")
+    ax.legend(loc="upper right", framealpha=0.8)
+    style.save(fig, f"{out}_series.pdf")
 
-    fig, ax = plt.subplots(figsize=(SUB_W, SUB_H))
-    for k in keys:
-        s = np.sort(series[k])
-        ax.plot(s, np.arange(1, len(s) + 1) / len(s), color=color[k], lw=1.2,
-                label=label[k])
-    ax.set_xlabel(r"$\max/\mathrm{mean}$"); ax.set_ylabel("CDF of iterations")
-    ax.set_xlim(1.0, top * 1.05); ax.set_ylim(0, 1); ax.set_yticks([0, 0.5, 1.0])
-    ax.grid(True, lw=0.4, alpha=0.4); ax.tick_params(direction="in", length=2.5)
-    ax.legend(loc="lower right", frameon=False, handlelength=1.1)
-    fig.tight_layout(pad=0.2); fig.savefig(f"{out_prefix}_cdf.pdf",
-                                           bbox_inches="tight", pad_inches=0.02)
-    print(f"wrote {out_prefix}_series.pdf and _cdf.pdf")
+    fig, ax = plt.subplots(figsize=(3.4, 1.6))
+    for i, (label, v) in enumerate(series.items()):
+        x = np.sort(v)
+        ax.plot(x, np.arange(1, len(x) + 1) / max(1, len(x)), lw=1.2,
+                color=style.PALETTE[i], label=label)
+    ax.set_xlabel("Imbalance (max/mean)")
+    ax.set_ylabel("CDF")
+    ax.legend(loc="lower right", framealpha=0.8)
+    style.save(fig, f"{out}_cdf.pdf")
+    rows = [[label, len(v), pct(v, 50), pct(v, 90), pct(v, 99),
+             float(v.max()) if v.size else float("nan"),
+             float((v > 3).mean()) if v.size else float("nan")]
+            for label, v in series.items()]
+    style.write_table(rows, ["series", "iterations", "median", "P90", "P99", "max",
+                             "share>3"], f"{out}_summary", title=run.name)
+
+
+def table(runs: list[tuple[str, str]], out: str | None) -> None:
+    header = ["metric"] + [label for label, _ in runs]
+    cols = []
+    for _, path in runs:
+        r = Run(path)
+        wc = worker_compute_imbalance(r)
+        kin, kout = kv_imbalance(r)
+        cols.append([pct(wc, 50), pct(wc, 90), pct(wc, 99),
+                     float(wc.max()) if wc.size else float("nan"),
+                     pct(kin, 50), pct(kin, 99), float(kin.max()) if kin.size else float("nan"),
+                     pct(kout, 50), pct(kout, 99),
+                     float(kout.max()) if kout.size else float("nan")])
+    names = ["compute median", "compute P90", "compute P99", "compute worst",
+             "inbound median", "inbound P99", "inbound worst",
+             "outbound median", "outbound P99", "outbound worst"]
+    rows = [[n] + [c[i] for c in cols] for i, n in enumerate(names)]
+    style.write_table(rows, header, out, title="per-iteration imbalance (max/mean)")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Trace imbalance analysis (Figs 6-8)")
-    ap.add_argument("--trace", required=True)
-    ap.add_argument("--limit", type=int, default=None,
-                    help="cap requests read from the trace (for a quick check)")
-    ap.add_argument("--max-windows", type=int, default=None,
-                    help="cap iterations analyzed (the oracle is slow)")
-    ap.add_argument("--profile", default=None, help="compute-model profile json")
-    ap.add_argument("--plot-dir", default=None,
-                    help="if set, emit Figs 6 (compute,RR), 7 (KV,RR), 8 (oracle)")
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("plot")
+    p.add_argument("--run", required=True)
+    p.add_argument("--kind", choices=["compute", "kv", "all"], default="compute")
+    p.add_argument("--out", required=True)
+    t = sub.add_parser("table")
+    t.add_argument("runs", nargs="+", help="label=run_dir")
+    t.add_argument("--out")
     a = ap.parse_args()
-
-    model = (ComputeModel.from_profile(a.profile) if a.profile
-             else ComputeModel.default())
-    records = load_trace(a.trace, limit=a.limit)
-    print(f"loaded {len(records)} requests")
-
-    import os
-    for mode in ("roundrobin", "oracle"):
-        s = imbalance_series(records, model, mode=mode, max_windows=a.max_windows)
-        print(f"[{mode}]  ({len(s['compute'])} iterations)")
-        for k in ("compute", "inbound", "outbound"):
-            print(_summ(k, s[k]))
-        if a.plot_dir:
-            os.makedirs(a.plot_dir, exist_ok=True)
-            if mode == "roundrobin":
-                plot(s, ["compute"], os.path.join(a.plot_dir, "straggler_imbalance"))
-                plot(s, ["outbound", "inbound"],
-                     os.path.join(a.plot_dir, "kv_imbalance"))
-            else:
-                plot(s, ["compute", "outbound", "inbound"],
-                     os.path.join(a.plot_dir, "kv_imbalance_oracle"))
+    if a.cmd == "plot":
+        plot(Run(a.run), a.kind, a.out)
+    else:
+        table(style.labeled(a.runs), a.out)
 
 
 if __name__ == "__main__":

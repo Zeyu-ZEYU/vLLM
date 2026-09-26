@@ -126,21 +126,26 @@ class _RecvMeta:
 
 
 class ElasticAttention:
-    """Per-process elastic-attention runtime of one prefill DP rank."""
+    """Per-process elastic-attention runtime of one prefill DP rank.
 
-    def __init__(self, rt: _state.StepRuntime, max_num_seqs: int):
-        m = rt.model
+    ``rt=None`` builds the compute part only (used by the microbenchmark);
+    then ``model`` gives the head counts.
+    """
+
+    def __init__(self, rt: _state.StepRuntime | None, max_num_seqs: int, model=None):
+        m = rt.model if rt is not None else model
         self.rt = rt
         self.H, self.Hkv, self.D = m.num_q_heads, m.num_kv_heads, m.head_dim
         self.qpk = m.q_per_kv
         self.max_seqs = max_num_seqs
-        self.rank = rt.rank
+        self.rank = rt.rank if rt is not None else 0
         self.groups: dict[int, object] = {}
         self.asg: Assignment | None = None
         self.seq = -1
         self._meta: dict = {}
         self._lock = threading.Lock()
-        rt.add_listener(self._on_plan)
+        if rt is not None:
+            rt.add_listener(self._on_plan)
 
     # --- setup ------------------------------------------------------------------
 
@@ -306,7 +311,8 @@ class ElasticAttention:
         # 2. own attention (kept heads on a donor; everything otherwise)
         if is_donor:
             out = self._kept_attention(mod, W, positions, hidden_states, md,
-                                       kv_cache, slot_mapping, attn_layer, donor.T)
+                                       kv_cache, slot_mapping, attn_layer, donor.T,
+                                       asg.keep)
         else:
             out = orig(positions, hidden_states)
         for w in works:
@@ -360,8 +366,11 @@ class ElasticAttention:
         return a // self.qpk, (b - 1) // self.qpk + 1
 
     def _kept_attention(self, mod, W, positions, hidden_states, md, kv_cache,
-                        slot_mapping, attn_layer, T: int) -> torch.Tensor:
-        K = self.asg.keep
+                        slot_mapping, attn_layer, T: int, keep: int) -> torch.Tensor:
+        """Heads ``[0, keep)`` of this rank's own tokens over its paged cache:
+        writes their KV heads' new KV and returns the output projection of
+        those heads (rows past ``T`` are zero)."""
+        K = keep
         out = hidden_states.new_zeros(hidden_states.shape[0], W.hidden)
         if K == 0:
             return out
@@ -386,6 +395,8 @@ class ElasticAttention:
         return out
 
     def _donated_heads(self, mod, W, m: _RecvMeta, xs, kp, vp, a: int, b: int):
+        """A donor's heads ``[a, b)`` for its tokens ``xs``: returns the output
+        projection of those heads and the new K and V of their KV heads."""
         D, qpk = self.D, self.qpk
         g0, g1 = self._kv_range(a, b)
         nh, gc, T = b - a, g1 - g0, m.T

@@ -1,15 +1,17 @@
-"""Sample RNIC bandwidth utilization from the IB port counters (Figs 9, 11).
+"""Sample RNIC and network-interface throughput at a fixed interval.
 
-Reads ``port_xmit_data`` / ``port_rcv_data`` (4-octet units) under
-``/sys/class/infiniband/<dev>/ports/<port>/counters`` and reports per-direction
-GB/s and utilization against the port's capacity. Used to show the backend is
-near-saturated (Fig 9) while the frontend stays under 0.1% (Fig 11).
+RDMA devices are read from ``/sys/class/infiniband/<dev>/ports/<port>/counters``
+(``port_xmit_data`` / ``port_rcv_data``, in 4-byte units); network interfaces
+from ``/sys/class/net/<if>/statistics`` (``tx_bytes`` / ``rx_bytes``). Every
+sample is one JSON line per device with the bytes moved in each direction over
+the measured interval and the utilization against the given capacity.
 
-Example::
+Example (a prefill node's backend bonds and frontend)::
 
-    python -m shunt.harness.bw_sampler \
-        --device mlx5_bond_0:1 --device mlx5_bond_1:1 ... \
-        --interval-ms 5 --duration 45 --capacity-gbps 200 --out backend_bw.jsonl
+    python -m shunt.harness.bw_sampler --interval-ms 5 --duration 60 \\
+        --ib mlx5_bond_0:1@400 --ib mlx5_bond_1:1@400 \\
+        --ib mlx5_bond_2:1@400 --ib mlx5_bond_3:1@400 \\
+        --ib mlx5_0:1@200 --netdev eth0@200 --out bw.jsonl
 """
 from __future__ import annotations
 
@@ -18,55 +20,78 @@ import json
 import time
 from pathlib import Path
 
-CTR = Path("/sys/class/infiniband")
+IB = Path("/sys/class/infiniband")
+NET = Path("/sys/class/net")
 
 
-def _read(dev: str, port: str, name: str) -> int:
+def _read(p: Path) -> int:
     try:
-        return int((CTR / dev / "ports" / port / "counters" / name).read_text())
-    except OSError:
+        return int(p.read_text())
+    except (OSError, ValueError):
         return 0
 
 
-def _xmit_rcv(dev: str, port: str) -> tuple[int, int]:
-    # counters are in units of 4 octets
-    return (_read(dev, port, "port_xmit_data") * 4,
-            _read(dev, port, "port_rcv_data") * 4)
+class Device:
+    def __init__(self, kind: str, spec: str):
+        name, _, cap = spec.partition("@")
+        self.kind = kind
+        self.cap_Bps = float(cap or 200) * 1e9 / 8
+        if kind == "ib":
+            dev, _, port = name.partition(":")
+            self.name, self.port = dev, port or "1"
+            base = IB / dev / "ports" / self.port / "counters"
+            self._tx, self._rx, self._scale = (base / "port_xmit_data",
+                                               base / "port_rcv_data", 4)
+        else:
+            self.name, self.port = name, ""
+            base = NET / name / "statistics"
+            self._tx, self._rx, self._scale = base / "tx_bytes", base / "rx_bytes", 1
+
+    def read(self) -> tuple[int, int]:
+        return _read(self._tx) * self._scale, _read(self._rx) * self._scale
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="RNIC bandwidth sampler")
-    ap.add_argument("--device", action="append", required=True,
-                    help="dev:port, e.g. mlx5_bond_0:1 (repeatable)")
+    ap = argparse.ArgumentParser(description="RNIC / network interface sampler")
+    ap.add_argument("--ib", action="append", default=[],
+                    help="RDMA device dev:port@Gbps (repeatable)")
+    ap.add_argument("--netdev", action="append", default=[],
+                    help="network interface name@Gbps (repeatable)")
     ap.add_argument("--interval-ms", type=float, default=5.0)
-    ap.add_argument("--duration", type=float, default=45.0)
-    ap.add_argument("--capacity-gbps", type=float, default=200.0)
+    ap.add_argument("--duration", type=float, default=60.0)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
-    devs = [d.split(":") if ":" in d else (d, "1") for d in a.device]
-    cap_GBps = a.capacity_gbps * 1e9 / 8 / 1e9   # GB/s capacity
-    dt = a.interval_ms / 1000.0
-    prev = {tuple(d): _xmit_rcv(*d) for d in devs}
-    t_end = time.time() + a.duration
-
+    devs = [Device("ib", s) for s in a.ib] + [Device("net", s) for s in a.netdev]
+    if not devs:
+        ap.error("give at least one --ib or --netdev")
+    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+    dt = a.interval_ms / 1e3
+    prev = [d.read() for d in devs]
+    t_prev = time.perf_counter()
+    t_next = t_prev + dt
+    t_end = t_prev + a.duration
     with open(a.out, "w") as f:
-        while time.time() < t_end:
-            time.sleep(dt)
-            now = time.time()
-            for d in devs:
-                k = tuple(d)
-                tx, rx = _xmit_rcv(*d)
-                ptx, prx = prev[k]
-                tx_GBps = (tx - ptx) / 1e9 / dt
-                rx_GBps = (rx - prx) / 1e9 / dt
-                prev[k] = (tx, rx)
+        while t_next <= t_end:
+            while True:           # sleep most of the interval, spin the rest
+                left = t_next - time.perf_counter()
+                if left <= 0:
+                    break
+                if left > 0.002:
+                    time.sleep(left - 0.001)
+            now = time.perf_counter()
+            cur = [d.read() for d in devs]
+            span = now - t_prev
+            wall = time.time()
+            for d, (tx, rx), (ptx, prx) in zip(devs, cur, prev):
                 f.write(json.dumps({
-                    "t": now, "dev": d[0], "port": d[1],
-                    "tx_GBps": tx_GBps, "rx_GBps": rx_GBps,
-                    "tx_util": tx_GBps / cap_GBps, "rx_util": rx_GBps / cap_GBps,
-                }) + "\n")
-            f.flush()
+                    "t": wall, "dt": span, "dev": d.name, "port": d.port,
+                    "kind": d.kind, "tx_bytes": tx - ptx, "rx_bytes": rx - prx,
+                    "tx_util": (tx - ptx) / span / d.cap_Bps,
+                    "rx_util": (rx - prx) / span / d.cap_Bps,
+                }, separators=(",", ":")) + "\n")
+            prev, t_prev = cur, now
+            t_next += dt
 
 
 if __name__ == "__main__":
