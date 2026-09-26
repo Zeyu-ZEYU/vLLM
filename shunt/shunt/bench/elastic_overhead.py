@@ -21,7 +21,7 @@ Example (8 GPUs)::
 
     torchrun --nproc-per-node 8 -m shunt.bench.elastic_overhead \\
         --model /models/Qwen3-235B-A22B --iterations bench/iterations.json \\
-        --helpers 1 3 5 7 --profile profiles/h20.json --out bench/eap_overhead.json
+        --helpers 1 3 5 7 --profile profiles/compute.json --out bench/eap_overhead.json
 """
 from __future__ import annotations
 

@@ -22,7 +22,7 @@ Example (8 GPUs)::
 
     torchrun --nproc-per-node 8 -m shunt.bench.ring_attention \\
         --model /models/Qwen3-235B-A22B --iterations bench/iterations.json \\
-        --helpers 1 3 7 --profile profiles/h20.json --out bench/ring.json
+        --helpers 1 3 7 --profile profiles/compute.json --out bench/ring.json
 """
 from __future__ import annotations
 

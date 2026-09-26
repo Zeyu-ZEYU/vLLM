@@ -14,7 +14,7 @@ Examples::
         --window 45 --out figs/fig8_backend_bw
     # Fig. S2: the frontend interface
     python -m shunt.analysis.bandwidth --prefill .../p0.jsonl --decode .../d0.jsonl \\
-        --devices eth0 --window 50 --percent-max 0.1 --out figs/figS2_frontend_bw
+        --devices eth0 --window 50 --out figs/figS2_frontend_bw
 """
 from __future__ import annotations
 
@@ -47,7 +47,8 @@ def main() -> None:
     ap.add_argument("--start", type=float, default=None,
                     help="seconds after the first sample (default: middle of the run)")
     ap.add_argument("--window", type=float, default=45.0)
-    ap.add_argument("--percent-max", type=float, default=100.0, help="y-axis limit (%)")
+    ap.add_argument("--percent-max", type=float, default=None,
+                    help="y-axis limit in percent (default: fit the data)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     devs = set(a.devices.split(","))

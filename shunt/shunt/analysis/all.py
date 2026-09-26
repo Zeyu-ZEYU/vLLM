@@ -69,8 +69,8 @@ def main() -> None:
                 need=[p, d])
         if a.frontend_device:
             run("Fig. S2", "bandwidth", "--prefill", p, "--decode", d, "--devices",
-                a.frontend_device, "--window", "50", "--percent-max", "0.1",
-                "--out", F / "figS2_frontend_bw", need=[p, d])
+                a.frontend_device, "--window", "50", "--out", F / "figS2_frontend_bw",
+                need=[p, d])
     run("Fig. 9", "ttft", "box", *w, f"Baseline={mot / 'baseline'}",
         f"No contention={mot / 'no-contention'}", "--out", F / "fig9_contention",
         need=[mot / "baseline", mot / "no-contention"])

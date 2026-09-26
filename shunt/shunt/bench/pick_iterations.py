@@ -8,7 +8,7 @@ first, then the others from lightest to heaviest. The output feeds
 
 Example::
 
-    python -m shunt.bench.pick_iterations --run results/motivation/baseline \\
+    python -m shunt.bench.pick_iterations --run results/motivation/baseline-timing \\
         --targets 3 5 7 9 11 --workers-per-node 8 --out bench/iterations.json
 """
 from __future__ import annotations

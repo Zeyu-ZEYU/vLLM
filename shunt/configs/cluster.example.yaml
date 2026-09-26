@@ -63,7 +63,7 @@ lmcache:
   local_mode_cpu_gb: 200        # prefill-local memory of the no-contention system
 
 shunt:
-  compute_profile: /opt/shunt/profiles/qwen3-235b.json   # python -m shunt.profiling.compute
+  compute_profile: profiles/compute.json   # relative to workdir; see shunt.profiling.compute
   gpu_direct: true
   gpu_pool_mb: 2048
   host_pool_mb: 4096

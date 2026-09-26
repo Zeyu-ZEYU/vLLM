@@ -13,7 +13,7 @@ proxy load through ``compute_profile``.
 Example::
 
     python -m shunt.profiling.compute --model /models/Qwen3-235B-A22B \\
-        --ep 16 --out profiles/h20_qwen3_235b.json
+        --ep 16 --out profiles/compute.json
 """
 from __future__ import annotations
 

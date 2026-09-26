@@ -1,10 +1,7 @@
 __pycache__/
 *.pyc
-*.so
-*.o
-build/
 *.egg-info/
-results/
-*.jsonl
-*.log
+build/
+csrc/*.so
+csrc/*.o
 csrc/scalability_bench
