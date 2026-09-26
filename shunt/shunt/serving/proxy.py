@@ -102,7 +102,6 @@ class Proxy:
 
         resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await resp.prepare(request)
-        self.placement.started(rank, est)
         try:
             first, kvp = await self._prefill(body, rid, rank)
         except Exception as e:  # noqa: BLE001

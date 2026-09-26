@@ -15,6 +15,8 @@ def test_lpt_parity():
         W = rng.randint(1, 20)
         c = [rng.choice([rng.random(), 1.0]) for _ in range(rng.randint(0, 200))]
         assert N.lpt_schedule(c, W) == A.lpt_schedule(c, W)
+        init = [rng.random() * 3 for _ in range(W)]
+        assert N.lpt_schedule(c, W, init) == A.lpt_schedule(c, W, init)
 
 
 def test_balance_heads_parity():

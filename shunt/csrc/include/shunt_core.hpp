@@ -19,8 +19,10 @@ constexpr double kEps = 1e-9;
 
 // ---- LPT placement ---------------------------------------------------------
 // Heaviest request first (ties: lower index); each goes to the least-loaded
-// worker (ties: lower worker index). A min-heap keeps it O(n log W).
-inline void lpt_schedule(const double* c, int n, int W, int* worker_of) {
+// worker (ties: lower worker index), starting from init_load (the work already
+// placed on each worker; nullptr for none). A min-heap keeps it O(n log W).
+inline void lpt_schedule(const double* c, int n, int W, int* worker_of,
+                         const double* init_load = nullptr) {
     std::vector<int> order(n);
     std::iota(order.begin(), order.end(), 0);
     std::stable_sort(order.begin(), order.end(),
@@ -30,7 +32,7 @@ inline void lpt_schedule(const double* c, int n, int W, int* worker_of) {
         return a.first != b.first ? a.first > b.first : a.second > b.second;
     };
     std::priority_queue<LW, std::vector<LW>, decltype(cmp)> pq(cmp);
-    for (int w = 0; w < W; ++w) pq.push({0.0, w});
+    for (int w = 0; w < W; ++w) pq.push({init_load ? init_load[w] : 0.0, w});
     for (int i : order) {
         LW top = pq.top();
         pq.pop();

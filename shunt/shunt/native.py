@@ -26,7 +26,7 @@ _d = ctypes.POINTER(ctypes.c_double)
 _i = ctypes.POINTER(ctypes.c_int32)
 
 if _lib is not None:
-    _lib.shunt_lpt_schedule.argtypes = [_d, ctypes.c_int, ctypes.c_int, _i]
+    _lib.shunt_lpt_schedule.argtypes = [_d, ctypes.c_int, ctypes.c_int, _i, _d]
     _lib.shunt_lpt_schedule.restype = None
     _lib.shunt_balance_heads.argtypes = [
         _d, _d, ctypes.c_int, ctypes.c_double, ctypes.c_int, ctypes.c_double,
@@ -53,12 +53,16 @@ def _f64(x) -> np.ndarray:
     return np.ascontiguousarray(np.asarray(x, dtype=np.float64))
 
 
-def lpt_schedule(compute_times, num_workers: int) -> list[int]:
+def lpt_schedule(compute_times, num_workers: int, init_load=None) -> list[int]:
     require()
     c = _f64(compute_times)
     out = np.zeros(c.size, dtype=np.int32)
+    init = ctypes.cast(0, _d)
+    if init_load is not None:
+        load = _f64(init_load)
+        init = load.ctypes.data_as(_d)
     _lib.shunt_lpt_schedule(c.ctypes.data_as(_d), c.size, int(num_workers),
-                            out.ctypes.data_as(_i))
+                            out.ctypes.data_as(_i), init)
     return out.tolist()
 
 

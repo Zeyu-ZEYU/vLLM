@@ -20,16 +20,19 @@ EPS = 1e-9
 # Request placement
 # ---------------------------------------------------------------------------
 
-def lpt_schedule(compute_times: list[float], num_workers: int) -> list[int]:
+def lpt_schedule(compute_times: list[float], num_workers: int,
+                 init_load: list[float] | None = None) -> list[int]:
     """Longest-processing-time placement.
 
     Requests are taken heaviest first (ties: lower index first) and each goes
-    to the currently least-loaded worker (ties: lower worker index). Returns
-    ``worker_of[i]`` for every request ``i``.
+    to the currently least-loaded worker (ties: lower worker index).
+    ``init_load`` is the work already placed on each worker (default: none).
+    Returns ``worker_of[i]`` for every request ``i``.
     """
     n = len(compute_times)
     order = sorted(range(n), key=lambda i: (-compute_times[i], i))
-    load = [0.0] * num_workers
+    load = [float(x) for x in init_load] if init_load is not None \
+        else [0.0] * num_workers
     worker_of = [0] * n
     for i in order:
         w = min(range(num_workers), key=lambda x: (load[x], x))

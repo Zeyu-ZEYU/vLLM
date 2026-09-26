@@ -2,7 +2,8 @@
 
 - ``rr``: round-robin, vLLM's default dispatch (Baseline).
 - ``lpt``: Shunt's placement (RS). Requests that arrive within one tick are
-  placed together with the LPT rule on their estimated worker-compute time.
+  placed together with the LPT rule on their estimated worker-compute time,
+  on top of each rank's estimated prefill work still in flight.
 - ``oracle``: a precomputed assignment per request (the ORS baseline), from
   ``python -m shunt.tools.oracle``; requests without one fall back to ``rr``.
 - ``kva``: the rank holding the longest cached prefix; no cached prefix
@@ -47,23 +48,30 @@ class Placement:
             self._task = asyncio.get_event_loop().create_task(self._lpt_loop())
 
     async def place(self, req_key: str, est: float, tokens: list[int] | None) -> int:
+        """Pick a rank and count ``est`` as in-flight work on it until
+        :meth:`finished` is called."""
+        if self.mode == "lpt":
+            fut = asyncio.get_event_loop().create_future()
+            await self._queue.put((est, fut))
+            return await fut
+        rank = self._pick(req_key, tokens)
+        self.load[rank] += est
+        return rank
+
+    def _pick(self, req_key: str, tokens: list[int] | None) -> int:
         if self.mode == "rr":
             return next(self._rr)
         if self.mode == "oracle":
             r = self.oracle.get(req_key)
             return int(r) if r is not None else next(self._rr)
-        if self.mode in ("kva", "kva_lb"):
-            rank, hit = self.kv_index.longest_prefix(tokens or [])
-            if rank < 0:
-                return next(self._rr)
-            if self.mode == "kva_lb":
-                mean = sum(self.load) / self.n
-                if mean > 0 and self.load[rank] > self.lb_factor * mean:
-                    rank = min(range(self.n), key=lambda r: (self.load[r], r))
-            return rank
-        fut = asyncio.get_event_loop().create_future()
-        await self._queue.put((est, fut))
-        return await fut
+        rank, _ = self.kv_index.longest_prefix(tokens or [])
+        if rank < 0:
+            return next(self._rr)
+        if self.mode == "kva_lb":
+            mean = sum(self.load) / self.n
+            if mean > 0 and self.load[rank] > self.lb_factor * mean:
+                rank = min(range(self.n), key=lambda r: (self.load[r], r))
+        return rank
 
     async def _lpt_loop(self) -> None:
         while True:
@@ -73,15 +81,12 @@ class Placement:
             while not self._queue.empty() and len(batch) < self.max_batch:
                 batch.append(self._queue.get_nowait())
             t0 = time.perf_counter()
-            ranks = self.lpt_fn([e for e, _ in batch], self.n)
+            ranks = self.lpt_fn([e for e, _ in batch], self.n, list(self.load))
             self.decision_us.append((time.perf_counter() - t0) * 1e6)
-            for (_, fut), r in zip(batch, ranks):
+            for (est, fut), r in zip(batch, ranks):
+                self.load[int(r)] += est
                 if not fut.done():
                     fut.set_result(int(r))
-
-    # in-flight load, used by kva_lb
-    def started(self, rank: int, est: float) -> None:
-        self.load[rank] += est
 
     def finished(self, rank: int, est: float) -> None:
         self.load[rank] = max(0.0, self.load[rank] - est)

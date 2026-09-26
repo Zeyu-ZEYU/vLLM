@@ -3,8 +3,9 @@
 
 extern "C" {
 
-void shunt_lpt_schedule(const double* c, int n, int W, int* worker_of) {
-    shunt::lpt_schedule(c, n, W, worker_of);
+void shunt_lpt_schedule(const double* c, int n, int W, int* worker_of,
+                        const double* init_load) {
+    shunt::lpt_schedule(c, n, W, worker_of, init_load);
 }
 
 int shunt_balance_heads(double* t, const double* a, int W, double group_mean,

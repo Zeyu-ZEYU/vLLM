@@ -87,8 +87,11 @@ class KVIndex:
         return best, best_n * bs
 
     def subscribe(self, endpoints: list[str], topic: str = "") -> None:
-        """One subscriber thread per DP rank; ``endpoints[r]`` is rank r's
-        publisher address (e.g. ``tcp://prefill-host:5557``)."""
+        """One subscriber thread per DP rank. ``endpoints[r]`` is rank r's
+        publisher address to connect to (e.g. ``tcp://prefill-host:5557`` when
+        the engines publish on ``tcp://*:5557``), or ``bind:<address>`` to
+        bind here when the engines publish by connecting (an endpoint without
+        a wildcard). vLLM adds the DP rank to the publisher's port."""
         for r, ep in enumerate(endpoints):
             t = threading.Thread(target=self._run, args=(r, ep, topic), daemon=True)
             t.start()
@@ -101,7 +104,11 @@ class KVIndex:
 
         dec = msgspec.msgpack.Decoder(type=KVEventBatch)
         sock = zmq.Context.instance().socket(zmq.SUB)
-        sock.connect(endpoint)
+        if endpoint.startswith("bind:"):
+            # vLLM publishers connect when their endpoint has no wildcard
+            sock.bind(endpoint[len("bind:"):])
+        else:
+            sock.connect(endpoint)
         sock.setsockopt_string(zmq.SUBSCRIBE, topic)
         while True:
             parts = sock.recv_multipart()
