@@ -1,8 +1,8 @@
-# Everything on one machine with four GPUs and a small Qwen3-MoE checkpoint:
+# Everything on one machine with three GPUs and a small Qwen3-MoE checkpoint:
 # prefill on GPUs 0-1 (DP=2, EP=2), decode on GPU 2, KV over TCP. Useful to try
 # the whole pipeline before moving to the cluster; RDMA traffic classes and
 # GPU-direct transfers are not exercised.
-model: /models/small-qwen3-moe
+model: /models/small-qwen3-moe          # python -m shunt.tools.small_model
 served_model_name: model
 workdir: /opt/shunt
 rundir: /tmp/shunt-runs
