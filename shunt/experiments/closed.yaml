@@ -1,0 +1,31 @@
+# Closed-loop TTFT distributions: Figs. 13a, 14a, 15a, S5; Tables 1 (NCCL rows),
+# S4, S5.
+name: closed
+defaults:
+  trace: traces/qwen_traceB_blksz_16.jsonl
+  load: closed:512
+  requests: 12000
+  timing: 0
+runs:
+  - {name: baseline, system: baseline}
+  - {name: ors, system: ors}
+  - {name: combo, system: combo}
+  - {name: shunt, system: shunt}
+  - {name: sh-ors, system: sh-ors}
+  - {name: no-rs, system: no-rs}
+  - {name: no-eap, system: no-eap}
+  - {name: no-kvlb, system: no-kvlb}
+  - {name: no-prio, system: no-prio}
+  - {name: no-budget, system: no-budget}
+  - {name: no-borrow, system: no-borrow}
+  - {name: no-frontend, system: no-frontend}
+  - {name: lpt, system: lpt}
+  - {name: kva, system: kva}
+  - {name: kva-lb, system: kva-lb}
+  - {name: shunt-kva, system: shunt-kva}
+  - {name: shunt-kva-lb, system: shunt-kva-lb}
+  - {name: shunt-theta1.0, system: shunt+theta1.0}
+  - {name: shunt-theta1.25, system: shunt+theta1.25}
+  - {name: shunt-theta2.0, system: shunt+theta2.0}
+  - {name: shunt-theta2.5, system: shunt+theta2.5}
+  - {name: shunt-theta3.0, system: shunt+theta3.0}

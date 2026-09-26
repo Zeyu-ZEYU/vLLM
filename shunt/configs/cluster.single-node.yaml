@@ -1,0 +1,40 @@
+# Everything on one machine with four GPUs and a small Qwen3-MoE checkpoint:
+# prefill on GPUs 0-1 (DP=2, EP=2), decode on GPU 2, KV over TCP. Useful to try
+# the whole pipeline before moving to the cluster; RDMA traffic classes and
+# GPU-direct transfers are not exercised.
+model: /models/small-qwen3-moe
+served_model_name: model
+workdir: /opt/shunt
+rundir: /tmp/shunt-runs
+activate: /opt/shunt/.venv/bin/activate
+ssh: local
+bind_host: 127.0.0.1
+mgmt_ip: {localhost: 127.0.0.1}
+prefill:
+  hosts: [localhost]
+  gpus_per_node: 2
+  port: 8100
+  mgmt_ip: {localhost: 127.0.0.1}
+  cuda_visible_devices: {localhost: "0,1"}
+decode:
+  hosts: [localhost]
+  gpus_per_node: 1
+  port: 8200
+  mgmt_ip: {localhost: 127.0.0.1}
+  cuda_visible_devices: {localhost: "2"}
+master: {host: localhost, rpc_port: 50051, http_port: 8080}
+proxy: {host: localhost, port: 8000}
+driver: {host: localhost}
+network:
+  protocol: tcp
+  backend_devices: [dev0, dev1]   # names only; TCP ignores them
+  frontend_device: fe
+env: {MC_TCP_BIND_ADDRESS: 127.0.0.1}
+vllm_args: [--max-model-len, "16384", --max-num-batched-tokens, "16384",
+            --max-num-seqs, "64", --gpu-memory-utilization, "0.5", --seed, "1024",
+            --api-server-count, "1"]
+lmcache: {buffer_gb: 0, decode_segment_gb: 4, decode_cpu_gb: 4, prefill_cpu_gb: 4,
+          local_mode_cpu_gb: 8}
+# Without a compute profile the planner uses nominal coefficients; profile the
+# checkpoint with shunt.profiling.compute and set compute_profile to use yours.
+shunt: {gpu_direct: false, host_pool_mb: 512, client_buffer_mb: 64}

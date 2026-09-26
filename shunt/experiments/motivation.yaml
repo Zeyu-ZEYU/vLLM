@@ -1,0 +1,26 @@
+# Sec. 2.3 (Figs. 5-9, S2), Sec. 3.2 (chunked prefill), Tables S1 and S7.
+# Runs with timing: 1 record per-layer phase times on the prefill ranks.
+# Replace PREFILL_HOST_0 / DECODE_HOST_0 with a prefill and a decode host of
+# your cluster file (the RNIC samplers run there).
+name: motivation
+defaults:
+  trace: traces/qwen_traceB_blksz_16.jsonl
+  load: closed:512
+  requests: 12000
+  timing: 0
+runs:
+  - {name: baseline-timing, system: baseline, timing: 1,
+     sample_bw: [PREFILL_HOST_0, DECODE_HOST_0], bw_seconds: 120}
+  - {name: ors-timing, system: ors, timing: 1}
+  - {name: baseline, system: baseline}
+  - {name: no-contention, system: no-contention}
+  - {name: baseline-chunked, system: baseline+chunk8192, timing: 1}
+  - {name: baseline-tp2, system: baseline+tp2, timing: 1}
+  - {name: baseline-tp4, system: baseline+tp4, timing: 1}
+  - {name: baseline-tp8, system: baseline+tp8, timing: 1}
+  - {name: baseline-traceA, system: baseline, timing: 1,
+     trace: traces/qwen_traceA_blksz_16.jsonl}
+  - {name: baseline-thinking, system: baseline, timing: 1,
+     trace: traces/qwen_thinking_blksz_16.jsonl}
+  - {name: baseline-coder, system: baseline, timing: 1,
+     trace: traces/qwen_coder_blksz_16.jsonl}

@@ -38,7 +38,7 @@ def overhead(path: str, out: str) -> None:
     ax.set_xticklabels(labels, rotation=90)
     ax.set_xlabel("max/mean / helpers")
     ax.set_ylabel("Share of the phase (%)")
-    ax.legend(framealpha=0.8, fontsize=7)
+    ax.legend(framealpha=0.8, fontsize=7, loc="upper left", bbox_to_anchor=(1.0, 1.0))
     style.save(fig, f"{out}.pdf")
     rows = [[f"{r['imbalance']:.2f}", r["helpers"], r["heads_moved"],
              r["complete_s"] * 1e3, 100 * r["pre_share"], 100 * r["attention_share"],

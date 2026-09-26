@@ -16,11 +16,11 @@ Examples::
 
     # one run
     python -m shunt.harness.run --cluster cluster.yaml --system shunt \\
-        --load closed:512 --trace qwen_traceB_blksz_16.jsonl.xz --requests 20000 \\
+        --load closed:512 --trace traces/qwen_traceB_blksz_16.jsonl --requests 20000 \\
         --out results/fig13/shunt
 
-    # every run of an experiment file (see experiments/)
-    python -m shunt.harness.run --cluster cluster.yaml --plan experiments/main.yaml
+    # every run of an experiment file (see shunt/experiments/)
+    python -m shunt.harness.run --cluster cluster.yaml --plan shunt/experiments/closed.yaml
 
     python -m shunt.harness.run --list-systems
 """

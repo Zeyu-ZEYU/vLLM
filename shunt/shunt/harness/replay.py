@@ -19,7 +19,7 @@ of streamed chunks.
 
 Example::
 
-    python -m shunt.harness.replay --trace qwen_traceB_blksz_16.jsonl.xz \\
+    python -m shunt.harness.replay --trace traces/qwen_traceB_blksz_16.jsonl \\
         --url http://proxy:8000 --concurrency 512 --num-requests 20000 \\
         --out results/run/requests.jsonl
 """

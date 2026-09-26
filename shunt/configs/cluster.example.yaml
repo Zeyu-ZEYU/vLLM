@@ -1,0 +1,71 @@
+# Cluster description for shunt.harness.run: two prefill nodes (one DP=16,
+# EP=16, TP=1 deployment), two decode nodes (DP=8, EP=8, TP=1 each), eight GPUs
+# per node. Replace every host name, address, and device with your own.
+
+model: /models/Qwen3-235B-A22B          # the same path on every node
+served_model_name: qwen3-235b
+workdir: /opt/shunt                      # this repository, the same path on every node
+rundir: /opt/shunt-runs                  # per-run logs on every node (copied back after a run)
+activate: /opt/shunt/.venv/bin/activate  # Python environment with vllm, lmcache, mooncake, shunt
+ssh: ssh -o BatchMode=yes                # or "local" to run everything on this machine
+# exec_prefix: "docker exec -u 1000:1000 serving bash -c {cmd}"   # run inside a container
+bind_host: 0.0.0.0
+
+prefill:
+  hosts: [p0, p1]
+  gpus_per_node: 8
+  port: 8100
+  dp_rpc_port: 13345
+  mgmt_ip: {p0: 10.0.0.10, p1: 10.0.0.11}        # management network (HTTP, rendezvous)
+  rdma_ip: {p0: "fd00::10", p1: "fd00::11"}      # backend RDMA address (Mooncake)
+decode:
+  hosts: [d0, d1]
+  gpus_per_node: 8
+  port: 8200
+  mgmt_ip: {d0: 10.0.0.12, d1: 10.0.0.13}
+  rdma_ip: {d0: "fd00::12", d1: "fd00::13"}
+master: {host: p0, rpc_port: 50051, http_port: 8080}   # Mooncake master and metadata
+proxy: {host: p0, port: 9000}
+driver: {host: p0}
+
+network:
+  protocol: rdma
+  # backend device of every GPU of a node, by local GPU index (two GPUs share a bond here)
+  backend_devices: [mlx5_bond_0, mlx5_bond_0, mlx5_bond_1, mlx5_bond_1,
+                    mlx5_bond_2, mlx5_bond_2, mlx5_bond_3, mlx5_bond_3]
+  frontend_device: mlx5_0        # host-attached frontend RNIC
+  frontend_netdev: eth0          # its network interface (for the utilization samples)
+  nccl_ib_hca: mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3
+  gid_index: 3
+  port_gbps: 200                 # bandwidth of one GPU's backend port
+  backend_port_gbps: 400         # capacity of one backend device (for the samples)
+  frontend_gbps: 200
+  sample_ms: 5
+  # RDMA traffic classes (DSCP = class >> 2). The fabric must map them to strict
+  # priorities: A2A above borrowed KV above a port's own KV.
+  a2a_tc: 106
+  kv_borrow_tc: 66
+  kv_tc: 34
+
+env:
+  NCCL_SOCKET_IFNAME: eth0
+  GLOO_SOCKET_IFNAME: eth0
+
+vllm_args: [--max-model-len, "17000", --max-num-batched-tokens, "17000",
+            --max-num-seqs, "256", --gpu-memory-utilization, "0.9", --seed, "1024"]
+
+lmcache:
+  chunk_size: 256
+  buffer_gb: 4
+  prefill_cpu_gb: 32
+  decode_cpu_gb: 32
+  decode_segment_gb: 64         # KV pool each decode node contributes
+  local_mode_cpu_gb: 200        # prefill-local memory of the no-contention system
+
+shunt:
+  compute_profile: /opt/shunt/profiles/qwen3-235b.json   # python -m shunt.profiling.compute
+  gpu_direct: true
+  gpu_pool_mb: 2048
+  host_pool_mb: 4096
+  tick_ms: 2.0
+  lb_factor: 1.5

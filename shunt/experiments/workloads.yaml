@@ -1,0 +1,20 @@
+# Other workloads: Table 2 (the coding subset in the open loop; no prefix
+# reuse in the closed loop).
+name: workloads
+defaults:
+  trace: traces/qwen_coder_blksz_16.jsonl
+  duration: 300
+  timing: 0
+runs:
+  - {name: coder-baseline-r4, system: baseline, load: 'open:4'}
+  - {name: coder-baseline-r8, system: baseline, load: 'open:8'}
+  - {name: coder-baseline-r12, system: baseline, load: 'open:12'}
+  - {name: coder-baseline-r16, system: baseline, load: 'open:16'}
+  - {name: coder-shunt-r4, system: shunt, load: 'open:4'}
+  - {name: coder-shunt-r8, system: shunt, load: 'open:8'}
+  - {name: coder-shunt-r12, system: shunt, load: 'open:12'}
+  - {name: coder-shunt-r16, system: shunt, load: 'open:16'}
+  - {name: nocache-baseline, system: baseline+nocache, load: 'closed:512',
+     requests: 12000, trace: traces/qwen_traceB_blksz_16.jsonl, duration: 0}
+  - {name: nocache-shunt, system: shunt+nocache, load: 'closed:512',
+     requests: 12000, trace: traces/qwen_traceB_blksz_16.jsonl, duration: 0}

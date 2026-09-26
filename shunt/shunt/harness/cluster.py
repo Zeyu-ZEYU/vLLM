@@ -1,7 +1,8 @@
 """Cluster description and remote execution for the experiment harness.
 
 The cluster file (YAML) names the hosts of every role, the addresses and RDMA
-devices, and how to run commands on a host. See ``configs/cluster.example.yaml``.
+devices, and how to run commands on a host. See
+``shunt/configs/cluster.example.yaml``.
 Commands run through ``ssh`` (or locally when ``ssh: local``) in a non-login
 ``bash`` after sourcing ``activate`` (the Python environment), optionally
 wrapped by ``exec_prefix`` (for example a ``docker exec`` into the serving

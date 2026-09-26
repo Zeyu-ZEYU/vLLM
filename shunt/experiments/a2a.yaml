@@ -1,0 +1,17 @@
+# DeepEP and DBO: Table 1, the DBO contention comparison, and the idle and
+# overflow statistics of Sec. 4.2 (timing: 2 keeps per-layer timelines).
+name: a2a
+defaults:
+  trace: traces/qwen_traceB_blksz_16.jsonl
+  load: closed:512
+  requests: 12000
+  timing: 0
+runs:
+  - {name: baseline+deepep, system: baseline+deepep}
+  - {name: shunt+deepep, system: shunt+deepep}
+  - {name: baseline+dbo, system: baseline+dbo}
+  - {name: shunt+dbo, system: shunt+dbo}
+  - {name: no-frontend+dbo, system: no-frontend+dbo}
+  - {name: no-contention+dbo, system: no-contention+dbo}
+  - {name: baseline+dbo-timing, system: baseline+dbo, timing: 2}
+  - {name: shunt+dbo-timing, system: shunt+dbo, timing: 2}

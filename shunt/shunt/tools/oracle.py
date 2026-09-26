@@ -8,7 +8,7 @@ is read by the proxy (``placement: oracle``, ``oracle_file``).
 
 Example::
 
-    python -m shunt.tools.oracle --trace qwen_traceB_blksz_16.jsonl.xz \\
+    python -m shunt.tools.oracle --trace traces/qwen_traceB_blksz_16.jsonl \\
         --config shunt.json --start 0 --num-requests 20000 --window 512 \\
         --out ors_ranks.json
 """

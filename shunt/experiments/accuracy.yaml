@@ -1,0 +1,11 @@
+# Prediction accuracy (Table 3) and KV overflow (Sec. 4.3, Sec. S5): Shunt with
+# per-layer phase timing, with the NCCL A2A and with DeepEP and DBO.
+name: accuracy
+defaults:
+  trace: traces/qwen_traceB_blksz_16.jsonl
+  load: closed:512
+  requests: 12000
+  timing: 1
+runs:
+  - {name: shunt-timing, system: shunt}
+  - {name: shunt+dbo-timing, system: shunt+dbo}

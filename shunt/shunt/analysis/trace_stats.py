@@ -9,9 +9,9 @@
 
 Examples::
 
-    python -m shunt.analysis.trace_stats stats business=qwen_traceB_blksz_16.jsonl.xz \\
-        coding=qwen_coder_blksz_16.jsonl --out tables/tab_s1_traces
-    python -m shunt.analysis.trace_stats lengths qwen_traceB_blksz_16.jsonl.xz \\
+    python -m shunt.analysis.trace_stats stats business=traces/qwen_traceB_blksz_16.jsonl \\
+        coding=traces/qwen_coder_blksz_16.jsonl --out tables/tab_s1_traces
+    python -m shunt.analysis.trace_stats lengths traces/qwen_traceB_blksz_16.jsonl \\
         --out figs/figS1_lengths
     python -m shunt.analysis.trace_stats split Baseline=results/main/baseline
 """
