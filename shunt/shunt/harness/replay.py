@@ -2,8 +2,10 @@
 
 Prompts are built as token ids so that prefix reuse in the trace becomes real
 prefix reuse in the engines: every 16-token block of a prompt is generated from
-its hash id, so requests that share leading hash ids share leading tokens. Each
-request asks for exactly its trace output length (``ignore_eos``).
+its hash id, so requests that share leading hash ids share leading tokens.
+Prompts longer than ``--max-input`` tokens are cut to their leading tokens.
+Each request asks for exactly its trace output length (``ignore_eos``), capped
+by ``--max-output`` and so that prompt and output fit ``--max-len``.
 
 Two load protocols:
 
@@ -57,10 +59,16 @@ def build_prompt(rec: TraceRecord, lo: int, hi: int, reuse: bool = True) -> list
     return toks[:rec.input_length]
 
 
+def output_tokens(rec: TraceRecord, max_out: int | None, max_len: int | None) -> int:
+    """Requested output tokens: the trace's, within both caps (at least 1)."""
+    n = rec.output_length if max_out is None else min(rec.output_length, max_out)
+    if max_len:
+        n = min(n, max_len - rec.input_length)
+    return max(1, n)
+
+
 async def _one(session, url: str, model: str, rec: TraceRecord, prompt: list[int],
-               t_sched: float, max_out: int | None) -> dict:
-    out_len = max(1, rec.output_length if max_out is None else min(rec.output_length,
-                                                                    max_out))
+               t_sched: float, out_len: int) -> dict:
     body = {"model": model, "prompt": prompt, "max_tokens": out_len, "stream": True,
             "temperature": 0.0, "ignore_eos": True}
     headers = {"X-Shunt-Request-Id": str(rec.index),
@@ -90,9 +98,11 @@ async def _one(session, url: str, model: str, rec: TraceRecord, prompt: list[int
 async def run(args) -> None:
     import aiohttp
 
-    recs = load_trace(args.trace, limit=args.num_requests, start=args.start)
+    recs = load_trace(args.trace, limit=args.num_requests, start=args.start,
+                      max_input=args.max_input or None)
     lo, hi = args.token_range
     prompts = [build_prompt(r, lo, hi, reuse=not args.no_reuse) for r in recs]
+    outs = [output_tokens(r, args.max_output, args.max_len or None) for r in recs]
     out = open(args.out, "w", buffering=1)
     done = 0
     t0 = time.time()
@@ -114,7 +124,7 @@ async def run(args) -> None:
                     if args.duration and time.time() - t0 > args.duration:
                         return
                     await finish(await _one(session, args.url, args.model, recs[i],
-                                            prompts[i], time.time(), args.max_output))
+                                            prompts[i], time.time(), outs[i]))
 
             await asyncio.gather(*(worker() for _ in range(args.concurrency)))
         else:
@@ -130,7 +140,7 @@ async def run(args) -> None:
 
                 async def go(i=i, t_sched=t_next):
                     await finish(await _one(session, args.url, args.model, recs[i],
-                                            prompts[i], t_sched, args.max_output))
+                                            prompts[i], t_sched, outs[i]))
 
                 tasks.append(asyncio.create_task(go()))
                 t_next += rng.expovariate(args.rate)
@@ -138,7 +148,8 @@ async def run(args) -> None:
     out.close()
     meta = {"trace": args.trace, "start": args.start, "num_requests": len(recs),
             "concurrency": args.concurrency, "rate": args.rate, "seed": args.seed,
-            "reuse": not args.no_reuse,
+            "reuse": not args.no_reuse, "max_input": args.max_input,
+            "max_output": args.max_output, "max_len": args.max_len,
             "t_begin": t0, "t_end": time.time()}
     with open(args.out + ".meta.json", "w") as f:
         json.dump(meta, f, indent=1)
@@ -158,8 +169,13 @@ def main() -> None:
     ap.add_argument("--num-requests", type=int, default=None)
     ap.add_argument("--duration", type=float, default=0.0,
                     help="stop issuing new requests after this many seconds")
+    ap.add_argument("--max-input", type=int, default=16000,
+                    help="cut longer prompts to this many tokens (0: no cap)")
     ap.add_argument("--max-output", type=int, default=None,
                     help="cap on output tokens per request")
+    ap.add_argument("--max-len", type=int, default=0,
+                    help="the engines' context length: prompt plus output stay "
+                         "within it (0: no cap)")
     ap.add_argument("--token-range", type=int, nargs=2, default=(1000, 100000),
                     help="token ids are drawn from [lo, hi)")
     ap.add_argument("--no-reuse", action="store_true",

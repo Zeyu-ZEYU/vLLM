@@ -33,7 +33,7 @@ env: {MC_TCP_BIND_ADDRESS: 127.0.0.1}
 vllm_args: [--max-model-len, "16384", --max-num-batched-tokens, "16384",
             --max-num-seqs, "64", --gpu-memory-utilization, "0.5", --seed, "1024",
             --api-server-count, "1"]
-lmcache: {buffer_gb: 0, decode_segment_gb: 4, decode_cpu_gb: 4, prefill_cpu_gb: 4,
+lmcache: {buffer_gb: 1, decode_segment_gb: 4, decode_cpu_gb: 4, prefill_cpu_gb: 4,
           local_mode_cpu_gb: 8}
 # Without a compute profile the planner uses nominal coefficients; profile the
 # checkpoint with shunt.profiling.compute and set compute_profile to use yours.

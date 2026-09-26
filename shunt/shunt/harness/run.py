@@ -22,6 +22,11 @@ Examples::
     # every run of an experiment file (see shunt/experiments/)
     python -m shunt.harness.run --cluster cluster.yaml --plan shunt/experiments/closed.yaml
 
+    # print the files and commands of a run without starting anything
+    python -m shunt.harness.run --cluster cluster.yaml --system shunt \\
+        --load closed:512 --trace traces/qwen_traceB_blksz_16.jsonl \\
+        --out results/try/shunt --dry-run
+
     python -m shunt.harness.run --list-systems
 """
 from __future__ import annotations
@@ -123,7 +128,8 @@ class Runner:
 
     def run(self, system: str, load: str, trace: str, out: str, requests: int | None,
             start: int, duration: float, max_output: int | None, sample_bw: list[str],
-            bw_seconds: float, timing: int, window: int) -> None:
+            bw_seconds: float, timing: int, window: int,
+            max_input: int = 16000) -> None:
         c = self.c
         s = S.get(system)
         out_dir = Path(out).resolve()
@@ -139,7 +145,8 @@ class Runner:
             cfg_json.write_text(json.dumps(R.shunt_config(c, s)))
             argv = [sys.executable, "-m", "shunt.tools.oracle", "--trace", trace,
                     "--config", str(cfg_json), "--start", str(start),
-                    "--window", str(window), "--out", str(local)]
+                    "--window", str(window), "--max-input", str(max_input),
+                    "--out", str(local)]
             if requests:
                 argv += ["--num-requests", str(requests)]
             _run_local(argv)
@@ -171,7 +178,7 @@ class Runner:
                 if p == "measure" and sample_bw:
                     samplers = self._start_samplers(sample_bw, run_dir, bw_seconds)
                 self._drive(s, load, trace, run_dir, requests, start, duration,
-                            max_output, started, tag=p)
+                            max_output, max_input, started, tag=p)
         finally:
             for role in samplers + started[::-1]:
                 self._stop(role)
@@ -179,14 +186,41 @@ class Runner:
             self._collect(run_dir, out_dir)
         meta = {"system": system, "load": load, "trace": trace, "start": start,
                 "requests": requests, "duration": duration, "max_output": max_output,
+                "max_input": max_input, "max_len": c.max_model_len,
                 "timing": timing, "remote_dir": run_dir, "finished": time.time(),
                 "system_config": s.__dict__}
         (out_dir / "meta.json").write_text(json.dumps(meta, indent=1, default=str))
         _log(f"done: {out_dir}")
 
-    def _drive(self, s: S.System, load: str, trace: str, run_dir: str,
-               requests: int | None, start: int, duration: float,
-               max_output: int | None, roles: list[R.Role], tag: str) -> None:
+    def dry_run(self, system: str, load: str, trace: str, out: str,
+                requests: int | None, start: int, duration: float,
+                max_output: int | None, timing: int, max_input: int = 16000) -> None:
+        """Print what one run would write and start, without touching a host."""
+        c = self.c
+        s = S.get(system)
+        run_dir = f"{c.rundir}/{Path(out).name}-DRYRUN"
+        oracle = f"{run_dir}/config/ors_ranks.json" if s.placement == "oracle" else None
+        plan = R.build(c, s, run_dir, timing=timing, oracle_file=oracle)
+        print(f"# system {system}: {s.notes}")
+        if oracle:
+            print(f"# the ORS placement is computed first: python -m shunt.tools.oracle "
+                  f"(written to {oracle} on {c.proxy_host})")
+        for (h, path), text in plan.files.items():
+            print(f"\n## file {h}:{path}\n{text.rstrip()}")
+        passes = ["warm", "measure"] if s.kv_mode == "local" else ["measure"]
+        roles = [plan.master] + plan.decode + [plan.proxy] + plan.prefill
+        roles += [self._driver(s, load, trace, run_dir, requests, start, duration,
+                               max_output, max_input, p) for p in passes]
+        print("\n## roles, in start order (each in its own process group, from "
+              f"{c.workdir})")
+        for role in roles:
+            wait = f"  (ready: {role.health})" if role.health else ""
+            print(f"\n[{role.name} @ {role.host}]{wait}\n{role.shell()}")
+
+    def _driver(self, s: S.System, load: str, trace: str, run_dir: str,
+                requests: int | None, start: int, duration: float,
+                max_output: int | None, max_input: int, tag: str) -> R.Role:
+        """The trace driver's role for one pass of a run."""
         c = self.c
         kind, _, val = load.partition(":")
         args = ["python", "-m", "shunt.harness.replay", "--trace", trace,
@@ -200,10 +234,21 @@ class Runner:
             args += ["--duration", str(duration)]
         if max_output:
             args += ["--max-output", str(max_output)]
+        args += ["--max-input", str(max_input)]
+        if c.max_model_len:
+            args += ["--max-len", str(c.max_model_len)]
         if not s.prefix_cache:
             args.append("--no-reuse")
-        driver = R.Role(f"driver.{tag}", c.driver_host,
-                        " ".join(shlex.quote(a) for a in args))
+        return R.Role(f"driver.{tag}", c.driver_host,
+                      " ".join(shlex.quote(a) for a in args))
+
+    def _drive(self, s: S.System, load: str, trace: str, run_dir: str,
+               requests: int | None, start: int, duration: float,
+               max_output: int | None, max_input: int, roles: list[R.Role],
+               tag: str) -> None:
+        c = self.c
+        driver = self._driver(s, load, trace, run_dir, requests, start, duration,
+                              max_output, max_input, tag)
         self._start(driver, run_dir)
         sizes: dict = {}
         _log(f"driver ({tag}) started: {load}")
@@ -292,7 +337,7 @@ def _run_plan(runner: Runner, plan_path: str, only: set[str] | None,
                    int(r.get("start", 0)), float(r.get("duration", 0)),
                    r.get("max_output"), list(r.get("sample_bw", [])),
                    float(r.get("bw_seconds", 60)), int(r.get("timing", 1)),
-                   int(r.get("window", 512)))
+                   int(r.get("window", 512)), int(r.get("max_input", 16000)))
 
 
 def main() -> None:
@@ -305,6 +350,8 @@ def main() -> None:
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--duration", type=float, default=0.0)
     ap.add_argument("--max-output", type=int, default=None)
+    ap.add_argument("--max-input", type=int, default=16000,
+                    help="prompt cap of the trace driver (0: no cap)")
     ap.add_argument("--sample-bw", default="", help="comma-separated hosts")
     ap.add_argument("--bw-seconds", type=float, default=60.0)
     ap.add_argument("--timing", type=int, default=1, help="SHUNT_TIMING level")
@@ -316,6 +363,8 @@ def main() -> None:
     ap.add_argument("--results", default="results")
     ap.add_argument("--drain-s", type=float, default=60.0)
     ap.add_argument("--list-systems", action="store_true")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the files and commands of a single run and exit")
     a = ap.parse_args()
     if a.list_systems:
         print(S.describe())
@@ -330,9 +379,13 @@ def main() -> None:
     for k in ("system", "load", "trace", "out"):
         if not getattr(a, k):
             ap.error(f"--{k} is required for a single run")
+    if a.dry_run:
+        runner.dry_run(a.system, a.load, a.trace, a.out, a.requests, a.start,
+                       a.duration, a.max_output, a.timing, a.max_input)
+        return
     runner.run(a.system, a.load, a.trace, a.out, a.requests, a.start, a.duration,
                a.max_output, [h for h in a.sample_bw.split(",") if h],
-               a.bw_seconds, a.timing, a.window)
+               a.bw_seconds, a.timing, a.window, a.max_input)
 
 
 if __name__ == "__main__":

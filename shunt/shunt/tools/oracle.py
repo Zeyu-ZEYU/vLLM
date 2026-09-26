@@ -30,13 +30,16 @@ def main() -> None:
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--num-requests", type=int, default=None)
     ap.add_argument("--window", type=int, default=512)
+    ap.add_argument("--max-input", type=int, default=16000,
+                    help="prompt cap of the trace driver (0: no cap)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
     cfg = ShuntConfig.from_json(a.config)
     cm = ComputeModel.from_profile(cfg.compute_profile, cfg.model, cfg.deploy)
     G = cfg.deploy.ep_group_workers
-    recs = load_trace(a.trace, limit=a.num_requests, start=a.start)
+    recs = load_trace(a.trace, limit=a.num_requests, start=a.start,
+                      max_input=a.max_input or None)
     ranks: dict[str, int] = {}
     at_bound = total = 0
     for win in iter_windows(recs, a.window):

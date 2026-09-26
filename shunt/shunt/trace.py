@@ -5,7 +5,8 @@ Each JSON line has ``chat_id``, ``timestamp`` (seconds), ``input_length``,
 Identical leading hashes mean a shared prefix. :func:`load_trace` also splits
 each prompt into reused-prefix and fresh tokens by replaying an unbounded
 prefix cache over the trace in arrival order; the proxy and the oracle use this
-split to price requests.
+split to price requests. With ``max_input``, prompts are cut to that many
+tokens (their leading blocks), as the trace driver sends them.
 """
 from __future__ import annotations
 
@@ -32,13 +33,14 @@ def open_text(path: str):
     return lzma.open(path, "rt") if path.endswith(".xz") else open(path, "rt")
 
 
-def load_trace(path: str, limit: int | None = None, start: int = 0
-               ) -> list[TraceRecord]:
+def load_trace(path: str, limit: int | None = None, start: int = 0,
+               max_input: int | None = None) -> list[TraceRecord]:
     """Parse the trace and split every prompt into prefix and fresh tokens.
 
     The prefix of a request is its run of leading blocks already seen in an
     earlier request; at least one token is always fresh. ``start`` skips that
-    many leading records after the reuse replay has seen them.
+    many leading records after the reuse replay has seen them. ``max_input``
+    cuts longer prompts to their first ``max_input`` tokens.
     """
     seen: set = set()
     out: list[TraceRecord] = []
@@ -49,6 +51,9 @@ def load_trace(path: str, limit: int | None = None, start: int = 0
             r = json.loads(line)
             L = int(r["input_length"])
             hashes = r.get("hash_ids") or []
+            if max_input and L > max_input:
+                L = max_input
+                hashes = hashes[:-(-L // BLOCK)]
             matched = 0
             for h in hashes:
                 if h in seen:

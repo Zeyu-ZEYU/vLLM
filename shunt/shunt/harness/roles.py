@@ -85,6 +85,9 @@ def lmcache_prefill(c: Cluster, host: str, s: System) -> dict:
                 "max_local_cpu_size": float(c.lmcache.get("local_mode_cpu_gb", 200)),
                 "use_layerwise": True}
     devs = _net(c, "backend_devices", [])
+    if not s.kv_router and int(c.lmcache.get("buffer_gb", 4)) <= 0:
+        # stock LMCache puts are staged in the Mooncake client's local buffer
+        raise ValueError(f"{s.name}: lmcache.buffer_gb must be positive")
     cfg = {
         "chunk_size": int(c.lmcache.get("chunk_size", 256)),
         "local_cpu": False,

@@ -106,6 +106,17 @@ class Cluster:
     def is_local(self) -> bool:
         return self.ssh == "local"
 
+    @property
+    def max_model_len(self) -> int | None:
+        """``--max-model-len`` of the engines, if ``vllm_args`` sets it."""
+        args = [str(a) for a in self.vllm_args]
+        for i, a in enumerate(args):
+            if a == "--max-model-len" and i + 1 < len(args):
+                return int(args[i + 1])
+            if a.startswith("--max-model-len="):
+                return int(a.split("=", 1)[1])
+        return None
+
     # --- execution --------------------------------------------------------------
 
     def _wrap(self, cmd: str) -> str:
